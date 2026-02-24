@@ -1,0 +1,32 @@
+# Python 默认忽略
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+
+# 虚拟环境
+.venv/
+env/
+venv/
+
+# 项目特定：本地数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 项目特定：运行日志与本地配置
+运行日志/
+*.log
+photo_identify_gui.ini
+
+# 项目特定：用户要求忽略的文件
+可用模型列表/
+
+# IDE 及系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

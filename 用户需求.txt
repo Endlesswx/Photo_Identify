@@ -1,0 +1,20 @@
+# API文档
+https://docs.siliconflow.cn/cn/api-reference/chat-completions/chat-completions
+
+# 模型GLM-4.1V-9B-Thinking
+API限制使用本模型时 RPM 为 1,000；TPM 为 50,000；
+
+# 参考代码
+我在其他项目中的代码#app.py，可以参考同样进行大模型调用
+
+# 代码规范
+使用uv管理依赖和运行代码，按python的最佳实践编码和组织各类文件，代码的所有函数都必须有函数注释说明在做什么，每个py文件都必须在文件头部写明本文件的作用。
+
+# 需求全局变量指定路径(默认值"F:\图片\聚焦壁纸:)，分析并输出图片的各种信息，代码可以参考
+https://raw.githubusercontent.com/dai-hongtao/InkTime/refs/heads/main/analyze_photos.py
+
+
+
+1.程序关闭界面时，终止相关的后台进程
+2.lvip格式的本质是一个jpg文件+一个mov视频打包起来，预览对象为lvip格式时需要获取其中的进行预览
+3.对于视频文件，需要嵌入视频播放器进行预览，并定位到关键字匹配的时点
