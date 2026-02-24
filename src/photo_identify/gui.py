@@ -5,12 +5,14 @@ import subprocess
 import sys
 import threading
 import time
+import io
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import scrolledtext
 
 from PIL import Image, ImageTk
 
+from photo_identify.image_utils import get_image_frame_bytes
 from photo_identify.config import (
     DEFAULT_BASE_URL,
     DEFAULT_DB_PATH,
@@ -639,7 +641,10 @@ class PhotoIdentifyGUI(tk.Tk):
         self._load_and_draw_image(file_path)
 
     def _load_and_draw_image(self, file_path: str):
-        if not os.path.isfile(file_path):
+        # 处理带有 "#t=" 等后缀的视频文件路径
+        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+
+        if not os.path.isfile(actual_path):
             self.canvas.delete("all")
             self.canvas.create_text(
                 self.canvas.winfo_width()//2, self.canvas.winfo_height()//2,
@@ -648,7 +653,8 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         try:
-            self.original_image = Image.open(file_path)
+            frame_bytes = get_image_frame_bytes(actual_path)
+            self.original_image = Image.open(io.BytesIO(frame_bytes))
             self._resize_and_display()
         except Exception as e:
             self.canvas.delete("all")
@@ -698,18 +704,22 @@ class PhotoIdentifyGUI(tk.Tk):
             return
         record = self.current_results[self.current_index]
         file_path = record.get("path", "")
-        if not os.path.exists(file_path):
+        
+        # 处理带有 "#t=" 等后缀的视频文件路径
+        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+        
+        if not os.path.exists(actual_path):
             messagebox.showerror("错误", "文件不存在！")
             return
 
         # 在 Windows 上选中文件并在资源管理器打开
         try:
             if sys.platform == "win32":
-                subprocess.Popen(f'explorer /select,"{os.path.normpath(file_path)}"')
+                subprocess.Popen(f'explorer /select,"{os.path.normpath(actual_path)}"')
             elif sys.platform == "darwin":  # macOS
-                subprocess.Popen(["open", "-R", file_path])
+                subprocess.Popen(["open", "-R", actual_path])
             else:  # Linux (fallback)
-                subprocess.Popen(["xdg-open", os.path.dirname(file_path)])
+                subprocess.Popen(["xdg-open", os.path.dirname(actual_path)])
         except Exception as e:
             messagebox.showerror("错误", f"无法打开文件位置: {e}")
 

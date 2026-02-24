@@ -18,3 +18,8 @@ https://raw.githubusercontent.com/dai-hongtao/InkTime/refs/heads/main/analyze_ph
 1.程序关闭界面时，终止相关的后台进程
 2.lvip格式的本质是一个jpg文件+一个mov视频打包起来，预览对象为lvip格式时需要获取其中的进行预览
 3.对于视频文件，需要嵌入视频播放器进行预览，并定位到关键字匹配的时点
+
+
+请修复以下问题：
+1.lvip文件没有正确预览
+2.纯视频文件没有正确预览，且因为后缀添加了时点信息，导致"打开文件位置"无效
