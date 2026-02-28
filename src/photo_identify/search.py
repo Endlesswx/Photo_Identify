@@ -72,7 +72,7 @@ def _llm_expand_query(query: str, api_key: str, base_url: str = DEFAULT_BASE_URL
         f"{base_url}/chat/completions", data=body, headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             data = json.loads(response.read().decode("utf-8"))
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         expanded = content.strip()
@@ -208,7 +208,7 @@ def search(
             smart = False
             rerank = False
         elif smart:
-            expanded_query = _llm_expand_query(query, api_key, base_url)
+            expanded_query = _llm_expand_query(query, api_key, base_url, model)
 
     if isinstance(db_paths, str):
         db_paths = [db_paths]

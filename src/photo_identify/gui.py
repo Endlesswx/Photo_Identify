@@ -14,15 +14,12 @@ from PIL import Image, ImageTk
 
 from photo_identify.image_utils import get_image_frame_bytes
 from photo_identify.config import (
-    DEFAULT_BASE_URL,
     DEFAULT_DB_PATH,
-    DEFAULT_TEXT_MODEL,
     DEFAULT_VIDEO_FRAME_INTERVAL,
-    DEFAULT_VISION_MODEL,
     DEFAULT_RPM_LIMIT,
     DEFAULT_TPM_LIMIT,
-    load_api_key,
 )
+from photo_identify.model_manager import ModelManager, get_model_db_path
 from photo_identify.search import search
 from photo_identify.scanner import scan
 
@@ -61,6 +58,86 @@ class StdoutRedirector:
         pass
 
 
+class ModelDialog(tk.Toplevel):
+    """新增/编辑模型的对话框。"""
+
+    MODEL_TYPES = ["视觉模型", "文本模型"]
+
+    def __init__(self, parent, title: str, model_data: dict = None):
+        """
+        Args:
+            parent: 父窗口。
+            title: 对话框标题。
+            model_data: 若为编辑模式，传入现有模型字典；新增时传 None。
+        """
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.grab_set()  # 模态
+        self.result = None  # 用户点保存后存变量值
+
+        # ── 变量 ──
+        self._type_var = tk.StringVar(value=model_data["type"] if model_data else self.MODEL_TYPES[0])
+        self._name_var = tk.StringVar(value=model_data.get("name", "") if model_data else "")
+        self._model_id_var = tk.StringVar(value=model_data.get("model_id", "") if model_data else "")
+        self._base_url_var = tk.StringVar(value=model_data.get("base_url", "") if model_data else "")
+        self._api_key_var_var = tk.StringVar(value=model_data.get("api_key_var", "") if model_data else "")
+
+        # ── 布局 ──
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        labels = ["模型类型:", "模型名称:", "模型ID:", "接口地址:", "API变量名:"]
+        row = 0
+        for lbl in labels:
+            ttk.Label(frame, text=lbl).grid(row=row, column=0, sticky=tk.W, pady=6, padx=(0, 10))
+            row += 1
+
+        # 类型下拉
+        ttk.Combobox(
+            frame, textvariable=self._type_var,
+            values=self.MODEL_TYPES, state="readonly", width=30
+        ).grid(row=0, column=1, sticky=tk.W, pady=6)
+
+        # 文本字段
+        for i, var in enumerate([self._name_var, self._model_id_var, self._base_url_var, self._api_key_var_var], 1):
+            ttk.Entry(frame, textvariable=var, width=40).grid(row=i, column=1, sticky=tk.W, pady=6)
+
+        # 底部按钮
+        btn_frame = ttk.Frame(self, padding=(20, 0, 20, 15))
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="✔ 保存", command=self._on_save).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="✖ 取消", command=self.destroy).pack(side=tk.RIGHT)
+
+        self._center(parent)
+
+    def _center(self, parent):
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{pw - w // 2}+{ph - h // 2}")
+
+    def _on_save(self):
+        name = self._name_var.get().strip()
+        model_id = self._model_id_var.get().strip()
+        base_url = self._base_url_var.get().strip()
+        api_key_var = self._api_key_var_var.get().strip()
+
+        if not all([name, model_id, base_url, api_key_var]):
+            messagebox.showwarning("警告", "所有字段均不能为空！", parent=self)
+            return
+
+        self.result = {
+            "type": self._type_var.get(),
+            "name": name,
+            "model_id": model_id,
+            "base_url": base_url,
+            "api_key_var": api_key_var,
+        }
+        self.destroy()
+
+
 class PhotoIdentifyGUI(tk.Tk):
     def __init__(self, db_path: str = str(DEFAULT_DB_PATH)):
         super().__init__()
@@ -71,6 +148,9 @@ class PhotoIdentifyGUI(tk.Tk):
         self.db_path = db_path
         self.search_dbs = [db_path] if db_path else []
         
+        # 初始化模型管理器
+        self._model_mgr = ModelManager(get_model_db_path(db_path))
+        
         # Initialize variables
         self.current_results = []
         self.current_index = 0
@@ -78,13 +158,17 @@ class PhotoIdentifyGUI(tk.Tk):
         self.original_image = None
         self._resize_timer = None
 
-        self.model_var = tk.StringVar(value=DEFAULT_TEXT_MODEL)
+        # 检索页：文本模型选择（存 model_id）
+        self.search_model_id_var = tk.StringVar(value="")
         self.query_var = tk.StringVar(value="")
         self.search_mode_var = tk.StringVar(value="llm")
         self.status_var = tk.StringVar(value="准备就绪。")
         self.info_var = tk.StringVar(value="暂无图片")
         self.desc_var = tk.StringVar(value="")
         self.page_var = tk.StringVar(value="0 / 0")
+
+        # 扫描页：视觉模型选择（存 model_id）
+        self.scan_model_id_var = tk.StringVar(value="")
 
         # Notebook (Tab) Container
         self.notebook = ttk.Notebook(self)
@@ -99,6 +183,11 @@ class PhotoIdentifyGUI(tk.Tk):
         self.scan_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.scan_tab, text="信息扫描")
         self._init_scan_tab()
+
+        # Tab 3: 模型管理
+        self.model_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.model_tab, text="模型管理")
+        self._init_model_tab()
 
         # 加载上次保存的参数
         self._load_settings()
@@ -122,8 +211,8 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         # Search tab
-        if cfg.has_option("search", "model"):
-            self.model_var.set(cfg.get("search", "model"))
+        if cfg.has_option("search", "model_id"):
+            self._set_search_model_by_id(cfg.get("search", "model_id"))
         if cfg.has_option("search", "mode"):
             self.search_mode_var.set(cfg.get("search", "mode"))
         if cfg.has_option("search", "databases"):
@@ -136,8 +225,8 @@ class PhotoIdentifyGUI(tk.Tk):
                     self.db_listbox.insert(tk.END, db)
 
         # Scan tab
-        if cfg.has_option("scan", "model"):
-            self.scan_model_var.set(cfg.get("scan", "model"))
+        if cfg.has_option("scan", "model_id"):
+            self._set_scan_model_by_id(cfg.get("scan", "model_id"))
         if cfg.has_option("scan", "db_path"):
             self.scan_db_var.set(cfg.get("scan", "db_path"))
         if cfg.has_option("scan", "paths"):
@@ -156,12 +245,12 @@ class PhotoIdentifyGUI(tk.Tk):
         cfg = configparser.ConfigParser()
 
         cfg["search"] = {
-            "model": self.model_var.get(),
+            "model_id": self.search_model_id_var.get(),
             "mode": self.search_mode_var.get(),
             "databases": "|".join(self.search_dbs),
         }
         cfg["scan"] = {
-            "model": self.scan_model_var.get(),
+            "model_id": self.scan_model_id_var.get(),
             "db_path": self.scan_db_var.get(),
             "paths": "|".join(self.scan_paths),
             "frame_interval": self.scan_frame_interval_var.get(),
@@ -176,7 +265,9 @@ class PhotoIdentifyGUI(tk.Tk):
     def _on_close(self):
         """窗口关闭时保存设置并退出。"""
         self._save_settings()
+        self._model_mgr.close()
         self.destroy()
+
     def open_env_vars(self):
         """打开 Windows 环境变量编辑窗口"""
         if sys.platform == "win32":
@@ -185,15 +276,139 @@ class PhotoIdentifyGUI(tk.Tk):
         else:
             messagebox.showinfo("提示", "仅在 Windows 下支持快速打开环境变量编辑窗口。")
 
+    # ── 工具方法：下拉列表数据填充 ──────────────────────────────
+
+    def _get_text_models(self) -> list[dict]:
+        """获取所有文本模型列表。"""
+        return self._model_mgr.get_models_by_type("文本模型")
+
+    def _get_vision_models(self) -> list[dict]:
+        """获取所有视觉模型列表。"""
+        return self._model_mgr.get_models_by_type("视觉模型")
+
+    def _refresh_search_model_combo(self):
+        """刷新检索页模型下拉列表。"""
+        models = self._get_text_models()
+        self._search_model_map = {m["name"]: m["model_id"] for m in models}
+        names = list(self._search_model_map.keys())
+        self.search_model_combo["values"] = names
+        # 保持当前选中的 model_id
+        current_id = self.search_model_id_var.get()
+        matched_name = next((m["name"] for m in models if m["model_id"] == current_id), None)
+        if matched_name:
+            self.search_model_combo.set(matched_name)
+        elif names:
+            self.search_model_combo.set(names[0])
+            self.search_model_id_var.set(self._search_model_map[names[0]])
+
+    def _refresh_scan_model_combo(self):
+        """刷新扫描页模型下拉列表。"""
+        models = self._get_vision_models()
+        self._scan_model_map = {m["name"]: m["model_id"] for m in models}
+        names = list(self._scan_model_map.keys())
+        self.scan_model_combo["values"] = names
+        # 保持当前选中的 model_id
+        current_id = self.scan_model_id_var.get()
+        matched_name = next((m["name"] for m in models if m["model_id"] == current_id), None)
+        if matched_name:
+            self.scan_model_combo.set(matched_name)
+        elif names:
+            self.scan_model_combo.set(names[0])
+            self.scan_model_id_var.set(self._scan_model_map[names[0]])
+
+    def _set_search_model_by_id(self, model_id: str):
+        """根据 model_id 设置检索页下拉选中项。"""
+        self.search_model_id_var.set(model_id)
+        self._refresh_search_model_combo()
+
+    def _set_scan_model_by_id(self, model_id: str):
+        """根据 model_id 设置扫描页下拉选中项。"""
+        self.scan_model_id_var.set(model_id)
+        self._refresh_scan_model_combo()
+
+    def _on_search_model_selected(self, event=None):
+        """检索页下拉选择变化时，更新 model_id 变量。"""
+        name = self.search_model_combo.get()
+        if name and hasattr(self, "_search_model_map"):
+            self.search_model_id_var.set(self._search_model_map.get(name, ""))
+
+    def _on_scan_model_selected(self, event=None):
+        """扫描页下拉选择变化时，更新 model_id 变量。"""
+        name = self.scan_model_combo.get()
+        if name and hasattr(self, "_scan_model_map"):
+            self.scan_model_id_var.set(self._scan_model_map.get(name, ""))
+
+    # ── 获取当前模型的 API 参数 ──────────────────────────────────
+
+    def _get_search_api_params(self) -> tuple[str, str, str] | None:
+        """获取检索页当前选中模型的 (model_id, base_url, api_key)。
+
+        Returns:
+            (model_id, base_url, api_key) 三元组，或失败时返回 None。
+        """
+        model_id = self.search_model_id_var.get().strip()
+        if not model_id:
+            messagebox.showwarning("警告", "请在「模型管理」页添加文本模型，并在检索页选择一个模型！")
+            return None
+        
+        model = self._model_mgr.get_model_by_model_id(model_id)
+        if not model:
+            messagebox.showwarning("警告", f"未找到模型 {model_id!r} 的配置，请检查「模型管理」页。")
+            return None
+        
+        api_key = ModelManager.get_api_key_value(model["api_key_var"])
+        if not api_key:
+            messagebox.showwarning(
+                "警告",
+                f"未找到环境变量 {model['api_key_var']}！\n"
+                f"请在「模型管理」页点击「⚙ 环境变量设置」进行配置。\n"
+                f"设置后点击「🔄 刷新状态」即可，无需重启应用。"
+            )
+            return None
+        
+        return model_id, model["base_url"], api_key
+
+    def _get_scan_api_params(self) -> tuple[str, str, str] | None:
+        """获取扫描页当前选中模型的 (model_id, base_url, api_key)。
+
+        Returns:
+            (model_id, base_url, api_key) 三元组，或失败时返回 None。
+        """
+        model_id = self.scan_model_id_var.get().strip()
+        if not model_id:
+            messagebox.showwarning("警告", "请在「模型管理」页添加视觉模型，并在扫描页选择一个模型！")
+            return None
+        
+        model = self._model_mgr.get_model_by_model_id(model_id)
+        if not model:
+            messagebox.showwarning("警告", f"未找到模型 {model_id!r} 的配置，请检查「模型管理」页。")
+            return None
+        
+        api_key = ModelManager.get_api_key_value(model["api_key_var"])
+        if not api_key:
+            messagebox.showwarning(
+                "警告",
+                f"未找到环境变量 {model['api_key_var']}！\n"
+                f"请在「模型管理」页点击「⚙ 环境变量设置」进行配置。\n"
+                f"设置后点击「🔄 刷新状态」即可，无需重启应用。"
+            )
+            return None
+        
+        return model_id, model["base_url"], api_key
+
+    # ── Tab 1: 图片检索 ──────────────────────────────────────────
+
     def _init_search_tab(self):
         self.top_frame = ttk.Frame(self.search_tab, padding="10")
 
-        # Row 0: Model Name and Edit Env Button
-        ttk.Label(self.top_frame, text="模型名称:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.model_entry = ttk.Entry(self.top_frame, textvariable=self.model_var, width=30)
-        self.model_entry.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
-        
-        ttk.Button(self.top_frame, text="⚙ 环境变量设置", command=self.open_env_vars).grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        # Row 0: 模型选择下拉
+        ttk.Label(self.top_frame, text="文本模型:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self._search_model_map = {}
+        self.search_model_combo = ttk.Combobox(self.top_frame, state="readonly", width=40)
+        self.search_model_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        self.search_model_combo.bind("<<ComboboxSelected>>", self._on_search_model_selected)
+        # 初始化下拉选项
+        self._refresh_search_model_combo()
 
         # Row 1: 检索数据库列表
         ttk.Label(self.top_frame, text="检索数据库:").grid(row=1, column=0, sticky=tk.W+tk.N, padx=5, pady=5)
@@ -274,18 +489,22 @@ class PhotoIdentifyGUI(tk.Tk):
         self.top_frame.pack(side=tk.TOP, fill=tk.X)
         self.main_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+    # ── Tab 2: 信息扫描 ──────────────────────────────────────────
+
     def _init_scan_tab(self):
-        self.scan_model_var = tk.StringVar(value=DEFAULT_VISION_MODEL)
         self.scan_db_var = tk.StringVar(value=self.db_path)
         self.scan_paths = []
         
         form_frame = ttk.Frame(self.scan_tab, padding="20")
         form_frame.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(form_frame, text="视觉模型名称:").grid(row=0, column=0, sticky=tk.W, pady=10)
-        ttk.Entry(form_frame, textvariable=self.scan_model_var, width=40).grid(row=0, column=1, sticky=tk.W, pady=10)
-        
-        ttk.Button(form_frame, text="⚙ 环境变量设置", command=self.open_env_vars).grid(row=0, column=2, padx=10, sticky=tk.W, pady=10)
+        # 视觉模型下拉
+        ttk.Label(form_frame, text="视觉模型:").grid(row=0, column=0, sticky=tk.W, pady=10)
+        self._scan_model_map = {}
+        self.scan_model_combo = ttk.Combobox(form_frame, state="readonly", width=40)
+        self.scan_model_combo.grid(row=0, column=1, sticky=tk.W, pady=10)
+        self.scan_model_combo.bind("<<ComboboxSelected>>", self._on_scan_model_selected)
+        self._refresh_scan_model_combo()
         
         ttk.Label(form_frame, text="数据库路径:").grid(row=1, column=0, sticky=tk.W, pady=10)
         ttk.Entry(form_frame, textvariable=self.scan_db_var, width=40).grid(row=1, column=1, sticky=tk.W, pady=10)
@@ -329,6 +548,139 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self.log_text = scrolledtext.ScrolledText(log_frame, state=tk.DISABLED, bg="black", fg="lightgreen", font=("Consolas", 10))
         self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+
+    # ── Tab 3: 模型管理 ──────────────────────────────────────────
+
+    def _init_model_tab(self):
+        """初始化模型管理标签页。"""
+        # 顶部工具栏
+        toolbar = ttk.Frame(self.model_tab, padding=(10, 8, 10, 4))
+        toolbar.pack(fill=tk.X)
+
+        ttk.Button(toolbar, text="➕ 新增", command=self._model_add).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="✏️ 编辑", command=self._model_edit).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="🗑 删除", command=self._model_delete).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="🔄 刷新状态", command=self._model_refresh).pack(side=tk.LEFT, padx=10)
+
+        # 将环境变量设置按钮放右侧
+        ttk.Button(toolbar, text="⚙ 环境变量设置", command=self.open_env_vars).pack(side=tk.RIGHT, padx=4)
+
+        # 状态提示
+        self._model_status_var = tk.StringVar(value="")
+        ttk.Label(toolbar, textvariable=self._model_status_var, foreground="gray").pack(side=tk.RIGHT, padx=10)
+
+        # 模型列表表格
+        tree_frame = ttk.Frame(self.model_tab, padding=(10, 0, 10, 10))
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("type", "name", "model_id", "base_url", "api_key_var", "status")
+        self._model_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+
+        col_settings = [
+            ("type",        "模型类型",     80,  tk.CENTER),
+            ("name",        "模型名称",     160, tk.W),
+            ("model_id",    "模型ID",       160, tk.W),
+            ("base_url",    "接口地址",     200, tk.W),
+            ("api_key_var", "API变量名",    150, tk.W),
+            ("status",      "API状态",      70,  tk.CENTER),
+        ]
+        for col, heading, width, anchor in col_settings:
+            self._model_tree.heading(col, text=heading)
+            self._model_tree.column(col, width=width, anchor=anchor, minwidth=50)
+
+        # 配置不同状态的行标签（颜色）
+        self._model_tree.tag_configure("ok", foreground="green")
+        self._model_tree.tag_configure("fail", foreground="red")
+
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._model_tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self._model_tree.xview)
+        self._model_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self._model_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        # 双击编辑
+        self._model_tree.bind("<Double-1>", lambda e: self._model_edit())
+
+        # 存储 tree item id → model db id 的映射
+        self._tree_item_to_db_id: dict[str, int] = {}
+
+        # 填充数据
+        self._model_refresh()
+
+    def _model_refresh(self):
+        """刷新模型列表（重新读数据库 + 检查环境变量）。"""
+        self._model_tree.delete(*self._model_tree.get_children())
+        self._tree_item_to_db_id.clear()
+
+        models = self._model_mgr.get_all_models()
+        for m in models:
+            status_ok = m["api_key_status"]
+            status_text = "✅" if status_ok else "❌"
+            tag = "ok" if status_ok else "fail"
+            iid = self._model_tree.insert(
+                "", tk.END,
+                values=(m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"], status_text),
+                tags=(tag,)
+            )
+            self._tree_item_to_db_id[iid] = m["id"]
+
+        ok_count = sum(1 for m in models if m["api_key_status"])
+        self._model_status_var.set(f"共 {len(models)} 个模型 · {ok_count} 个 APIkey 已配置")
+
+        # 同步刷新两个下拉列表
+        self._refresh_search_model_combo()
+        self._refresh_scan_model_combo()
+
+    def _get_selected_model_db_id(self) -> int | None:
+        """获取当前在 Treeview 中选中的数据库 id，未选中返回 None。"""
+        selected = self._model_tree.selection()
+        if not selected:
+            messagebox.showinfo("提示", "请先选中一个模型！")
+            return None
+        return self._tree_item_to_db_id.get(selected[0])
+
+    def _model_add(self):
+        """弹出新增模型对话框。"""
+        dlg = ModelDialog(self, "新增模型")
+        self.wait_window(dlg)
+        if dlg.result:
+            r = dlg.result
+            self._model_mgr.add_model(r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"])
+            self._model_refresh()
+
+    def _model_edit(self):
+        """弹出编辑模型对话框。"""
+        db_id = self._get_selected_model_db_id()
+        if db_id is None:
+            return
+        model = self._model_mgr.get_model_by_id(db_id)
+        if not model:
+            return
+        dlg = ModelDialog(self, "编辑模型", model_data=model)
+        self.wait_window(dlg)
+        if dlg.result:
+            r = dlg.result
+            self._model_mgr.update_model(db_id, r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"])
+            self._model_refresh()
+
+    def _model_delete(self):
+        """删除选中的模型（弹确认框）。"""
+        db_id = self._get_selected_model_db_id()
+        if db_id is None:
+            return
+        model = self._model_mgr.get_model_by_id(db_id)
+        if not model:
+            return
+        if not messagebox.askyesno("确认删除", f"确定要删除模型「{model['name']}」吗？"):
+            return
+        self._model_mgr.delete_model(db_id)
+        self._model_refresh()
+
+    # ── 信息扫描相关方法 ──────────────────────────────────────────
 
     def export_scan_logs(self):
         log_content = self.log_text.get(1.0, tk.END).strip()
@@ -385,10 +737,11 @@ class PhotoIdentifyGUI(tk.Tk):
             
         self._save_settings()
         
-        api_key = load_api_key()
-        if not api_key:
-            messagebox.showwarning("警告", "未找到 API Key，请在环境变量配置 SILICONFLOW_API_KEY")
+        # 从选中的视觉模型获取 API 参数
+        api_params = self._get_scan_api_params()
+        if api_params is None:
             return
+        model_id, base_url, api_key = api_params
             
         self.scan_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.NORMAL)
@@ -426,6 +779,8 @@ class PhotoIdentifyGUI(tk.Tk):
             
             print("==================================================")
             print(f"[{time.strftime('%H:%M:%S')}] 扫描进程启动...")
+            print(f"使用模型: {model_id}")
+            print(f"接口地址: {base_url}")
             print("正在遍历与收集指定目录内所有符合条件的多媒体文件。")
             print("如果您选择了体积庞大的盘符或含有万级文件的目录，这可能需要数分钟的搜寻时间，请耐心等待...")
             print("==================================================\n")
@@ -435,7 +790,8 @@ class PhotoIdentifyGUI(tk.Tk):
                     paths=self.scan_paths,
                     db_path=self.scan_db_var.get(),
                     api_key=api_key,
-                    model=self.scan_model_var.get(),
+                    base_url=base_url,
+                    model=model_id,
                     rpm_limit=DEFAULT_RPM_LIMIT,
                     tpm_limit=DEFAULT_TPM_LIMIT,
                     cancel_event=self._scan_cancel_event,
@@ -482,6 +838,8 @@ class PhotoIdentifyGUI(tk.Tk):
 
         threading.Thread(target=_wait_and_restart, daemon=True).start()
 
+    # ── 图片检索相关方法 ──────────────────────────────────────────
+
     def add_search_db(self):
         files = filedialog.askopenfilenames(
             title="选择要添加的数据库文件",
@@ -519,7 +877,6 @@ class PhotoIdentifyGUI(tk.Tk):
         if hasattr(self, 'llm_radio'):
             self.llm_radio.config(state=state)
 
-
     def do_search(self):
         if not self.search_dbs:
             messagebox.showwarning("警告", "请至少添加一个数据库用于检索！")
@@ -532,13 +889,16 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self._save_settings()
 
-        api_key = load_api_key()
-        model = self.model_var.get().strip()
         is_llm_mode = (self.search_mode_var.get() == "llm")
-
-        if is_llm_mode and not api_key:
-            messagebox.showwarning("警告", "未在环境变量中找到有效的 API Key！请点击环境变量设置配置 SILICONFLOW_API_KEY。")
-            return
+        
+        if is_llm_mode:
+            # 从选中的文本模型获取 API 参数
+            api_params = self._get_search_api_params()
+            if api_params is None:
+                return
+            model_id, base_url, api_key = api_params
+        else:
+            model_id, base_url, api_key = "", "", ""
 
         self.toggle_state(tk.DISABLED)
         if is_llm_mode:
@@ -555,11 +915,11 @@ class PhotoIdentifyGUI(tk.Tk):
                     query=query,
                     db_paths=self.search_dbs,
                     limit=30,  # 截取前 30 个给 LLM 做重排
-                    smart=is_llm_mode, # 这里我们需要保证 smart 不仅做扩充，还要做重排
+                    smart=is_llm_mode,
                     api_key=api_key,
-                    base_url=DEFAULT_BASE_URL,
-                    model=model,  # 新增传递给 search 的参数
-                    rerank=is_llm_mode,  # 新增标志
+                    base_url=base_url,
+                    model=model_id,
+                    rerank=is_llm_mode,
                 )
                 self.after(0, self._on_search_done, results, None)
             except Exception as e:
