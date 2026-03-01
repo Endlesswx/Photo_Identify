@@ -107,6 +107,45 @@ def _print_progress(stats: ScanStats, last_path: str, force: bool = False):
     sys.stdout.flush()
 
 
+def _extract_faces_with_resize(image_bytes: bytes) -> list[dict]:
+    """提取人脸前修正方向并适当缩放，以避免高分原图导致 CPU 转换瓶颈和内存激增。"""
+    try:
+        from photo_identify.face_manager import extract_faces
+        import numpy as np
+        from PIL import Image, ImageOps
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        orig_w, orig_h = img.width, img.height
+        max_dim = 1920
+        scale = 1.0
+        
+        if max(orig_w, orig_h) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.Resampling.BILINEAR)
+            scale = orig_w / img.width
+
+        image_np = np.array(img)
+        faces = extract_faces(image_np)
+        
+        if scale != 1.0 and faces:
+            for face in faces:
+                bbox = face["bbox"]
+                face["bbox"] = [
+                    bbox[0] * scale,
+                    bbox[1] * scale,
+                    bbox[2] * scale,
+                    bbox[3] * scale
+                ]
+                
+        return faces
+    except Exception as e:
+        logger.error(f"人脸提取过程中出错: {e}", exc_info=False)
+        return []
+
 def _analyze_single(
     path: str,
     api_key: str,
@@ -116,6 +155,7 @@ def _analyze_single(
     max_tokens: int,
     timeout: int,
     rate_limiter: RateLimiter,
+    enable_face_scan: bool = False,
 ) -> dict:
     """分析单张图片：读取→压缩→调用 LLM→合并结果。
 
@@ -128,6 +168,7 @@ def _analyze_single(
         max_tokens: 最大输出 token 数。
         timeout: HTTP 超时秒数。
         rate_limiter: 速率限制器。
+        enable_face_scan: 是否进行人脸扫描。
 
     Returns:
         合并了元数据和 LLM 分析结果的完整记录字典。
@@ -159,6 +200,10 @@ def _analyze_single(
     )
 
     metadata.update(llm_result)
+    
+    if enable_face_scan:
+        metadata["faces"] = _extract_faces_with_resize(image_bytes)
+
     metadata["analyzed_at"] = datetime.now().isoformat()
     return metadata
 
@@ -178,6 +223,7 @@ def scan(
     extensions: frozenset[str] = DEFAULT_IMAGE_EXTENSIONS,
     cancel_event: threading.Event | None = None,
     video_frame_interval: float = DEFAULT_VIDEO_FRAME_INTERVAL,
+    enable_face_scan: bool = False,
 ):
     """执行图片扫描主流程。
 
@@ -196,9 +242,16 @@ def scan(
         tpm_limit: 每分钟最大 token 数。
         workers: 并发线程数。
         extensions: 允许的图片扩展名集合。
+        enable_face_scan: 是否进行人脸扫描和聚类。
     """
     storage = Storage(db_path)
     rate_limiter = RateLimiter(rpm_limit, tpm_limit)
+
+    # 如果需要人脸识别，提前预热模型并打印设备状态
+    if enable_face_scan:
+        from photo_identify.face_manager import get_face_app, get_device_mode
+        get_face_app()
+        logger.info(f"人脸引擎已启动，当前模式: {get_device_mode()}")
 
     # 收集所有图片路径
     all_images: list[str] = []
@@ -207,14 +260,50 @@ def scan(
         logger.info("目录 %s 发现 %d 张图片", p, len(found))
         all_images.extend(found)
 
+    def _do_clustering():
+        if not enable_face_scan:
+            return
+        try:
+            from photo_identify.face_manager import cluster_face_embeddings
+            import numpy as np
+            print("\n正在聚类相似人脸...")
+            all_faces = storage.get_all_faces()
+            if not all_faces:
+                print("未发现人脸数据，跳过聚类。")
+                return
+            
+            # 将 embedding bytes 转换回 numpy array
+            embeddings_with_ids = []
+            for face_id, embedding_bytes in all_faces:
+                embedding_np = np.frombuffer(embedding_bytes, dtype=np.float32)
+                embeddings_with_ids.append((face_id, embedding_np))
+                
+            cluster_mapping = cluster_face_embeddings(embeddings_with_ids)
+            storage.update_face_clusters(cluster_mapping)
+            print(f"人脸聚类完成，共识别出 {len(set(c for c in cluster_mapping.values() if c >= 0))} 位主要人物（过滤了低频路人或侧脸）。")
+        except Exception as e:
+            logger.error(f"人脸聚类出错: {e}")
+            print(f"人脸聚类时发生错误: {e}")
+
     if not all_images:
         print("未发现任何图片文件。")
+        _do_clustering()
         storage.close()
         return
 
     # 加载已有数据用于跳过判断
     known_md5s = storage.get_known_md5s()
     known_paths = storage.get_known_paths()
+    face_scanned_md5s = storage.get_face_scanned_md5s() if enable_face_scan else set()
+
+    # 如果开启了人脸扫描，找出只做了 LLM 分析还没做人脸扫描的记录
+    faces_to_process = set()
+    if enable_face_scan:
+        all_faces = storage.get_all_faces()
+        # image_id 和 md5 的映射不在内存，所以我们要让没做过人脸的走一遍 worker，但跳过 LLM
+        # 简单策略：已知存在于 images 表的 MD5 会走 _SKIPPED_SENTINEL，
+        # 为了补充人脸，我们需要在 _worker 里处理。
+        # 这里不需要预先过滤，直接在 _worker 里判断即可。
 
     stats = ScanStats()
     stats.total = len(all_images)
@@ -231,17 +320,22 @@ def scan(
         if cached:
             try:
                 st = Path(img_path).stat()
-                cached_size, cached_mtime = cached
+                cached_size, cached_mtime, cached_md5 = cached
                 if cached_size == st.st_size and cached_mtime == datetime.fromtimestamp(st.st_mtime).isoformat():
-                    stats.skipped += 1
-                    _print_progress(stats, img_path, force=(stats.current == stats.total))
-                    continue
+                    # 判断如果还需要人脸扫描，但缓存没有记录已经扫过，则不跳过
+                    if enable_face_scan and cached_md5 not in face_scanned_md5s:
+                        pass # 继续加入 to_analyze，依赖_worker精确判断
+                    else:
+                        stats.skipped += 1
+                        _print_progress(stats, img_path, force=(stats.current == stats.total))
+                        continue
             except OSError:
                 pass
         to_analyze.append(img_path)
         _print_progress(stats, img_path, force=(stats.current == stats.total))
 
     if cancel_event and cancel_event.is_set():
+        _do_clustering()
         storage.close()
         return
 
@@ -250,6 +344,7 @@ def scan(
         _print_progress(stats, "", force=True)
         sys.stdout.write("\n")
         print(f"所有 {stats.total} 张图片均已分析，无需处理。")
+        _do_clustering()
         storage.close()
         return
 
@@ -292,9 +387,12 @@ def scan(
                 frame_md5 = compute_md5(frame_bytes)
                 with _md5_lock:
                     if frame_md5 in known_md5s:
-                        results.append(_SKIPPED_SENTINEL)
-                        continue
+                        if not enable_face_scan or frame_md5 in face_scanned_md5s:
+                            results.append(_SKIPPED_SENTINEL)
+                            continue
                     known_md5s.add(frame_md5)
+                    if enable_face_scan:
+                        face_scanned_md5s.add(frame_md5)
 
                 ts_label = f"{ts:.1f}s"
                 compressed, fmt = compress_for_upload(frame_bytes)
@@ -332,10 +430,33 @@ def scan(
         except (OSError, PermissionError) as exc:
             logger.warning("无法读取文件 %s: %s", img_path, exc)
             return img_path, None
+        
+        need_llm = True
+        need_face = enable_face_scan
+        
         with _md5_lock:
             if md5 in known_md5s:
-                return img_path, _SKIPPED_SENTINEL
-            known_md5s.add(md5)
+                need_llm = False
+            if need_face and md5 in face_scanned_md5s:
+                need_face = False
+                
+            # 如果将要执行相关操作，则预先占位，防止其他线程并发执行
+            if need_llm:
+                known_md5s.add(md5)
+            if need_face:
+                face_scanned_md5s.add(md5)
+                
+        if not need_llm and not need_face:
+            return img_path, _SKIPPED_SENTINEL
+            
+        # 如果只需要人脸扫描（说明LLM已经做过了）
+        if not need_llm and need_face:
+            image_bytes = get_image_frame_bytes(img_path)
+            faces = _extract_faces_with_resize(image_bytes)
+            # 构造一个仅包含人脸和 MD5 的特殊结果，通知上层补充人脸数据
+            return img_path, {"md5": md5, "faces_only": faces}
+
+        # 正常做 LLM (也包含人脸识别如果开启了)
         try:
             return img_path, _analyze_single(
                 path=img_path,
@@ -346,6 +467,7 @@ def scan(
                 max_tokens=max_tokens,
                 timeout=timeout,
                 rate_limiter=rate_limiter,
+                enable_face_scan=enable_face_scan,
             )
         except Exception as exc:
             logger.error("分析失败 %s: %s", img_path, exc, exc_info=False)
@@ -376,7 +498,11 @@ def scan(
                             stats.failed += 1
                             logger.error("API 错误 %s: %s", img_path, r["error"])
                         else:
-                            storage.upsert(r)
+                            if enable_face_scan:
+                                r["face_scanned"] = True
+                            image_id = storage.upsert(r)
+                            if enable_face_scan and "faces" in r:
+                                storage.add_face_embeddings(image_id, r["faces"])
                             stats.processed += 1
                         _print_progress(stats, img_path, force=(stats.current == stats.total))
                 # 单条结果
@@ -389,8 +515,27 @@ def scan(
                     elif "error" in result:
                         stats.failed += 1
                         logger.error("API 错误 %s: %s", img_path, result["error"])
+                    elif "faces_only" in result:
+                        # 仅处理人脸更新的特殊结构
+                        import sqlite3
+                        try:
+                            cursor = storage._conn.cursor()
+                            cursor.execute("SELECT id FROM images WHERE md5 = ?", (result["md5"],))
+                            row = cursor.fetchone()
+                            if row:
+                                image_id = row[0]
+                                storage.add_face_embeddings(image_id, result["faces_only"])
+                                storage.mark_face_scanned(image_id)
+                            stats.processed += 1
+                        except Exception as e:
+                            logger.error("更新人脸数据失败 %s: %s", img_path, e)
+                            stats.failed += 1
                     else:
-                        storage.upsert(result)
+                        if enable_face_scan:
+                            result["face_scanned"] = True
+                        image_id = storage.upsert(result)
+                        if enable_face_scan and "faces" in result:
+                            storage.add_face_embeddings(image_id, result["faces"])
                         stats.processed += 1
                     _print_progress(stats, img_path, force=(stats.current == stats.total))
     except KeyboardInterrupt:
@@ -399,8 +544,11 @@ def scan(
 
     sys.stdout.write("\n")
     print(
-        f"\n扫描完成 — 总计: {stats.total}  新增: {stats.processed}  "
+        f"\n扫描完成 — 总计: {stats.total}  新增/更新: {stats.processed}  "
         f"跳过: {stats.skipped}  失败: {stats.failed}  "
         f"数据库记录数: {storage.count()}"
     )
+    
+    _do_clustering()
+
     storage.close()

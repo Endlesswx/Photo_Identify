@@ -24,6 +24,7 @@ photo_identify_gui.ini
 
 # 项目特定：用户要求忽略的文件
 可用模型列表/
+用户需求.txt
 
 # IDE 及系统文件
 .vscode/

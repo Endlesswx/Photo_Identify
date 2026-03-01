@@ -35,11 +35,33 @@ CREATE TABLE IF NOT EXISTS images (
     location_time TEXT,
     wallpaper_hint TEXT,
     llm_raw TEXT,
-    analyzed_at TEXT
+    analyzed_at TEXT,
+    face_scanned INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS face_embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id INTEGER NOT NULL,
+    bbox TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    cluster_id INTEGER DEFAULT -1,
+    FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS persons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id INTEGER UNIQUE,
+    name TEXT NOT NULL,
+    cover_image_id INTEGER,
+    cover_face_id INTEGER,
+    sort_order INTEGER DEFAULT 0,
+    is_deleted INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_images_md5 ON images(md5);
 CREATE INDEX IF NOT EXISTS idx_images_path ON images(path);
+CREATE INDEX IF NOT EXISTS idx_face_image_id ON face_embeddings(image_id);
+CREATE INDEX IF NOT EXISTS idx_face_cluster_id ON face_embeddings(cluster_id);
 """
 
 _FTS_SCHEMA_SQL = """
@@ -94,6 +116,24 @@ class Storage:
         """创建数据库表和全文搜索索引。"""
         cursor = self._conn.cursor()
         cursor.executescript(_SCHEMA_SQL)
+        # 增加 face_scanned 字段（如果是旧库）
+        try:
+            cursor.execute("ALTER TABLE images ADD COLUMN face_scanned INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass # 字段已存在
+            
+        # 增加 sort_order 字段
+        try:
+            cursor.execute("ALTER TABLE persons ADD COLUMN sort_order INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass # 字段已存在
+            
+        # 增加 is_deleted 字段
+        try:
+            cursor.execute("ALTER TABLE persons ADD COLUMN is_deleted INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass # 字段已存在
+            
         cursor.executescript(_FTS_SCHEMA_SQL)
         cursor.executescript(_FTS_TRIGGER_INSERT)
         cursor.executescript(_FTS_TRIGGER_DELETE)
@@ -109,14 +149,22 @@ class Storage:
         cursor = self._conn.execute("SELECT md5 FROM images")
         return {row[0] for row in cursor.fetchall()}
 
-    def get_known_paths(self) -> dict[str, tuple[int, float]]:
-        """获取所有已入库图片的路径及其 size+mtime 信息，用于快速跳过判断。
+    def get_face_scanned_md5s(self) -> set[str]:
+        """获取所有已完成人脸扫描的图片的 MD5 集合。"""
+        try:
+            cursor = self._conn.execute("SELECT md5 FROM images WHERE face_scanned = 1")
+            return {row[0] for row in cursor.fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    def get_known_paths(self) -> dict[str, tuple[int, str, str]]:
+        """获取所有已入库图片的路径及其 size+mtime+md5 信息，用于快速跳过判断。
 
         Returns:
-            字典，key 为路径，value 为 (size_bytes, modified_time 字符串)。
+            字典，key 为路径，value 为 (size_bytes, modified_time 字符串, md5 字符串)。
         """
-        cursor = self._conn.execute("SELECT path, size_bytes, modified_time FROM images")
-        return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+        cursor = self._conn.execute("SELECT path, size_bytes, modified_time, md5 FROM images")
+        return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
 
     def has_md5(self, md5: str) -> bool:
         """检查指定 MD5 是否已入库。
@@ -130,50 +178,279 @@ class Storage:
         cursor = self._conn.execute("SELECT 1 FROM images WHERE md5 = ?", (md5,))
         return cursor.fetchone() is not None
 
-    def upsert(self, record: dict):
+    def upsert(self, record: dict) -> int:
         """插入或更新一条图片分析记录（按 MD5 去重）。
 
         Args:
             record: 包含所有字段的字典。
+            
+        Returns:
+            int: 插入或更新的图片记录的数据库 ID (image_id)
         """
         objects_str = json.dumps(record.get("objects", []), ensure_ascii=False) if isinstance(record.get("objects"), list) else record.get("objects", "")
-        self._conn.execute(
+        cursor = self._conn.cursor()
+        
+        # 尝试查询已有的 id
+        cursor.execute("SELECT id FROM images WHERE md5 = ?", (record["md5"],))
+        existing_row = cursor.fetchone()
+        
+        update_face_scanned = record.get("face_scanned", False)
+        if existing_row:
+            image_id = existing_row[0]
+            if update_face_scanned:
+                # 执行更新
+                cursor.execute(
+                    """
+                    UPDATE images SET
+                        path = ?,
+                        file_name = ?,
+                        size_bytes = ?,
+                        analyzed_at = ?,
+                        face_scanned = 1
+                    WHERE md5 = ?
+                    """,
+                    (
+                        record.get("path", ""),
+                        record.get("file_name", ""),
+                        record.get("size_bytes"),
+                        record.get("analyzed_at", ""),
+                        record["md5"],
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE images SET
+                        path = ?,
+                        file_name = ?,
+                        size_bytes = ?,
+                        analyzed_at = ?
+                    WHERE md5 = ?
+                    """,
+                    (
+                        record.get("path", ""),
+                        record.get("file_name", ""),
+                        record.get("size_bytes"),
+                        record.get("analyzed_at", ""),
+                        record["md5"],
+                    ),
+                )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO images (
+                    path, file_name, size_bytes, md5, sha256,
+                    width, height, image_mode, image_format, exif_json,
+                    created_time, modified_time,
+                    scene, objects, style, location_time, wallpaper_hint,
+                    llm_raw, analyzed_at, face_scanned
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.get("path", ""),
+                    record.get("file_name", ""),
+                    record.get("size_bytes"),
+                    record["md5"],
+                    record.get("sha256", ""),
+                    record.get("width"),
+                    record.get("height"),
+                    record.get("image_mode", ""),
+                    record.get("image_format", ""),
+                    json.dumps(record.get("exif", {}), ensure_ascii=False),
+                    record.get("created_time", ""),
+                    record.get("modified_time", ""),
+                    record.get("scene", ""),
+                    objects_str,
+                    record.get("style", ""),
+                    record.get("location_time", ""),
+                    record.get("wallpaper_hint", ""),
+                    record.get("llm_raw", ""),
+                    record.get("analyzed_at", ""),
+                    1 if update_face_scanned else 0,
+                ),
+            )
+            image_id = cursor.lastrowid or 0
+            
+        self._conn.commit()
+        return int(image_id)
+
+    def mark_face_scanned(self, image_id: int):
+        """将指定图片的 face_scanned 标记为 1"""
+        self._conn.execute("UPDATE images SET face_scanned = 1 WHERE id = ?", (image_id,))
+        self._conn.commit()
+
+    def add_face_embeddings(self, image_id: int, faces: list[dict]):
+        """将提取到的人脸特征写入数据库。
+        
+        Args:
+            image_id: 关联的图片 ID
+            faces: face_manager.extract_faces 返回的字典列表
+        """
+        if not faces:
+            return
+            
+        cursor = self._conn.cursor()
+        for face in faces:
+            bbox_str = json.dumps(face["bbox"])
+            embedding_blob = face["embedding"].tobytes()
+            cursor.execute(
+                "INSERT INTO face_embeddings (image_id, bbox, embedding) VALUES (?, ?, ?)",
+                (image_id, bbox_str, embedding_blob)
+            )
+        self._conn.commit()
+
+    def get_unclustered_faces(self) -> list[tuple[int, bytes]]:
+        """获取所有尚未聚类的人脸数据。
+        
+        Returns:
+            list of (face_id, embedding_bytes)
+        """
+        cursor = self._conn.execute("SELECT id, embedding FROM face_embeddings WHERE cluster_id = -1")
+        return [(row[0], row[1]) for row in cursor.fetchall()]
+
+    def get_all_faces(self) -> list[tuple[int, bytes]]:
+        """获取所有的人脸数据，用于全量聚类。
+        
+        Returns:
+            list of (face_id, embedding_bytes)
+        """
+        cursor = self._conn.execute("SELECT id, embedding FROM face_embeddings")
+        return [(row[0], row[1]) for row in cursor.fetchall()]
+        
+    def update_face_clusters(self, cluster_mapping: dict[int, int]):
+        """更新人脸聚类结果并同步至 persons 表。
+        
+        Args:
+            cluster_mapping: {face_id: cluster_id}
+        """
+        if not cluster_mapping:
+            return
+            
+        cursor = self._conn.cursor()
+        
+        # 1. 备份当前 persons 里的所有数据（以 cover_face_id 为锚点识别身份）
+        cursor.execute("SELECT cover_face_id, name, sort_order, is_deleted FROM persons")
+        named_faces = cursor.fetchall()
+        # {face_id: (name, sort_order, is_deleted)}
+        custom_names = {row[0]: (row[1], row[2], row[3]) for row in named_faces if row[0] is not None}
+        
+        # 清空现有的 persons 表（因为 DBSCAN 每次重新聚类的 cluster_id 顺序和意义都会完全改变）
+        cursor.execute("DELETE FROM persons")
+        
+        # 2. 更新 face_embeddings 的 cluster_id
+        for face_id, cluster_id in cluster_mapping.items():
+            cursor.execute("UPDATE face_embeddings SET cluster_id = ? WHERE id = ?", (cluster_id, face_id))
+            
+        # 3. 找到所有独立且大于 0 的 cluster_id (排除 -1 噪点)
+        unique_clusters = set(cid for cid in cluster_mapping.values() if cid >= 0)
+        
+        # 4. 为新的 cluster_id 在 persons 表中创建记录
+        for cid in unique_clusters:
+            # 找出该 cluster 下所有的 face_id
+            cursor.execute("SELECT id, image_id FROM face_embeddings WHERE cluster_id = ?", (cid,))
+            cluster_faces = cursor.fetchall()
+            if not cluster_faces:
+                continue
+                
+            # 尝试在这个类中找一个已经有自定义名字的人脸
+            person_name = None
+            sort_order = 0
+            is_deleted = 0
+            cover_face_id = cluster_faces[0][0]
+            cover_image_id = cluster_faces[0][1]
+            
+            # 优先找被重命名过或者改过设定的
+            for f_id, i_id in cluster_faces:
+                if f_id in custom_names:
+                    saved_name, saved_sort, saved_del = custom_names[f_id]
+                    # 如果有多个历史匹配，优先保留 非“人物_”开头的
+                    if person_name is None or (not saved_name.startswith("人物_")):
+                        person_name = saved_name
+                        sort_order = saved_sort
+                        is_deleted = saved_del
+                        cover_face_id = f_id
+                        cover_image_id = i_id
+                    
+            if not person_name:
+                person_name = f"人物_{cid:03d}"
+                
+            cursor.execute(
+                "INSERT INTO persons (cluster_id, name, cover_image_id, cover_face_id, sort_order, is_deleted) VALUES (?, ?, ?, ?, ?, ?)",
+                (cid, person_name, cover_image_id, cover_face_id, sort_order, is_deleted)
+            )
+        
+        self._conn.commit()
+
+    def get_all_persons(self, include_deleted: bool = False) -> list[dict]:
+        """获取所有聚类人物列表（优先按 sort_order 升序，其次按该人照片数倒序）。"""
+        where_clause = "" if include_deleted else "WHERE p.is_deleted = 0"
+        cursor = self._conn.execute(
+            f"""
+            SELECT p.id, p.cluster_id, p.name, p.cover_image_id, p.cover_face_id,
+                   p.sort_order, p.is_deleted,
+                   i.path, fe.bbox,
+                   (SELECT COUNT(DISTINCT image_id) FROM face_embeddings WHERE cluster_id = p.cluster_id) as face_count
+            FROM persons p
+            LEFT JOIN images i ON p.cover_image_id = i.id
+            LEFT JOIN face_embeddings fe ON p.cover_face_id = fe.id
+            {where_clause}
+            ORDER BY p.sort_order ASC, face_count DESC, p.id ASC
             """
-            INSERT INTO images (
-                path, file_name, size_bytes, md5, sha256,
-                width, height, image_mode, image_format, exif_json,
-                created_time, modified_time,
-                scene, objects, style, location_time, wallpaper_hint,
-                llm_raw, analyzed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(md5) DO UPDATE SET
-                path = excluded.path,
-                file_name = excluded.file_name,
-                size_bytes = excluded.size_bytes,
-                analyzed_at = excluded.analyzed_at
-            """,
-            (
-                record.get("path", ""),
-                record.get("file_name", ""),
-                record.get("size_bytes"),
-                record["md5"],
-                record.get("sha256", ""),
-                record.get("width"),
-                record.get("height"),
-                record.get("image_mode", ""),
-                record.get("image_format", ""),
-                json.dumps(record.get("exif", {}), ensure_ascii=False),
-                record.get("created_time", ""),
-                record.get("modified_time", ""),
-                record.get("scene", ""),
-                objects_str,
-                record.get("style", ""),
-                record.get("location_time", ""),
-                record.get("wallpaper_hint", ""),
-                record.get("llm_raw", ""),
-                record.get("analyzed_at", ""),
-            ),
         )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_deleted_persons(self) -> list[dict]:
+        """获取回收站内的人物列表，按照片数倒序。"""
+        cursor = self._conn.execute(
+            """
+            SELECT p.id, p.cluster_id, p.name, p.cover_image_id, p.cover_face_id,
+                   i.path, fe.bbox,
+                   (SELECT COUNT(DISTINCT image_id) FROM face_embeddings WHERE cluster_id = p.cluster_id) as face_count
+            FROM persons p
+            LEFT JOIN images i ON p.cover_image_id = i.id
+            LEFT JOIN face_embeddings fe ON p.cover_face_id = fe.id
+            WHERE p.is_deleted = 1
+            ORDER BY face_count DESC, p.id ASC
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_person_sort_order(self, person_ids_in_order: list[int]):
+        """批量更新人物排序顺序"""
+        cursor = self._conn.cursor()
+        for idx, person_id in enumerate(person_ids_in_order):
+            cursor.execute("UPDATE persons SET sort_order = ? WHERE id = ?", (idx, person_id))
+        self._conn.commit()
+
+    def update_person_cover(self, person_id: int, cover_image_id: int, cover_face_id: int):
+        """设置某人物的封面头像"""
+        self._conn.execute(
+            "UPDATE persons SET cover_image_id = ?, cover_face_id = ? WHERE id = ?",
+            (cover_image_id, cover_face_id, person_id)
+        )
+        self._conn.commit()
+
+    def set_person_deleted(self, person_id: int, is_deleted: int = 1):
+        """将人物移入/移出回收站"""
+        self._conn.execute("UPDATE persons SET is_deleted = ? WHERE id = ?", (is_deleted, person_id))
+        self._conn.commit()
+
+        
+    def get_images_by_person(self, cluster_id: int) -> list[dict]:
+        """获取某个人物相关的图片。"""
+        sql = """
+        SELECT DISTINCT i.* 
+        FROM face_embeddings fe
+        JOIN images i ON fe.image_id = i.id
+        WHERE fe.cluster_id = ?
+        ORDER BY i.modified_time DESC
+        """
+        cursor = self._conn.execute(sql, (cluster_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def update_person_name(self, person_id: int, new_name: str):
+        """重命名人物"""
+        self._conn.execute("UPDATE persons SET name = ? WHERE id = ?", (new_name, person_id))
         self._conn.commit()
 
     def search_fts(self, query: str, limit: int = 50) -> list[dict]:
