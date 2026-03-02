@@ -200,6 +200,30 @@ def _extract_json_from_text(text: str) -> dict | None:
     return None
 
 
+class CircuitBreaker:
+    """全局断路器，用于探测并熔断长时间无响应的 API 请求假死。"""
+    def __init__(self, max_consecutive_failures: int = 5):
+        import threading
+        self.max_consecutive_failures = max_consecutive_failures
+        self.consecutive_failures = 0
+        self.is_open = False
+        self._lock = threading.Lock()
+
+    def record_failure(self):
+        with self._lock:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.is_open = True
+                
+    def record_success(self):
+        with self._lock:
+            self.consecutive_failures = 0
+            self.is_open = False
+
+# 全局共享断路器实例
+global_circuit_breaker = CircuitBreaker()
+
+
 def call_image_model(
     image_bytes: bytes,
     image_format: str = "jpeg",
@@ -228,6 +252,9 @@ def call_image_model(
         包含 scene/objects/style/location_time/wallpaper_hint/llm_raw 的字典；
         失败时包含 error 字段。
     """
+    if global_circuit_breaker.is_open:
+        return {"error": "断路器已触发，API 拒绝服务或持续超时，请检查网络或稍后再试。", "__circuit_breaker_open__": True}
+
     prompt = _build_prompt()
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = _build_payload(model, temperature, max_tokens, prompt, image_b64, image_format)
@@ -243,9 +270,21 @@ def call_image_model(
             rate_limiter.wait(token_cost)
         try:
             status, data = _request_json(f"{base_url}/chat/completions", payload, headers, timeout)
+            # 成功请求则重置断路器
+            if status < 500:
+                global_circuit_breaker.record_success()
+                
         except Exception as exc:
             last_error = str(exc)
             logger.warning("API 请求异常 (第 %d 次): %s", attempt, exc)
+            
+            # 对"完全读不出"或超时这类网络连通性异常触发快速失效并记录断路器
+            if "timed out" in str(exc).lower() or "connection" in str(exc).lower():
+                global_circuit_breaker.record_failure()
+                if global_circuit_breaker.is_open:
+                    logger.error("连续网络超时达到阈值，触发断路器熔断！")
+                    return {"error": f"触发断路器：网络持续无法连接或超时 ({last_error})", "__circuit_breaker_open__": True}
+            
             if attempt < MAX_RETRIES:
                 time.sleep(min(RETRY_BASE_DELAY ** attempt, 3.0))
             continue
@@ -253,6 +292,11 @@ def call_image_model(
         if status >= 500:
             last_error = f"HTTP {status}: {data}"
             logger.warning("服务端错误 (第 %d 次): %s", attempt, last_error)
+            global_circuit_breaker.record_failure()
+            if global_circuit_breaker.is_open:
+                    logger.error("连续服务端 500 错误达到阈值，触发断路器熔断！")
+                    return {"error": f"触发断路器：服务端持续返回错误 ({last_error})", "__circuit_breaker_open__": True}
+                    
             if attempt < MAX_RETRIES:
                 time.sleep(min(RETRY_BASE_DELAY ** attempt, 3.0))
             continue

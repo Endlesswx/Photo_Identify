@@ -138,6 +138,16 @@ class Storage:
         cursor.executescript(_FTS_TRIGGER_INSERT)
         cursor.executescript(_FTS_TRIGGER_DELETE)
         cursor.executescript(_FTS_TRIGGER_UPDATE)
+
+        # 持续失败的文件记录表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS skipped_files (
+                path TEXT PRIMARY KEY,
+                reason TEXT,
+                skipped_at TEXT
+            )
+        """)
+
         self._conn.commit()
 
     def get_known_md5s(self) -> set[str]:
@@ -165,6 +175,23 @@ class Storage:
         """
         cursor = self._conn.execute("SELECT path, size_bytes, modified_time, md5 FROM images")
         return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+
+    def get_skipped_paths(self) -> set[str]:
+        """获取所有持续失败的文件路径集合，扫描时跳过。"""
+        try:
+            cursor = self._conn.execute("SELECT path FROM skipped_files")
+            return {row[0] for row in cursor.fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    def add_skipped_file(self, path: str, reason: str):
+        """记录持续失败的文件，下次扫描时跳过。"""
+        from datetime import datetime
+        self._conn.execute(
+            "INSERT OR REPLACE INTO skipped_files (path, reason, skipped_at) VALUES (?, ?, ?)",
+            (path, reason, datetime.now().isoformat()),
+        )
+        self._conn.commit()
 
     def has_md5(self, md5: str) -> bool:
         """检查指定 MD5 是否已入库。

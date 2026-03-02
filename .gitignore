@@ -28,6 +28,7 @@ photo_identify_gui.ini
 
 # IDE 及系统文件
 .vscode/
+.claude
 .idea/
 .DS_Store
 Thumbs.db

@@ -858,6 +858,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pillow-heif" },
     { name = "scikit-learn" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -872,6 +873,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=11.1.0" },
     { name = "pillow-heif", specifier = ">=0.21.0" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
+    { name = "tqdm", specifier = ">=4.66.0" },
 ]
 
 [[package]]

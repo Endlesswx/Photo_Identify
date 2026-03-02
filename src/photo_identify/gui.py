@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import io
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import scrolledtext
@@ -73,38 +74,51 @@ def crop_and_circle_face(image: Image.Image, bbox_str: str, size: int = 80) -> I
     
     return result
 
-class StdoutRedirector:
-    """重定向标准输出到 tkinter Text UI 组件的包装器"""
-    def __init__(self, text_widget: scrolledtext.ScrolledText):
-        self.text_widget = text_widget
-        self.buffer = ""
+class TkLineWriter:
+    """tqdm 兼容的文件对象，将输出更新到 Text 组件的指定行。
 
-    def write(self, string):
-        if not string:
+    支持多线程：所有 Tkinter 操作通过 after() 调度到主线程。
+    内置节流（100ms），避免高频刷新导致 GUI 卡顿。
+    """
+
+    def __init__(self, text_widget, line_num: int):
+        self.text_widget = text_widget
+        self.line_num = line_num
+        self._latest_text = ""
+        self._update_pending = False
+        self._lock = threading.Lock()
+
+    def write(self, s):
+        if not s:
             return
-            
-        def _update_ui(s=string):
+        # 清除 tqdm 输出的 ANSI 转义序列（如 \033[A 光标上移）
+        text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', s)
+        text = text.replace('\r', '').replace('\n', '').strip()
+        if not text:
+            return
+        with self._lock:
+            self._latest_text = text
+            if not self._update_pending:
+                self._update_pending = True
+                self.text_widget.after(100, self._do_update)
+
+    def _do_update(self):
+        with self._lock:
+            text = self._latest_text
+            self._update_pending = False
+        try:
             self.text_widget.configure(state=tk.NORMAL)
-            if '\r' in s:
-                # 遇到 \r 表示要回到行首覆盖当前行，终端进度条常见做法
-                lines = s.split('\r')
-                # 取最后的有意义文本（因为 \r 之后的内容会覆盖前面的）
-                final_text = lines[-1] if lines[-1] else (lines[-2] if len(lines) > 1 else "")
-                
-                # 删除最后一行（从前一个换行符到末尾）并替换
-                self.text_widget.delete("end-1c linestart", "end-1c")
-                self.text_widget.insert("end-1c", final_text)
-            else:
-                self.text_widget.insert(tk.END, s)
-                
-            self.text_widget.see(tk.END)
+            self.text_widget.delete(f"{self.line_num}.0", f"{self.line_num}.0 lineend")
+            self.text_widget.insert(f"{self.line_num}.0", text)
             self.text_widget.configure(state=tk.DISABLED)
-            
-        # 安全地将其放入 Tkinter 事件队列
-        self.text_widget.after(0, _update_ui)
+        except Exception:
+            pass
 
     def flush(self):
         pass
+
+    def isatty(self):
+        return False
 
 
 class ModelDialog(tk.Toplevel):
@@ -674,9 +688,15 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self.scan_btn = ttk.Button(form_frame, text="▶ 开始扫描 (见下方日志)", command=self.start_scan)
         self.scan_btn.grid(row=5, column=1, sticky=tk.EW, pady=20, ipady=5)
-        
-        self.restart_btn = ttk.Button(form_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
-        self.restart_btn.grid(row=5, column=2, sticky=tk.W, padx=10, pady=20, ipady=5)
+
+        scan_ctrl_frame = ttk.Frame(form_frame)
+        scan_ctrl_frame.grid(row=5, column=2, sticky=tk.W, padx=10, pady=20)
+
+        self.restart_btn = ttk.Button(scan_ctrl_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=(0, 5), ipady=5)
+
+        self.stop_btn = ttk.Button(scan_ctrl_frame, text="⏹ 停止扫描", command=self.stop_scan, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, ipady=5)
         
         self._scan_cancel_event = None
         self._scan_thread_ref = None
@@ -797,6 +817,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.person_thumbnail_images.clear()
         self._person_frames.clear()
         self._selected_person_id = None
+        self._person_frame_order = None  # 重置显示顺序跟踪
         
         # 只有当没有要求保留选择，或者右侧还没有被渲染时，才清空右侧画廊
         if keep_selected_id is None:
@@ -832,9 +853,12 @@ class PhotoIdentifyGUI(tk.Tk):
                         
                     self.after(0, self._add_person_list_item, idx, p, img, current_gen)
                     
-                # 加载完毕后，如果需要恢复选中状态
+                # 加载完毕后，恢复选中状态或默认选中第一个人物
                 if keep_selected_id is not None:
                     self.after(100, lambda: self._select_person(keep_selected_id, refresh_gallery=refresh_gallery))
+                elif self.person_list:
+                    first_id = self.person_list[0]["id"]
+                    self.after(100, lambda pid=first_id: self._select_person(pid))
                     
             threading.Thread(target=_thread_load, daemon=True).start()
             
@@ -901,7 +925,11 @@ class PhotoIdentifyGUI(tk.Tk):
         menu = tk.Menu(item_frame, tearoff=0)
         menu.add_command(label="重命名", command=lambda pid=person_id: self._rename_person(pid))
         menu.add_command(label="移入回收站", command=lambda pid=person_id: self._delete_person(pid))
-        
+        if p_data.get("path"):
+            def _open_loc_person():
+                self._open_file_location_by_path(p_data.get("path", ""))
+            menu.add_command(label="打开文件位置", command=_open_loc_person)
+            
         def show_menu(e):
             menu.tk_popup(e.x_root, e.y_root)
             
@@ -1129,18 +1157,21 @@ class PhotoIdentifyGUI(tk.Tk):
                 messagebox.showerror("删除失败", f"数据库更新错误:\n{e}")
 
     def _move_person(self, person_id, direction):
-        # 重新排序所有的 Frame
-        frames_list = list(self.person_list_inner_frame.winfo_children())
+        # 使用跟踪的显示顺序，而非 winfo_children()（后者始终返回创建顺序，排序后会失效）
+        if self._person_frame_order is None:
+            self._person_frame_order = list(self.person_list_inner_frame.winfo_children())
+
+        frames_list = list(self._person_frame_order)
         idx = -1
         for i, f in enumerate(frames_list):
             p_data = getattr(f, "person_data", None)
             if p_data and p_data["id"] == person_id:
                 idx = i
                 break
-                
+
         if idx == -1:
             return
-            
+
         new_idx = idx + direction
         if 0 <= new_idx < len(frames_list):
             # 交换位置
@@ -1150,6 +1181,9 @@ class PhotoIdentifyGUI(tk.Tk):
                 f.pack_forget()
             for f in frames_list:
                 f.pack(side=tk.TOP, fill=tk.X, expand=True)
+
+            # 更新跟踪的显示顺序
+            self._person_frame_order = frames_list
                 
             # 保存到数据库
             try:
@@ -1247,6 +1281,16 @@ class PhotoIdentifyGUI(tk.Tk):
         
         if is_cover:
             txt_lbl.configure(fg="blue", font=("Arial", 10, "bold"))
+            if p_data.get("path"):
+                menu = tk.Menu(item_frame, tearoff=0)
+                def _open_loc_cover():
+                    self._open_file_location_by_path(p_data.get("path", ""))
+                menu.add_command(label="打开文件位置", command=_open_loc_cover)
+                def show_menu_cover(e):
+                    menu.tk_popup(e.x_root, e.y_root)
+                item_frame.bind("<Button-3>", show_menu_cover)
+                img_lbl.bind("<Button-3>", show_menu_cover)
+                txt_lbl.bind("<Button-3>", show_menu_cover)
             
         if not is_cover and record:
             # 点击打开大图预览
@@ -1261,8 +1305,13 @@ class PhotoIdentifyGUI(tk.Tk):
             img_lbl.bind("<Button-1>", on_click)
             txt_lbl.bind("<Button-1>", on_click)
             
-            # 右键菜单设为头像
+            # 右键菜单
             menu = tk.Menu(item_frame, tearoff=0)
+            def _copy_filename(r=record):
+                file_name = r.get("file_name", os.path.basename(r.get("path", "")))
+                self.clipboard_clear()
+                self.clipboard_append(file_name)
+            menu.add_command(label="复制文件名", command=_copy_filename)
             def _set_cover():
                 person_id = p_data["id"]
                 image_id = record["id"]
@@ -1273,6 +1322,10 @@ class PhotoIdentifyGUI(tk.Tk):
                 self._set_person_cover_action(person_id, p_data["cluster_id"], image_id)
                 
             menu.add_command(label="设为头像", command=_set_cover)
+            
+            def _open_loc():
+                self._open_file_location_by_path(record.get("path", ""))
+            menu.add_command(label="打开文件位置", command=_open_loc)
             
             def show_menu(e):
                 menu.tk_popup(e.x_root, e.y_root)
@@ -1534,9 +1587,12 @@ class PhotoIdentifyGUI(tk.Tk):
             
         self.scan_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL)
         self.scan_status_var.set("正在后台扫描，查看下方日志区...")
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete(1.0, tk.END)
+        face_hint = "准备中..." if self.enable_face_scan_var.get() else "未启用"
+        self.log_text.insert(tk.END, f"[信息扫描] 准备中...\n[人物识别] {face_hint}")
         self.log_text.configure(state=tk.DISABLED)
         
         self._scan_cancel_event = threading.Event()
@@ -1548,32 +1604,36 @@ class PhotoIdentifyGUI(tk.Tk):
         
         def _scan_thread():
             import logging
-            original_stdout = sys.stdout
-            original_stderr = sys.stderr
-            redirector = StdoutRedirector(self.log_text)
-            
-            # Redirect stdout and stderr to our text widget
-            sys.stdout = redirector
-            sys.stderr = redirector
-            
-            # Configure logging to emit to the new stdout
+            from logging.handlers import RotatingFileHandler
+
+            # ── 配置 Logging：控制台 + 文件（1MB 轮转） ──
             root_logger = logging.getLogger()
             root_logger.setLevel(logging.INFO)
             old_handlers = root_logger.handlers[:]
             for h in old_handlers:
                 root_logger.removeHandler(h)
-            stream_handler = logging.StreamHandler(sys.stdout)
-            stream_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-            root_logger.addHandler(stream_handler)
-            
-            print("==================================================")
-            print(f"[{time.strftime('%H:%M:%S')}] 扫描进程启动...")
-            print(f"使用模型: {model_id}")
-            print(f"接口地址: {base_url}")
-            print("正在遍历与收集指定目录内所有符合条件的多媒体文件。")
-            print("如果您选择了体积庞大的盘符或含有万级文件的目录，这可能需要数分钟的搜寻时间，请耐心等待...")
-            print("==================================================\n")
-            
+
+            console_handler = logging.StreamHandler(sys.__stdout__)
+            console_handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+            ))
+            root_logger.addHandler(console_handler)
+
+            log_path = os.path.splitext(self.scan_db_var.get())[0] + ".log"
+            file_handler = RotatingFileHandler(
+                log_path, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
+            )
+            file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+            ))
+            root_logger.addHandler(file_handler)
+
+            # ── GUI 进度条写入器（tqdm → Text 组件） ──
+            llm_writer = TkLineWriter(self.log_text, 1)
+            face_writer = TkLineWriter(self.log_text, 2)
+
+            logging.info("扫描启动 — 模型: %s, 接口: %s", model_id, base_url)
+
             try:
                 scan(
                     paths=self.scan_paths,
@@ -1586,6 +1646,7 @@ class PhotoIdentifyGUI(tk.Tk):
                     cancel_event=self._scan_cancel_event,
                     video_frame_interval=float(self.scan_frame_interval_var.get() or DEFAULT_VIDEO_FRAME_INTERVAL),
                     enable_face_scan=self.enable_face_scan_var.get(),
+                    progress_writers=(llm_writer, face_writer),
                 )
                 # 只有当前代际仍然有效时才更新状态
                 if current_gen == self._scan_generation:
@@ -1598,9 +1659,9 @@ class PhotoIdentifyGUI(tk.Tk):
                     self.after(0, lambda e=e: self.scan_status_var.set(f"扫描出错: {e}"))
                     self.after(0, lambda e=e: messagebox.showerror("错误", f"扫描异常:\n{e}"))
             finally:
-                sys.stdout = original_stdout  # Restore
-                sys.stderr = original_stderr
-                root_logger.removeHandler(stream_handler)
+                root_logger.removeHandler(console_handler)
+                root_logger.removeHandler(file_handler)
+                file_handler.close()
                 for h in old_handlers:
                     root_logger.addHandler(h)
                 
@@ -1608,6 +1669,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 if current_gen == self._scan_generation:
                     self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
                     self.after(0, lambda: self.restart_btn.config(state=tk.DISABLED))
+                    self.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
                 
         t = threading.Thread(target=_scan_thread, daemon=True)
         self._scan_thread_ref = t
@@ -1619,6 +1681,7 @@ class PhotoIdentifyGUI(tk.Tk):
             self._scan_cancel_event.set()
         self.scan_status_var.set("正在停止当前扫描，请稍候...")
         self.restart_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED)
 
         def _wait_and_restart():
             # 等待旧线程真正结束（最多 30 秒）
@@ -1627,6 +1690,14 @@ class PhotoIdentifyGUI(tk.Tk):
             self.after(0, self.start_scan)
 
         threading.Thread(target=_wait_and_restart, daemon=True).start()
+
+    def stop_scan(self):
+        """停止当前扫描（不重启）。"""
+        if self._scan_cancel_event:
+            self._scan_cancel_event.set()
+        self.scan_status_var.set("正在停止扫描...")
+        self.stop_btn.config(state=tk.DISABLED)
+        self.restart_btn.config(state=tk.DISABLED)
 
     # ── 图片检索相关方法 ──────────────────────────────────────────
 
@@ -1956,8 +2027,12 @@ class PhotoIdentifyGUI(tk.Tk):
         if not self.current_results:
             return
         record = self.current_results[self.current_index]
-        file_path = record.get("path", "")
-        
+        self._open_file_location_by_path(record.get("path", ""))
+
+    def _open_file_location_by_path(self, file_path):
+        if not file_path:
+            return
+            
         # 处理带有 "#t=" 等后缀的视频文件路径
         actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
         
