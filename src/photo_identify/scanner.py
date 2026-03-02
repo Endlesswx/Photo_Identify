@@ -588,6 +588,7 @@ def scan(
                 return img_path, {"__failed__": True, "reason": str(exc)}
 
         # Phase 1 并发执行
+        circuit_breaker_err = None
         try:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(_llm_worker, p): p for p in to_analyze}
@@ -605,6 +606,7 @@ def scan(
                         for r in result:
                             # 提前检查是否是熔断指示
                             if r is not _SKIPPED_SENTINEL and isinstance(r, dict) and r.get("__circuit_breaker_open__"):
+                                circuit_breaker_err = r.get("error", "API连通性持续失败，触发断路器熔断")
                                 logger.error("检测到 API 熔断，已提前终止后续扫描。")
                                 if cancel_event:
                                     cancel_event.set()
@@ -625,6 +627,7 @@ def scan(
                                 stats.processed += 1
                     else:
                         if result is not _SKIPPED_SENTINEL and result is not None and isinstance(result, dict) and result.get("__circuit_breaker_open__"):
+                            circuit_breaker_err = result.get("error", "API连通性持续失败，触发断路器熔断")
                             logger.error("检测到 API 熔断，已提前终止后续扫描。")
                             if cancel_event:
                                 cancel_event.set()
@@ -650,15 +653,21 @@ def scan(
             logger.warning("用户中断 (Ctrl+C)，已分析的数据已保存。")
 
         _llm_bar.close()
-        logger.info(
-            "信息扫描完成 — 总计: %d  新增/更新: %d  跳过: %d  失败: %d",
-            stats.total, stats.processed, stats.skipped, stats.failed,
-        )
-        if _llm_writer:
-            _llm_writer.write(
-                f"[信息扫描] ✓ 完成 — 扫描 {stats.total} 张 "
-                f"(新增 {stats.processed}, 跳过 {stats.skipped})\n"
+
+        if circuit_breaker_err:
+            logger.error("扫描因 API 故障中止: %s", circuit_breaker_err)
+            if _llm_writer:
+                _llm_writer.write(f"[信息扫描] ❌ 扫描中止 — {circuit_breaker_err}\n")
+        else:
+            logger.info(
+                "信息扫描完成 — 总计: %d  新增/更新: %d  跳过: %d  失败: %d",
+                stats.total, stats.processed, stats.skipped, stats.failed,
             )
+            if _llm_writer:
+                _llm_writer.write(
+                    f"[信息扫描] ✓ 完成 — 扫描 {stats.total} 张 "
+                    f"(新增 {stats.processed}, 跳过 {stats.skipped})\n"
+                )
     else:
         logger.info("信息扫描: 全部 %d 张已完成，无需 LLM 分析", stats.total)
         if _llm_writer:
@@ -767,3 +776,6 @@ def scan(
     _do_clustering()
 
     storage.close()
+
+    if 'circuit_breaker_err' in locals() and circuit_breaker_err:
+        raise RuntimeError(circuit_breaker_err)
