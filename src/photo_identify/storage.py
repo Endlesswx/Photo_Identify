@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS images (
     wallpaper_hint TEXT,
     llm_raw TEXT,
     analyzed_at TEXT,
-    face_scanned INTEGER DEFAULT 0
+    face_scanned INTEGER DEFAULT 0,
+    is_favorite INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS face_embeddings (
@@ -138,6 +139,12 @@ class Storage:
         cursor.executescript(_FTS_TRIGGER_INSERT)
         cursor.executescript(_FTS_TRIGGER_DELETE)
         cursor.executescript(_FTS_TRIGGER_UPDATE)
+
+        # 增加 is_favorite 字段（如果是旧库）
+        try:
+            cursor.execute("ALTER TABLE images ADD COLUMN is_favorite INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass # 字段已存在
 
         # 持续失败的文件记录表
         cursor.execute("""
@@ -300,6 +307,22 @@ class Storage:
             
         self._conn.commit()
         return int(image_id)
+
+    def toggle_favorite(self, image_id: int, is_favorite: bool):
+        """更新图片的收藏状态"""
+        self._conn.execute(
+            "UPDATE images SET is_favorite = ? WHERE id = ?",
+            (1 if is_favorite else 0, image_id)
+        )
+        self._conn.commit()
+
+    def get_favorites(self) -> list[dict]:
+        """获取所有收藏的图片（按修改时间倒序）。"""
+        self._conn.row_factory = sqlite3.Row
+        cursor = self._conn.execute(
+            "SELECT * FROM images WHERE is_favorite = 1 ORDER BY modified_time DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def mark_face_scanned(self, image_id: int):
         """将指定图片的 face_scanned 标记为 1"""
@@ -485,7 +508,29 @@ class Storage:
         引入 jieba 分词，把长句或未加空格的词拆分成细粒度词汇组合
         例如：结婚照 -> 结婚 OR 照
         并且对输入先用空格分开的关键词进行 OR 逻辑组合。
+        同时，如果 query 包含已知人物名，优先将其照片排在首位。
         """
+        self._conn.row_factory = sqlite3.Row
+        cursor = self._conn.cursor()
+        
+        # 0. 尝试从查询词中匹配人物名称
+        person_images = {} # image_id -> person_name
+        try:
+            cursor.execute("SELECT id, name, cluster_id FROM persons WHERE is_deleted = 0")
+            all_persons = cursor.fetchall()
+            for p_row in all_persons:
+                p_name = p_row["name"]
+                if p_name in query:
+                    # 获取该人物下的所有图片
+                    cursor.execute(
+                        "SELECT DISTINCT image_id FROM face_embeddings WHERE cluster_id = ?",
+                        (p_row["cluster_id"],)
+                    )
+                    for img_row in cursor.fetchall():
+                        person_images[img_row["image_id"]] = p_name
+        except sqlite3.OperationalError:
+            pass # 可能表不存在或结构有变
+            
         # 第一步：把用户输入用空白符分割开
         parts = query.split()
         match_terms = []
@@ -496,54 +541,80 @@ class Storage:
                 # 给每个切出来的词加上 * 通配符，内部再打上 OR
                 group = " OR ".join([f'"{w}"*' for w in cut_words])
                 match_terms.append(f"({group})")
-
-        if not match_terms:
+                
+        # 第三步：如果没有任何分词并且也没有匹配到人物，直接返回空
+        if not match_terms and not person_images:
             return []
+            
+        fts_results = {}
+        if match_terms:
+            match_query = " OR ".join(match_terms)
+            print(f"  🔍 FTS 分词转换: \"{query}\" -> \"{match_query}\"")
 
-        # 所有子分组的关键字组合之间采取 OR
-        # 因为利用了 SQLite FTS5 的 BM25 score，越精准覆盖多的记录自然会排越前
-        # 但如果是 AND 匹配大模型发散扩充的近义词就没有任何数据能全中
-        match_query = " OR ".join(match_terms)
+            sql = """
+            SELECT
+                r.id,
+                r.path,
+                r.file_name,
+                r.size_bytes AS file_size,
+                r.created_time AS photo_date,
+                r.scene,
+                r.objects,
+                r.style,
+                r.modified_time AS updated_at,
+                fts.rank as score
+            FROM images_fts fts
+            JOIN images r ON fts.rowid = r.id
+            WHERE images_fts MATCH ?
+            """
+            try:
+                # 扩大召回范围以便和 person_images 融合
+                cursor.execute(sql + f" LIMIT {limit * 5}", (match_query,))
+                for row in cursor.fetchall():
+                    row_dict = dict(row)
+                    fts_results[row_dict["id"]] = row_dict
+            except sqlite3.OperationalError as e:
+                import sys
+                print(f"  ⚠️ FTS 查询语法有误: {match_query} ({e})", file=sys.stderr)
+                cursor.execute(
+                    "SELECT * FROM images WHERE scene LIKE ? OR objects LIKE ? LIMIT ?",
+                    (f"%{query}%", f"%{query}%", limit * 5)
+                )
+                for row in cursor.fetchall():
+                    row_dict = dict(row)
+                    # 模拟一个负数分，使得其也能参与排序
+                    row_dict["score"] = -0.5
+                    fts_results[row_dict["id"]] = row_dict
         
-        # 调试观察最终在本地生成的匹配语法
-        print(f"  🔍 FTS 分词转换: \"{query}\" -> \"{match_query}\"")
+        # 融合 person_images 和 fts_results
+        final_results = {}
+        
+        # 1. 既包含目标人物又命中 FTS 的图片（最高级：-1000 + 原始分数）
+        for img_id, p_name in person_images.items():
+            if img_id in fts_results:
+                row = fts_results[img_id]
+                row["score"] = row["score"] - 1000.0
+                final_results[img_id] = row
+            else:
+                # 2. 属于目标人物但未命中 FTS，我们需从 images 表中拉取（次高级：-500.0）
+                cursor.execute("SELECT * FROM images WHERE id = ?", (img_id,))
+                row = cursor.fetchone()
+                if row:
+                    row_dict = dict(row)
+                    row_dict["score"] = -500.0
+                    row_dict["file_size"] = row_dict.get("size_bytes")
+                    row_dict["photo_date"] = row_dict.get("created_time")
+                    row_dict["updated_at"] = row_dict.get("modified_time")
+                    final_results[img_id] = row_dict
 
-        # 为了获得最新的 file_name 等，采用 JOIN 形式
-        sql = """
-        SELECT
-            r.id,
-            r.path,
-            r.file_name,
-            r.size_bytes AS file_size,
-            r.created_time AS photo_date,
-            r.scene,
-            r.objects,
-            r.style,
-            r.modified_time AS updated_at,
-            fts.rank as score
-        FROM images_fts fts
-        JOIN images r ON fts.rowid = r.id
-        WHERE images_fts MATCH ?
-        ORDER BY score
-        LIMIT ?
-        """
-        # The original code used self.get_connection(), which is not defined.
-        # Assuming self._conn is the correct connection object.
-        self._conn.row_factory = sqlite3.Row # Ensure row_factory is set for this connection
-        cursor = self._conn.cursor()
-        try:
-            cursor.execute(sql, (match_query, limit))
-            results = [dict(row) for row in cursor.fetchall()]
-        except sqlite3.OperationalError as e:
-            import sys
-            print(f"  ⚠️ FTS 查询语法有误: {match_query} ({e})", file=sys.stderr)
-            # 后备方案：退化为最原始简单的 LIKE
-            cursor.execute(
-                "SELECT * FROM images WHERE scene LIKE ? OR objects LIKE ? LIMIT ?",
-                (f"%{query}%", f"%{query}%", limit)
-            )
-            results = [dict(row) for row in cursor.fetchall()]
-        return results
+        # 3. 剩下纯命中 FTS 的图片
+        for img_id, row in fts_results.items():
+            if img_id not in final_results:
+                final_results[img_id] = row
+                
+        # 排序：按照 score 升序（分越小越靠前）
+        sorted_results = sorted(final_results.values(), key=lambda x: x.get("score", 0.0))
+        return sorted_results[:limit]
 
     def _search_like(self, terms: list[str], limit: int = 20) -> list[dict]:
         """使用 LIKE 在多个文本字段中进行模糊搜索。

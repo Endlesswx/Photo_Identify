@@ -220,6 +220,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.photo_image = None
         self.original_image = None
         self._resize_timer = None
+        self.current_rotation = 0
 
         # 检索页：文本模型选择（存 model_id）
         self.search_model_id_var = tk.StringVar(value="")
@@ -254,6 +255,11 @@ class PhotoIdentifyGUI(tk.Tk):
         self.notebook.add(self.person_tab, text="人物管理")
         self._init_person_tab()
 
+        # Tab 3.5: 照片收藏
+        self.favorite_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.favorite_tab, text="照片收藏")
+        self._init_favorite_tab()
+
         # Tab 4: 模型管理
         self.model_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.model_tab, text="模型管理")
@@ -275,6 +281,8 @@ class PhotoIdentifyGUI(tk.Tk):
             if not getattr(self, "_person_tab_loaded", False):
                 self._person_tab_loaded = True
                 self._refresh_persons()
+        elif selected_tab == str(self.favorite_tab):
+            self._refresh_favorites()
 
     @property
     def _settings_path(self) -> str:
@@ -306,6 +314,8 @@ class PhotoIdentifyGUI(tk.Tk):
                 self.db_listbox.delete(0, tk.END)
                 for db in dbs:
                     self.db_listbox.insert(tk.END, db)
+        if cfg.has_option("search", "last_query"):
+            self.query_var.set(cfg.get("search", "last_query"))
 
         # Scan tab
         if cfg.has_option("scan", "model_id"):
@@ -334,6 +344,7 @@ class PhotoIdentifyGUI(tk.Tk):
             "mode": self.search_mode_var.get(),
             "limit": self.search_limit_var.get(),
             "databases": "|".join(self.search_dbs),
+            "last_query": self.query_var.get(),
         }
         cfg["scan"] = {
             "model_id": self.scan_model_id_var.get(),
@@ -596,6 +607,9 @@ class PhotoIdentifyGUI(tk.Tk):
         # 图片画板
         self.canvas = tk.Canvas(self.preview_frame, bg="gray", highlightthickness=0)
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # 绑定画板右键菜单（支持大图预览时收藏操作）
+        self.canvas.bind("<Button-3>", self._show_preview_context_menu)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
         # 底部控制区
@@ -981,6 +995,8 @@ class PhotoIdentifyGUI(tk.Tk):
                     from photo_identify.storage import Storage
                     storage = Storage(self.scan_db_var.get())
                     images = storage.get_images_by_person(p_data["cluster_id"])
+                    for img in images:
+                        img["db_path"] = self.scan_db_var.get()
                     storage.close()
                     
                     self.person_image_count_var.set(f"包含此人的照片总数: {len(images)}")
@@ -1301,9 +1317,9 @@ class PhotoIdentifyGUI(tk.Tk):
                 self._update_display()
                 self.show_preview_view()
                 
-            item_frame.bind("<Button-1>", on_click)
-            img_lbl.bind("<Button-1>", on_click)
-            txt_lbl.bind("<Button-1>", on_click)
+            item_frame.bind("<Button-1>", lambda e, r=record: on_click(e, r))
+            img_lbl.bind("<Button-1>", lambda e, r=record: on_click(e, r))
+            txt_lbl.bind("<Button-1>", lambda e, r=record: on_click(e, r))
             
             # 右键菜单
             menu = tk.Menu(item_frame, tearoff=0)
@@ -1311,28 +1327,63 @@ class PhotoIdentifyGUI(tk.Tk):
                 file_name = r.get("file_name", os.path.basename(r.get("path", "")))
                 self.clipboard_clear()
                 self.clipboard_append(file_name)
-            menu.add_command(label="复制文件名", command=_copy_filename)
-            def _set_cover():
+            menu.add_command(label="复制文件名", command=lambda r=record: _copy_filename(r))
+            def _set_cover(r=record):
                 person_id = p_data["id"]
-                image_id = record["id"]
+                image_id = r["id"]
                 # 由于这整个列表是基于 images 返回的，但是 cover 必须是 face_id
                 # 为了简便起见，在这个 record 里我们需要得到 face_id。但是 storage 里的查询只有 images 数据。
                 # 修改 storage 的 get_images_by_person 返回包含 face_id。
                 # 为了不改动过大，我们单独查一下该图像对应的当前人的 face_id
                 self._set_person_cover_action(person_id, p_data["cluster_id"], image_id)
                 
-            menu.add_command(label="设为头像", command=_set_cover)
+            menu.add_command(label="设为头像", command=lambda r=record: _set_cover(r))
             
-            def _open_loc():
-                self._open_file_location_by_path(record.get("path", ""))
-            menu.add_command(label="打开文件位置", command=_open_loc)
+            def _open_loc(r=record):
+                self._open_file_location_by_path(r.get("path", ""))
+            menu.add_command(label="打开文件位置", command=lambda r=record: _open_loc(r))
             
-            def show_menu(e):
+            # --- 增加画廊照片右上角的收藏星角标 ---
+            is_fav = record.get("is_favorite", 0)
+            star_label = tk.Label(img_lbl, text="★", fg="#e3b341", bg="#333333", font=("Segoe UI", 12))
+            
+            # 只有当原本就被收藏时，才把它 place 出来
+            def _update_star_badge(state):
+                if state:
+                    star_label.place(relx=1.0, x=-4, y=4, anchor="ne")
+                else:
+                    star_label.place_forget()
+                    
+            _update_star_badge(is_fav)
+            # -----------------------------------------------
+            
+            def _toggle_fav(r=record):
+                from photo_identify.storage import Storage # Import here to avoid circular dependency if Storage imports GUI
+                # 取得来源于记录本身的 db_path，否则退回默认的主库
+                target_db = r.get("db_path", self.db_path)
+                storage = Storage(target_db)
+                new_fav = not bool(r.get("is_favorite", 0))
+                storage.toggle_favorite(r["id"], new_fav)
+                storage.close()
+                r["is_favorite"] = 1 if new_fav else 0
+                
+                # 动态更新缩略图上的星标可见性
+                _update_star_badge(new_fav)
+                
+                # In _add_gallery_item, we don't refresh the favorites tab immediately,
+                # as this item might be in the search results, not the favorites tab.
+                # The menu text will be updated dynamically by show_menu.
+            menu.add_command(label="取消收藏" if record.get("is_favorite") else "加入收藏", command=lambda r=record: _toggle_fav(r))
+            
+            def show_menu(e, r=record):
+                is_fav = r.get("is_favorite", 0)
+                # The index for "加入收藏" / "取消收藏" is 3 (0:复制文件名, 1:设为头像, 2:打开文件位置, 3:收藏)
+                menu.entryconfigure(3, label="取消收藏" if is_fav else "加入收藏")
                 menu.tk_popup(e.x_root, e.y_root)
                 
-            item_frame.bind("<Button-3>", show_menu)
-            img_lbl.bind("<Button-3>", show_menu)
-            txt_lbl.bind("<Button-3>", show_menu)
+            item_frame.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+            img_lbl.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+            txt_lbl.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
         
         self.person_gallery_text.configure(state="normal")
         self.person_gallery_text.window_create("end", window=item_frame, padx=10, pady=10)
@@ -1390,6 +1441,236 @@ class PhotoIdentifyGUI(tk.Tk):
                 
         except Exception as e:
             messagebox.showerror("错误", f"更新头像失败:\n{e}")
+
+    # =========================================================================
+    # 照片收藏 Tab
+    # =========================================================================
+    def _init_favorite_tab(self):
+        # 顶部控制栏
+        top_frame = tk.Frame(self.favorite_tab, pady=10)
+        top_frame.pack(side=tk.TOP, fill=tk.X)
+        
+        self.favorite_count_var = tk.StringVar(value="共 0 张")
+        tk.Label(top_frame, textvariable=self.favorite_count_var, font=("Arial", 12)).pack(side=tk.LEFT, padx=10)
+        tk.Button(top_frame, text="导出CSV", command=self._export_favorites_csv).pack(side=tk.RIGHT, padx=10)
+        tk.Button(top_frame, text="刷新", command=self._refresh_favorites).pack(side=tk.RIGHT, padx=10)
+        
+        # 缩略图滚动区域 (使用 Text + Scrollbar 方案)
+        gallery_container = ttk.Frame(self.favorite_tab)
+        gallery_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        
+        self._favorite_gen = 0
+        self.favorite_thumbnail_images = []
+        
+        bg_color = getattr(self, "_bg_color", "#f0f0f0")
+        self.favorite_gallery_text = tk.Text(gallery_container, wrap="char", state="disabled", bg=bg_color, bd=0, highlightthickness=0)
+        self.favorite_scrollbar = ttk.Scrollbar(gallery_container, orient="vertical", command=self.favorite_gallery_text.yview)
+        self.favorite_gallery_text.configure(yscrollcommand=self.favorite_scrollbar.set)
+        
+        self.favorite_gallery_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.favorite_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 鼠标滚轮绑定与 _init_search_tab 中类似
+        self.favorite_gallery_text.bind_all("<MouseWheel>", self._on_favorite_mousewheel)
+
+    def _on_favorite_mousewheel(self, event):
+        if self._is_in_widget(event, self.favorite_gallery_text):
+            self.favorite_gallery_text.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _export_favorites_csv(self):
+        import csv
+        from photo_identify.storage import Storage
+        
+        favs = []
+        try:
+            storage = Storage(self.db_path)
+            main_favs = storage.get_favorites()
+            for f in main_favs:
+                f["db_path"] = self.db_path
+            favs.extend(main_favs)
+            storage.close()
+        except Exception:
+            pass
+            
+        # 若配置了独立的扫描库，同时也加载扫描库里的收藏图片
+        scan_db = self.scan_db_var.get()
+        if scan_db and scan_db != self.db_path and os.path.exists(scan_db):
+            try:
+                storage_scan = Storage(scan_db)
+                scan_favs = storage_scan.get_favorites()
+                for f in scan_favs:
+                    f["db_path"] = scan_db
+                favs.extend(scan_favs)
+                storage_scan.close()
+            except Exception:
+                pass
+                
+        if not favs:
+            messagebox.showinfo("提示", "当前没有收藏的照片")
+            return
+            
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")],
+            title="导出收藏记录",
+            initialfile="favorites_export.csv"
+        )
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(["图片名称", "绝对地址", "所属数据库"])
+                for r in favs:
+                    fname = r.get("file_name", os.path.basename(r.get("path", "")))
+                    writer.writerow([fname, r.get("path", ""), r.get("db_path", self.db_path)])
+            messagebox.showinfo("成功", f"成功导出 {len(favs)} 条记录 (含扫描库)")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {e}")
+
+    def _refresh_favorites(self):
+        if not self.db_path or not os.path.exists(self.db_path):
+            return
+            
+        from photo_identify.storage import Storage
+        favs = []
+        try:
+            storage = Storage(self.db_path)
+            main_favs = storage.get_favorites()
+            for f in main_favs:
+                f["db_path"] = self.db_path
+            favs.extend(main_favs)
+            storage.close()
+        except:
+            pass
+
+        # 若配置了独立的扫描库，同时也加载扫描库里的收藏图片
+        scan_db = self.scan_db_var.get()
+        if scan_db and scan_db != self.db_path and os.path.exists(scan_db):
+            try:
+                storage_scan = Storage(scan_db)
+                scan_favs = storage_scan.get_favorites()
+                for f in scan_favs:
+                    f["db_path"] = scan_db
+                favs.extend(scan_favs)
+                storage_scan.close()
+            except:
+                pass
+
+        # 重新按照 modified_time 降序排序所有合并的记录
+        favs.sort(key=lambda x: x.get("modified_time", ""), reverse=True)
+        
+        self.favorite_count_var.set(f"共 {len(favs)} 张")
+        
+        self.favorite_gallery_text.configure(state="normal")
+        self.favorite_gallery_text.delete(1.0, tk.END)
+        self.favorite_gallery_text.configure(state="disabled")
+        self.favorite_thumbnail_images.clear()
+        
+        self._favorite_gen += 1
+        current_gen = self._favorite_gen
+        
+        def _thread():
+            for i, record in enumerate(favs):
+                if current_gen != self._favorite_gen:
+                    break
+                    
+                file_path = record.get("path", "")
+                actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+                img = None
+                try:
+                    if os.path.isfile(actual_path):
+                        frame_bytes = get_image_frame_bytes(actual_path)
+                        pil_img = Image.open(io.BytesIO(frame_bytes))
+                        pil_img = ImageOps.exif_transpose(pil_img)
+                        if pil_img.mode != 'RGB':
+                            pil_img = pil_img.convert('RGB')
+                        pil_img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                        img = pil_img
+                except:
+                    pass
+                
+                self.after(0, lambda idx=i, r=record, image=img: self._add_favorite_thumbnail(idx, r, image, current_gen))
+                
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _add_favorite_thumbnail(self, index, record, img, gen):
+        if gen != self._favorite_gen:
+            return
+            
+        bg_color = getattr(self, "_bg_color", "#f0f0f0")
+        item_frame = tk.Frame(self.favorite_gallery_text, bg=bg_color, cursor="hand2")
+        
+        if img:
+            photo = ImageTk.PhotoImage(img)
+            self.favorite_thumbnail_images.append(photo)
+        else:
+            photo = None
+            
+        kwargs = {}
+        if photo:
+            kwargs['image'] = photo
+        else:
+            kwargs['text'] = "无图片"
+            kwargs['width'] = 20
+            kwargs['height'] = 10
+        
+        img_lbl = tk.Label(item_frame, bg=bg_color, **kwargs)
+        img_lbl.pack(side="top")
+        
+        name = record.get("file_name", os.path.basename(record.get("path", "")))
+        if len(name) > 12:
+            name = name[:10] + "..."
+        txt_lbl = tk.Label(item_frame, text=name, bg=bg_color, width=18)
+        txt_lbl.pack(side="top")
+        
+        def on_click(event, r=record):
+            # 将当前列表作为预览内容传入
+            self.current_results = [r]
+            self.current_index = 0
+            # 临时借用检索的预览组件，但可能需要返回，因此更好的做法是先跳去检索页
+            self.notebook.select(self.search_tab)
+            self._update_display()
+            self.show_preview_view()
+            
+        item_frame.bind("<Button-1>", lambda e, r=record: on_click(e, r))
+        img_lbl.bind("<Button-1>", lambda e, r=record: on_click(e, r))
+        txt_lbl.bind("<Button-1>", lambda e, r=record: on_click(e, r))
+        
+        # 右键菜单
+        menu = tk.Menu(item_frame, tearoff=0)
+        def _copy_filename(r=record):
+            file_name = r.get("file_name", os.path.basename(r.get("path", "")))
+            self.clipboard_clear()
+            self.clipboard_append(file_name)
+        menu.add_command(label="复制文件名", command=lambda r=record: _copy_filename(r))
+        
+        def _open_loc(r=record):
+            self._open_file_location_by_path(r.get("path", ""))
+        menu.add_command(label="打开文件位置", command=lambda r=record: _open_loc(r))
+        
+        def _toggle_fav(r=record):
+            from photo_identify.storage import Storage
+            target_db = r.get("db_path", self.db_path)
+            storage = Storage(target_db)
+            new_fav = not bool(r.get("is_favorite", 0))
+            storage.toggle_favorite(r["id"], new_fav)
+            storage.close()
+            # 由于在收藏页，点击取消收藏后需要刷新
+            self._refresh_favorites()
+        menu.add_command(label="取消收藏" if record.get("is_favorite") else "加入收藏", command=lambda r=record: _toggle_fav(r))
+        
+        def show_menu(e, r=record):
+            menu.tk_popup(e.x_root, e.y_root)
+            
+        item_frame.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+        img_lbl.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+        txt_lbl.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+        
+        self.favorite_gallery_text.configure(state="normal")
+        self.favorite_gallery_text.window_create("end", window=item_frame, padx=10, pady=10)
+        self.favorite_gallery_text.configure(state="disabled")
 
     # ── Tab 4: 模型管理 ──────────────────────────────────────────
 
@@ -1897,9 +2178,49 @@ class PhotoIdentifyGUI(tk.Tk):
             self._update_display()
             self.show_preview_view()
             
-        item_frame.bind("<Button-1>", on_click)
-        img_lbl.bind("<Button-1>", on_click)
-        txt_lbl.bind("<Button-1>", on_click)
+        item_frame.bind("<Button-1>", lambda e, idx=index: on_click(e, idx))
+        img_lbl.bind("<Button-1>", lambda e, idx=index: on_click(e, idx))
+        txt_lbl.bind("<Button-1>", lambda e, idx=index: on_click(e, idx))
+
+        # 右键菜单
+        menu = tk.Menu(item_frame, tearoff=0)
+        def _copy_filename(r=record):
+            file_name = r.get("file_name", os.path.basename(r.get("path", "")))
+            self.clipboard_clear()
+            self.clipboard_append(file_name)
+        menu.add_command(label="复制文件名", command=lambda r=record: _copy_filename(r))
+        
+        def _open_loc(r=record):
+            self._open_file_location_by_path(r.get("path", ""))
+        menu.add_command(label="打开文件位置", command=lambda r=record: _open_loc(r))
+        
+        def _toggle_fav(r=record):
+            from photo_identify.storage import Storage # Import Storage
+            target_db = r.get("db_path", self.db_path)
+            storage = Storage(target_db)
+            new_fav = not bool(r.get("is_favorite", 0))
+            storage.toggle_favorite(r["id"], new_fav)
+            storage.close()
+            # 本地更新当前记录的字段使状态正确
+            r["is_favorite"] = 1 if new_fav else 0
+            # If the favorites tab is open, refresh it.
+            try:
+                if self.notebook.tab(self.notebook.select(), "text") == "照片收藏":
+                    self._refresh_favorites()
+            except:
+                pass
+        menu.add_command(label="取消收藏" if record.get("is_favorite") else "加入收藏", command=lambda r=record: _toggle_fav(r))
+
+        def show_menu(e, r=record):
+            # 每次弹出前先根据当前记录更新菜单项文字
+            is_fav = r.get("is_favorite", 0)
+            # The index for "加入收藏" / "取消收藏" is 2 (0:复制文件名, 1:打开文件位置, 2:收藏)
+            menu.entryconfigure(2, label="取消收藏" if is_fav else "加入收藏")
+            menu.tk_popup(e.x_root, e.y_root)
+            
+        item_frame.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+        img_lbl.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
+        txt_lbl.bind("<Button-3>", lambda e, r=record: show_menu(e, r))
         
         self.gallery_text.configure(state="normal")
         self.gallery_text.window_create("end", window=item_frame, padx=10, pady=10)
@@ -1908,11 +2229,13 @@ class PhotoIdentifyGUI(tk.Tk):
     def show_prev(self):
         if self.current_results and self.current_index > 0:
             self.current_index -= 1
+            self.current_rotation = 0
             self._update_display()
 
     def show_next(self):
         if self.current_results and self.current_index < len(self.current_results) - 1:
             self.current_index += 1
+            self.current_rotation = 0
             self._update_display()
 
     def _update_display(self):
@@ -1963,6 +2286,51 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self._load_and_draw_image(file_path)
 
+    def _show_preview_context_menu(self, event):
+        if not self.current_results or self.current_index >= len(self.current_results):
+            return
+            
+        record = self.current_results[self.current_index]
+        
+        menu = tk.Menu(self.canvas, tearoff=0)
+        
+        def _copy_filename(r=record):
+            file_name = r.get("file_name", os.path.basename(r.get("path", "")))
+            self.clipboard_clear()
+            self.clipboard_append(file_name)
+        menu.add_command(label="复制文件名", command=_copy_filename)
+        
+        def _open_loc(r=record):
+            self._open_file_location_by_path(r.get("path", ""))
+        menu.add_command(label="打开文件位置", command=_open_loc)
+        
+        def _toggle_fav(r=record):
+            from photo_identify.storage import Storage
+            target_db = r.get("db_path", self.db_path)
+            storage = Storage(target_db)
+            new_fav = not bool(r.get("is_favorite", 0))
+            storage.toggle_favorite(r["id"], new_fav)
+            storage.close()
+            r["is_favorite"] = 1 if new_fav else 0
+            
+            # 如果当前恰好是有这个星标的单张预览界面，手动同步更新星标状态
+            # 我们通过修改 fav_btn 和 fav_btn_shadow 这两个 tag 来实现
+            if new_fav:
+                self.canvas.itemconfigure("fav_btn_shadow", text="★", state="normal")
+                self.canvas.itemconfigure("fav_btn", text="★", fill="#e3b341", state="normal")
+            else:
+                self.canvas.itemconfigure("fav_btn_shadow", text="☆")
+                self.canvas.itemconfigure("fav_btn", text="☆", fill="#d1d5da")
+                # 不强制隐藏，由鼠标移动事件去接管
+            
+            # 如果从任意地方取消收藏/加入收藏之后，都应该去刷新一下 favorite_tab (如果已经加载)
+            self._refresh_favorites()
+            
+        is_fav = record.get("is_favorite", 0)
+        menu.add_command(label="取消收藏" if is_fav else "加入收藏", command=_toggle_fav)
+        
+        menu.tk_popup(event.x_root, event.y_root)
+
     def _load_and_draw_image(self, file_path: str):
         # 处理带有 "#t=" 等后缀的视频文件路径
         actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
@@ -2007,14 +2375,20 @@ class PhotoIdentifyGUI(tk.Tk):
         if canvas_width <= 1 or canvas_height <= 1:
             return
 
-        img_width, img_height = self.original_image.size
+        if self.current_rotation != 0:
+            # 采用负数来实现顺时针(Pillow rotate 为逆时针), expand=True 保证旋转后四角不被裁切
+            rotated_image = self.original_image.rotate(-self.current_rotation, expand=True)
+        else:
+            rotated_image = self.original_image
+
+        img_width, img_height = rotated_image.size
         # 计算缩放比例，保持长宽比
         ratio = min(canvas_width / img_width, canvas_height / img_height)
         new_width = max(1, int(img_width * ratio))
         new_height = max(1, int(img_height * ratio))
 
         # 使用 LANCZOS 进行高质量缩放
-        resized_img = self.original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        resized_img = rotated_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
         self.photo_image = ImageTk.PhotoImage(resized_img)
 
         self.canvas.delete("all")
@@ -2022,6 +2396,158 @@ class PhotoIdentifyGUI(tk.Tk):
         x = canvas_width // 2
         y = canvas_height // 2
         self.canvas.create_image(x, y, image=self.photo_image, anchor=tk.CENTER)
+        
+        # --- 收藏星星按钮逻辑 (GitHub 风格) ---
+        record = self.current_results[self.current_index]
+        is_fav = record.get("is_favorite", 0)
+        
+        # 统一使用 ☆ 和 ★ 
+        # GitHub 空心星颜色为浅灰，实心星为金黄色
+        star_text = "★" if is_fav else "☆"
+        star_color = "#e3b341" if is_fav else "#d1d5da"
+        
+        # 放置在右上角
+        margin_x, margin_y = 35, 35
+        btn_x = canvas_width - margin_x
+        btn_y = margin_y
+        
+        # --- 最大化/还原 按钮逻辑 ---
+        is_max = getattr(self, 'is_maximized', False)
+        max_text = "⤡" if is_max else "⤢"
+        max_color = "#d1d5da"
+        max_btn_x = btn_x - 35  # 在星标左侧
+        max_btn_y = btn_y
+        
+        max_shadow_id = self.canvas.create_text(
+            max_btn_x + 1, max_btn_y + 1, text=max_text, fill="black", font=("Segoe UI", 20),
+            state="hidden", tags="max_btn_shadow"
+        )
+        max_star_id = self.canvas.create_text(
+            max_btn_x, max_btn_y, text=max_text, fill=max_color, font=("Segoe UI", 20),
+            state="hidden", tags="max_btn"
+        )
+        
+        # --- 旋转 按钮逻辑 ---
+        rot_text = "↻"
+        rot_color = "#d1d5da"
+        rot_btn_x = max_btn_x - 35  # 在最大化标识左侧
+        rot_btn_y = btn_y
+        
+        rot_shadow_id = self.canvas.create_text(
+            rot_btn_x + 1, rot_btn_y + 1, text=rot_text, fill="black", font=("Segoe UI", 20),
+            state="hidden", tags="rot_btn_shadow"
+        )
+        rot_star_id = self.canvas.create_text(
+            rot_btn_x, rot_btn_y, text=rot_text, fill=rot_color, font=("Segoe UI", 20),
+            state="hidden", tags="rot_btn"
+        )
+        
+        # 加微弱的黑色阴影，防止在白底图片上不可见 (字体缩小到原来约60%: font size 20)
+        shadow_id = self.canvas.create_text(
+            btn_x + 1, btn_y + 1, text=star_text, fill="black", font=("Segoe UI", 20),
+            state="normal" if is_fav else "hidden", tags="fav_btn_shadow"
+        )
+        
+        star_id = self.canvas.create_text(
+            btn_x, btn_y, text=star_text, fill=star_color, font=("Segoe UI", 20),
+            state="normal" if is_fav else "hidden", tags="fav_btn"
+        )
+        
+        # 鼠标移动显示逻辑
+        def on_canvas_motion(event):
+            # 收藏按钮逻辑
+            if not record.get("is_favorite", 0):
+                if event.x > canvas_width - 80 and event.y < 80:
+                    self.canvas.itemconfigure(shadow_id, state="normal")
+                    self.canvas.itemconfigure(star_id, state="normal")
+                else:
+                    self.canvas.itemconfigure(shadow_id, state="hidden")
+                    self.canvas.itemconfigure(star_id, state="hidden")
+                    
+            # 最大化/看图 按钮逻辑
+            if event.x > canvas_width - 120 and event.y < 80:
+                self.canvas.itemconfigure(max_shadow_id, state="normal")
+                self.canvas.itemconfigure(max_star_id, state="normal")
+                self.canvas.itemconfigure(rot_shadow_id, state="normal")
+                self.canvas.itemconfigure(rot_star_id, state="normal")
+            else:
+                self.canvas.itemconfigure(max_shadow_id, state="hidden")
+                self.canvas.itemconfigure(max_star_id, state="hidden")
+                self.canvas.itemconfigure(rot_shadow_id, state="hidden")
+                self.canvas.itemconfigure(rot_star_id, state="hidden")
+                
+        def on_canvas_leave(event):
+            if not record.get("is_favorite", 0):
+                self.canvas.itemconfigure(shadow_id, state="hidden")
+                self.canvas.itemconfigure(star_id, state="hidden")
+            self.canvas.itemconfigure(max_shadow_id, state="hidden")
+            self.canvas.itemconfigure(max_star_id, state="hidden")
+            self.canvas.itemconfigure(rot_shadow_id, state="hidden")
+            self.canvas.itemconfigure(rot_star_id, state="hidden")
+            
+        self.canvas.bind("<Motion>", on_canvas_motion)
+        self.canvas.bind("<Leave>", on_canvas_leave)
+        
+        # 点击切换逻辑
+        def on_star_click(event):
+            from photo_identify.storage import Storage
+            target_db = record.get("db_path", self.db_path)
+            storage = Storage(target_db)
+            
+            new_fav = not bool(record.get("is_favorite", 0))
+            storage.toggle_favorite(record["id"], new_fav)
+            storage.close()
+            
+            record["is_favorite"] = 1 if new_fav else 0
+            
+            # 更新视觉
+            if new_fav:
+                self.canvas.itemconfigure(shadow_id, text="★", state="normal")
+                self.canvas.itemconfigure(star_id, text="★", fill="#e3b341", state="normal")
+            else:
+                self.canvas.itemconfigure(shadow_id, text="☆")
+                self.canvas.itemconfigure(star_id, text="☆", fill="#d1d5da")
+                # 因为此时取消了收藏，应当立刻根据鼠标位置来决定是否该隐藏
+                self.canvas.itemconfigure(shadow_id, state="normal") # 既然刚点完说明鼠标还在按钮上
+                self.canvas.itemconfigure(star_id, state="normal")
+                
+            # 若收藏页已经加载过，刷新一下
+            try:
+                if self.notebook.tab(self.notebook.select(), "text") == "照片收藏":
+                    self._refresh_favorites()
+            except:
+                pass
+
+        self.canvas.tag_bind(star_id, "<Button-1>", on_star_click)
+        self.canvas.tag_bind(max_star_id, "<Button-1>", self._open_in_system_viewer)
+        self.canvas.tag_bind(rot_star_id, "<Button-1>", self._rotate_image)
+
+    def _rotate_image(self, event=None):
+        self.current_rotation = (self.current_rotation + 90) % 360
+        self._resize_and_display()
+
+    def _open_in_system_viewer(self, event=None):
+        if not self.current_results:
+            return
+        record = self.current_results[self.current_index]
+        file_path = record.get("path", "")
+        if not file_path:
+            return
+            
+        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+        if not os.path.exists(actual_path):
+            messagebox.showerror("错误", "文件不存在！")
+            return
+            
+        try:
+            if sys.platform == "win32":
+                os.startfile(actual_path)
+            elif sys.platform == "darwin":  # macOS
+                subprocess.Popen(["open", actual_path])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", actual_path])
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开图片: {e}")
 
     def open_file_location(self):
         if not self.current_results:

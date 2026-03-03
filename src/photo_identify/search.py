@@ -221,6 +221,8 @@ def search(
         try:
             storage = Storage(db)
             db_results = storage.search_fts(expanded_query, fetch_limit)
+            for r in db_results:
+                r["db_path"] = db
             results.extend(db_results)
             storage.close()
         except Exception as e:
