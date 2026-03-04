@@ -74,3 +74,5 @@ https://raw.githubusercontent.com/dai-hongtao/InkTime/refs/heads/main/analyze_ph
 3.图片检索，如果调用LLM 排序失败回退默认检索，需要在页面用红色文字给出明确提示。
 
 
+1.模型管理提供导出功能，导出为csv
+2.

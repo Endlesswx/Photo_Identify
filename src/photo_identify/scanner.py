@@ -189,6 +189,10 @@ def scan(
         enable_face_scan: 是否进行人脸扫描和聚类。
         progress_writers: GUI 进度条写入器 ``(llm_writer, face_writer)``。
     """
+    import time as _time
+    import queue
+    t_start = _time.perf_counter()
+
     storage = Storage(db_path)
     rate_limiter = RateLimiter(rpm_limit, tpm_limit)
 
@@ -229,12 +233,14 @@ def scan(
                 embedding_np = np.frombuffer(embedding_bytes, dtype=np.float32)
                 embeddings_with_ids.append((face_id, embedding_np))
 
+            t_clust_start = _time.perf_counter()
             cluster_mapping = cluster_face_embeddings(embeddings_with_ids)
             storage.update_face_clusters(cluster_mapping)
             n_persons = len(set(c for c in cluster_mapping.values() if c >= 0))
-            logger.info("人脸聚类完成，共识别出 %d 位主要人物", n_persons)
+            t_clust_cost = _time.perf_counter() - t_clust_start
+            logger.info("人脸聚类完成(耗时 %.1fs)，共识别出 %d 位主要人物", t_clust_cost, n_persons)
             if _face_writer:
-                _face_writer.write(f"[人物识别] ✓ 聚类完成 — {n_persons} 位人物\n")
+                _face_writer.write(f"[人物识别] ✓ 聚类完成(耗时 {t_clust_cost:.1f}s) — {n_persons} 位人物\n")
         except Exception as e:
             logger.error("人脸聚类出错: %s", e)
             if _face_writer:
@@ -332,10 +338,20 @@ def scan(
     _face_cache: dict[str, list] = {}
     _face_cache_lock = threading.Lock()
 
-    if enable_face_scan and face_todo:
+    # 将所有需要做人脸识别的（新图片 + 旧图片补扫）都加入预提取队列
+    _all_face_todo = []
+    if enable_face_scan:
+        _all_face_todo.extend(face_todo)
+        # 预先将需要扫描的图片（普通图片）加入提取队列
+        for img_path in to_analyze:
+            ext = Path(img_path).suffix.lower()
+            if ext not in _VIDEO_EXTS:
+                _all_face_todo.append((img_path, None)) # md5 is None for to_analyze initially
+
+    if enable_face_scan and _all_face_todo:
         def _face_pipeline():
             _pipeline_count = 0
-            for img_path, _md5 in face_todo:
+            for img_path, _md5 in _all_face_todo:
                 if cancel_event and cancel_event.is_set():
                     break
                 ext = Path(img_path).suffix.lower()
@@ -346,6 +362,11 @@ def scan(
                         return
                     time.sleep(0.5)
                 try:
+                    # 避免对已被其他线程缓存的数据重复提取
+                    with _face_cache_lock:
+                        if img_path in _face_cache:
+                            continue
+                    
                     image_bytes = get_image_frame_bytes(img_path)
                     faces = _extract_faces_with_resize(image_bytes)
                     with _face_cache_lock:
@@ -364,94 +385,97 @@ def scan(
     # ── 共用常量 ──
     _bar_fmt = "{desc} {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
     _SKIPPED_SENTINEL = {"__skipped__": True}
-    _face_todo_lock = threading.Lock()
-    _initial_face_count = len(face_todo)
+    
+    _face_queue = queue.Queue()
+    _face_p2_completed_event = threading.Event()
+    
+    for item in face_todo:
+        _face_queue.put(item)
+        
+    _face_found_lock = threading.Lock()
+    _face_found = 0
 
-    # ── Phase 2: 人物识别（后台线程，与 Phase 1 并行） ──
-    _phase2_thread = None
+    # ── Phase 2: 人物识别（后台线程，与 Phase 1 真正并行） ──
+    _phase2_threads = []
     _face_bar = None
 
-    if enable_face_scan and face_todo:
+    if enable_face_scan:
         _face_bar = tqdm(
-            total=len(face_todo), desc="[人物识别]",
+            total=len(face_todo) + len(to_analyze), desc="[人物识别]",
             file=_face_writer or sys.stderr,
             bar_format=_bar_fmt, leave=True, mininterval=0.3, ascii=True,
         )
 
-        def _face_worker(item: tuple[str, str]) -> tuple[str, str, list]:
+        def _face_worker_loop():
             nonlocal _face_found
-            img_path, md5 = item
-            fname = Path(img_path).name
-            if cancel_event and cancel_event.is_set():
-                _face_bar.update(1)
-                return img_path, md5, []
-
-            cached_faces = None
-            with _face_cache_lock:
-                cached_faces = _face_cache.pop(img_path, None)
-            if cached_faces is not None:
-                faces = cached_faces
-            else:
-                try:
-                    image_bytes = get_image_frame_bytes(img_path)
-                    faces = _extract_faces_with_resize(image_bytes)
-                except Exception as exc:
-                    logger.error("人脸提取失败 %s: %s", img_path, exc)
-                    _face_bar.update(1)
-                    return img_path, md5, []
-
-            face_count = len(faces)
-            with _face_found_lock:
-                if face_count > 0:
-                    _face_found += 1
-                found = _face_found
-            logger.debug("人脸识别 %s → %d 张人脸", fname, face_count)
-            _face_bar.set_description_str(
-                f"[人物识别] ({found}张有人脸) {fname}", refresh=False,
-            )
-            _face_bar.update(1)
-            return img_path, md5, faces
-
-        def _run_phase2():
-            """后台运行人脸提取，使用独立 DB 连接避免线程冲突。"""
             p2_storage = Storage(db_path)
             try:
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futs = {
-                        ex.submit(_face_worker, it): it
-                        for it in face_todo[:_initial_face_count]
-                    }
-                    for fut in as_completed(futs):
-                        if cancel_event and cancel_event.is_set():
-                            for f in futs:
-                                f.cancel()
+                while True:
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    
+                    try:
+                        item = _face_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        if _face_p2_completed_event.is_set():
                             break
+                        continue
+                        
+                    if item is None:
+                        _face_queue.task_done()
+                        break
+                        
+                    img_path, md5 = item
+                    fname = Path(img_path).name
+                    cached_faces = None
+                    with _face_cache_lock:
+                        cached_faces = _face_cache.pop(img_path, None)
+                    if cached_faces is not None:
+                        faces = cached_faces
+                    else:
                         try:
-                            img_path, md5, faces = fut.result()
-                        except CancelledError:
-                            continue
-                        try:
-                            cur = p2_storage._conn.cursor()
-                            cur.execute(
-                                "SELECT id FROM images WHERE md5 = ?", (md5,),
-                            )
-                            row = cur.fetchone()
-                            if row:
-                                if faces:
-                                    p2_storage.add_face_embeddings(row[0], faces)
-                                p2_storage.mark_face_scanned(row[0])
-                        except Exception as e:
-                            logger.error("更新人脸数据失败 %s: %s", img_path, e)
+                            image_bytes = get_image_frame_bytes(img_path)
+                            faces = _extract_faces_with_resize(image_bytes)
+                        except Exception as exc:
+                            logger.error("人脸提取失败 %s: %s", img_path, exc)
+                            faces = []
+                            
+                    face_count = len(faces)
+                    with _face_found_lock:
+                        if face_count > 0:
+                            _face_found += 1
+                        found = _face_found
+                    
+                    logger.debug("人脸识别 %s → %d 张人脸", fname, face_count)
+                    if _face_bar:
+                        _face_bar.set_description_str(
+                            f"[人物识别] ({found}张有人脸) {fname}", refresh=False,
+                        )
+                        _face_bar.update(1)
+
+                    try:
+                        cur = p2_storage._conn.cursor()
+                        cur.execute("SELECT id FROM images WHERE md5 = ?", (md5,))
+                        row = cur.fetchone()
+                        if row:
+                            if faces:
+                                p2_storage.add_face_embeddings(row[0], faces)
+                            p2_storage.mark_face_scanned(row[0])
+                    except Exception as e:
+                        logger.error("更新人脸数据失败 %s: %s", img_path, e)
+                        
+                    _face_queue.task_done()
             finally:
                 p2_storage.close()
 
-        _phase2_thread = threading.Thread(
-            target=_run_phase2, daemon=True, name="phase2-face",
-        )
-        _phase2_thread.start()
-        logger.info("Phase 2 人物识别已在后台启动 (%d 张)", _initial_face_count)
+        logger.info("Phase 2 人物识别已在后台启动，并行工作线程数: %d", workers)
+        for _ in range(workers):
+            t = threading.Thread(target=_face_worker_loop, daemon=True)
+            t.start()
+            _phase2_threads.append(t)
 
     # ── Phase 1: 信息扫描 (LLM 分析) ──
+    circuit_breaker_err = None
     if to_analyze:
         _llm_bar = tqdm(
             total=len(to_analyze), desc="[信息扫描]",
@@ -474,6 +498,8 @@ def scan(
                     logger.error("视频抽帧失败 %s: %s", img_path, exc)
                     _llm_bar.set_description_str(f"[信息扫描] 失败 {fname}", refresh=False)
                     _llm_bar.update(1)
+                    if _face_bar:
+                        _face_bar.update(1)
                     return img_path, {"__failed__": True, "reason": str(exc)}
 
                 file_metadata = extract_metadata(img_path)
@@ -525,12 +551,14 @@ def scan(
                 _llm_bar.update(1)
                 return img_path, results if results else None
 
-            # ---- 普通图片路径 ----
+                # ---- 普通图片路径 ----
             try:
                 md5 = compute_file_md5_chunked(img_path)
             except (OSError, PermissionError) as exc:
                 logger.warning("无法读取文件 %s: %s", img_path, exc)
                 _llm_bar.update(1)
+                if _face_bar:
+                    _face_bar.update(1)
                 return img_path, None
 
             need_llm = True
@@ -550,15 +578,17 @@ def scan(
             if not need_llm and not need_face:
                 _llm_bar.set_description_str(f"[信息扫描] ✓ {fname}", refresh=False)
                 _llm_bar.update(1)
+                if _face_bar:
+                    _face_bar.update(1)
                 return img_path, _SKIPPED_SENTINEL
 
-            # LLM 已做过，人脸待处理 → 推迟到 Phase 2 补充批次
+            # LLM 已做过，人脸待处理 → 推迟到 Phase 2 处理
             if not need_llm and need_face:
                 _llm_bar.set_description_str(f"[信息扫描] 已有 {fname}", refresh=False)
                 _llm_bar.update(1)
-                with _face_todo_lock:
-                    face_todo.append((img_path, md5))
-                return img_path, _SKIPPED_SENTINEL
+                
+                # 放在主线程进行 put，这里标记为需要 face 但无需 llm
+                return img_path, {"__needs_face_only__": True, "md5": md5}
 
             # 正常 LLM 分析（人脸推迟到 Phase 2 补充批次）
             try:
@@ -577,18 +607,23 @@ def scan(
                 _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=False)
                 _llm_bar.update(1)
 
-                if need_face:
-                    with _face_todo_lock:
-                        face_todo.append((img_path, result.get("md5", md5)))
+                if need_face and enable_face_scan:
+                    # 不在这里 put，在主线程 upsert 后统一 put
+                    result["__needs_face_after_upsert__"] = True
+                    result["md5"] = result.get("md5", md5)
+                else:
+                    if _face_bar:
+                        _face_bar.update(1)
 
                 return img_path, result
             except Exception as exc:
                 logger.error("分析失败 %s: %s", img_path, exc, exc_info=False)
                 _llm_bar.update(1)
+                if _face_bar:
+                    _face_bar.update(1)
                 return img_path, {"__failed__": True, "reason": str(exc)}
 
         # Phase 1 并发执行
-        circuit_breaker_err = None
         try:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(_llm_worker, p): p for p in to_analyze}
@@ -619,7 +654,7 @@ def scan(
                                 stats.skipped += 1
                             elif "error" in r:
                                 stats.failed += 1
-                                logger.error("API 错误 %s: %s", img_path, r["error"])
+                                logger.error("API 错误 %s: %s (返回: %s)", img_path, r["error"], r.get("llm_raw", ""))
                             else:
                                 if enable_face_scan:
                                     r["face_scanned"] = True
@@ -643,16 +678,25 @@ def scan(
                         elif isinstance(result, dict) and result.get("__failed__"):
                             stats.failed += 1
                             storage.add_skipped_file(img_path, result["reason"])
+                        elif isinstance(result, dict) and result.get("__needs_face_only__"):
+                            if enable_face_scan:
+                                _face_queue.put((img_path, result["md5"]))
                         elif "error" in result:
                             stats.failed += 1
-                            logger.error("API 错误 %s: %s", img_path, result["error"])
+                            logger.error("API 错误 %s: %s (返回: %s)", img_path, result["error"], result.get("llm_raw", ""))
                         else:
+                            needs_face = result.pop("__needs_face_after_upsert__", False)
                             image_id = storage.upsert(result)
                             stats.processed += 1
+                            if needs_face and enable_face_scan:
+                                _face_queue.put((img_path, result.get("md5")))
         except KeyboardInterrupt:
             logger.warning("用户中断 (Ctrl+C)，已分析的数据已保存。")
 
         _llm_bar.close()
+
+        t_llm_end = _time.perf_counter()
+        llm_cost = t_llm_end - t_start
 
         if circuit_breaker_err:
             logger.error("扫描因 API 故障中止: %s", circuit_breaker_err)
@@ -660,8 +704,8 @@ def scan(
                 _llm_writer.write(f"[信息扫描] ❌ 扫描中止 — {circuit_breaker_err}\n")
         else:
             logger.info(
-                "信息扫描完成 — 总计: %d  新增/更新: %d  跳过: %d  失败: %d",
-                stats.total, stats.processed, stats.skipped, stats.failed,
+                "信息扫描完成(耗时 %.1fs) — 总计: %d  新增/更新: %d  跳过: %d  失败: %d",
+                llm_cost, stats.total, stats.processed, stats.skipped, stats.failed,
             )
             if _llm_writer:
                 _llm_writer.write(
@@ -669,100 +713,38 @@ def scan(
                     f"(新增 {stats.processed}, 跳过 {stats.skipped})\n"
                 )
     else:
-        logger.info("信息扫描: 全部 %d 张已完成，无需 LLM 分析", stats.total)
+        t_llm_end = _time.perf_counter()
+        llm_cost = t_llm_end - t_start
+        logger.info("信息扫描: 全部 %d 张已完成，无需 LLM 分析 (耗时 %.1fs)", stats.total, llm_cost)
         if _llm_writer:
             _llm_writer.write(
-                f"[信息扫描] ✓ 完成 — 全部 {stats.total} 张已扫描\n"
+                f"[信息扫描] ✓ 完成 — 全部 {stats.total} 张已就绪\n"
             )
 
     # ── 等待 Phase 2 后台线程完成 ──
-    if _phase2_thread:
-        _phase2_thread.join()
+    _face_p2_completed_event.set()
+    if enable_face_scan:
+        for _ in range(workers):
+            _face_queue.put(None)
+
+    for t in getattr(locals(), '_phase2_threads', []):
+        try:
+            t.join()
+        except:
+            pass
+
+    _cancelled = cancel_event and cancel_event.is_set()
+    t_face_end = _time.perf_counter()
+    total_face_cost = t_face_end - t_start
 
     if _face_bar:
         _face_bar.close()
-        logger.info("人物识别完成 — 共 %d 张有人脸", _face_found)
+        logger.info("人物识别完成(总耗时 %.1fs) — 共 %d 张有人脸", total_face_cost, _face_found)
         if _face_writer:
             _face_writer.write(
-                f"[人物识别] ✓ 识别完成 {_face_found} 张有人脸，正在聚类...\n"
+                f"[人物识别] ✓ 识别完成 — 共 {_face_found} 张有人脸，正在聚类...\n"
             )
-
-    # ── Phase 1 产生的额外人脸任务（补充批次） ──
-    _cancelled = cancel_event and cancel_event.is_set()
-    with _face_todo_lock:
-        late_items = face_todo[_initial_face_count:]
-    if enable_face_scan and late_items and not _cancelled:
-        logger.info("处理 Phase 1 新增的 %d 张人脸任务", len(late_items))
-        _face_bar_late = tqdm(
-            total=len(late_items), desc="[人物识别]",
-            file=_face_writer or sys.stderr,
-            bar_format=_bar_fmt, leave=True, mininterval=0.3, ascii=True,
-        )
-
-        def _face_worker_late(item: tuple[str, str]) -> tuple[str, str, list]:
-            nonlocal _face_found
-            img_path, md5 = item
-            fname = Path(img_path).name
-            if cancel_event and cancel_event.is_set():
-                _face_bar_late.update(1)
-                return img_path, md5, []
-            cached_faces = None
-            with _face_cache_lock:
-                cached_faces = _face_cache.pop(img_path, None)
-            if cached_faces is not None:
-                faces = cached_faces
-            else:
-                try:
-                    image_bytes = get_image_frame_bytes(img_path)
-                    faces = _extract_faces_with_resize(image_bytes)
-                except Exception as exc:
-                    logger.error("人脸提取失败 %s: %s", img_path, exc)
-                    _face_bar_late.update(1)
-                    return img_path, md5, []
-            face_count = len(faces)
-            with _face_found_lock:
-                if face_count > 0:
-                    _face_found += 1
-                found = _face_found
-            _face_bar_late.set_description_str(
-                f"[人物识别] ({found}张有人脸) {fname}", refresh=False,
-            )
-            _face_bar_late.update(1)
-            return img_path, md5, faces
-
-        try:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futs = {executor.submit(_face_worker_late, it): it for it in late_items}
-                for fut in as_completed(futs):
-                    if cancel_event and cancel_event.is_set():
-                        for f in futs:
-                            f.cancel()
-                        break
-                    try:
-                        img_path, md5, faces = fut.result()
-                    except CancelledError:
-                        continue
-                    try:
-                        cursor = storage._conn.cursor()
-                        cursor.execute(
-                            "SELECT id FROM images WHERE md5 = ?", (md5,),
-                        )
-                        row = cursor.fetchone()
-                        if row:
-                            if faces:
-                                storage.add_face_embeddings(row[0], faces)
-                            storage.mark_face_scanned(row[0])
-                    except Exception as e:
-                        logger.error("更新人脸数据失败 %s: %s", img_path, e)
-        except KeyboardInterrupt:
-            pass
-
-        _face_bar_late.close()
-        if _face_writer:
-            _face_writer.write(
-                f"[人物识别] ✓ 识别完成 {_face_found} 张有人脸，正在聚类...\n"
-            )
-    elif enable_face_scan and not _face_bar and _face_writer:
+    elif enable_face_scan and _face_writer:
         if _cancelled:
             _face_writer.write("[人物识别] 已中止\n")
         else:
@@ -825,6 +807,21 @@ def scan(
     _do_clustering()
 
     storage.close()
+    
+    t_total_end = _time.perf_counter()
+    total_cost = t_total_end - t_start
+    logger.info("整个扫描流程完成，总耗时: %.1fs", total_cost)
 
     if 'circuit_breaker_err' in locals() and circuit_breaker_err:
         raise RuntimeError(circuit_breaker_err)
+        
+    return {
+        "total": stats.total,
+        "processed": stats.processed,
+        "skipped": stats.skipped,
+        "failed": stats.failed,
+        "llm_cost": llm_cost if 'llm_cost' in locals() else 0.0,
+        "face_cost": total_face_cost if 'total_face_cost' in locals() else 0.0,
+        "total_cost": total_cost,
+        "face_found": _face_found if '_face_found' in locals() else 0
+    }

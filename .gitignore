@@ -13,6 +13,7 @@ env/
 venv/
 
 # 项目特定：本地数据库
+database/
 *.db
 *.sqlite
 *.sqlite3

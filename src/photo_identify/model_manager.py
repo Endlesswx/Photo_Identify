@@ -68,14 +68,21 @@ class ModelManager:
             )
         """)
         self._conn.commit()
+        
+        # 兼容旧版本：尝试添加 workers 字段（默认为4）
+        try:
+            self._conn.execute("ALTER TABLE models ADD COLUMN workers INTEGER DEFAULT 4")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass # 字段已存在
 
         # 若表为空，插入预设数据
         count = self._conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
         if count == 0:
             for m in _DEFAULT_MODELS:
                 self._conn.execute(
-                    "INSERT INTO models (type, name, model_id, base_url, api_key_var) VALUES (?,?,?,?,?)",
-                    (m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"]),
+                    "INSERT INTO models (type, name, model_id, base_url, api_key_var, workers) VALUES (?,?,?,?,?,?)",
+                    (m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"], m.get("workers", 4)),
                 )
             self._conn.commit()
 
@@ -83,11 +90,15 @@ class ModelManager:
         """将数据库行转为字典，附加 api_key_status 和 is_local 字段。"""
         d = dict(row)
         # api_key_var 为空表示本地模型（如 Ollama），无需 API Key
-        d["is_local"] = not d["api_key_var"].strip()
+        d["is_local"] = not d.get("api_key_var", "").strip()
         if d["is_local"]:
             d["api_key_status"] = True  # 本地模型视为始终可用
+            d["workers"] = 1 # 本地模型并发固定为1
         else:
             d["api_key_status"] = self.check_api_key_status(d["api_key_var"])
+            # 如果是后来加的列为None或不存在，给默认值4
+            if d.get("workers") is None:
+                d["workers"] = 4
         return d
 
     # ── 公共接口 ──────────────────────────────────────────────
@@ -153,18 +164,23 @@ class ModelManager:
         model_id: str,
         base_url: str,
         api_key_var: str,
+        workers: int = 4,
     ) -> int:
         """添加新模型配置。
 
         Returns:
             新插入记录的 id。
         """
+        # 本地模型固定1线程
+        if not api_key_var.strip():
+            workers = 1
+            
         cursor = self._conn.execute(
-            "INSERT INTO models (type, name, model_id, base_url, api_key_var) VALUES (?,?,?,?,?)",
-            (model_type, name, model_id, base_url, api_key_var),
+            "INSERT INTO models (type, name, model_id, base_url, api_key_var, workers) VALUES (?,?,?,?,?,?)",
+            (model_type, name, model_id, base_url, api_key_var, workers),
         )
         self._conn.commit()
-        return cursor.lastrowid
+        return cursor.lastrowid or 0
 
     def update_model(
         self,
@@ -174,11 +190,16 @@ class ModelManager:
         model_id: str,
         base_url: str,
         api_key_var: str,
+        workers: int = 4,
     ) -> None:
         """更新模型配置。"""
+        # 本地模型固定1线程
+        if not api_key_var.strip():
+            workers = 1
+            
         self._conn.execute(
-            "UPDATE models SET type=?, name=?, model_id=?, base_url=?, api_key_var=? WHERE id=?",
-            (model_type, name, model_id, base_url, api_key_var, model_db_id),
+            "UPDATE models SET type=?, name=?, model_id=?, base_url=?, api_key_var=?, workers=? WHERE id=?",
+            (model_type, name, model_id, base_url, api_key_var, workers, model_db_id),
         )
         self._conn.commit()
 

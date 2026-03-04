@@ -19,6 +19,7 @@ from photo_identify.config import (
     DEFAULT_VIDEO_FRAME_INTERVAL,
     DEFAULT_RPM_LIMIT,
     DEFAULT_TPM_LIMIT,
+    DEFAULT_WORKERS,
 )
 from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_TYPES
 from photo_identify.search import search
@@ -143,12 +144,13 @@ class ModelDialog(tk.Toplevel):
         self._model_id_var = tk.StringVar(value=model_data.get("model_id", "") if model_data else "")
         self._base_url_var = tk.StringVar(value=model_data.get("base_url", "") if model_data else "")
         self._api_key_var_var = tk.StringVar(value=model_data.get("api_key_var", "") if model_data else "")
+        self._workers_var = tk.StringVar(value=str(model_data.get("workers", 4)) if model_data else "4")
 
         # ── 布局 ──
         frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        labels = ["模型类型:", "模型名称:", "模型ID:", "接口地址:", "API变量名:"]
+        labels = ["模型类型:", "模型名称:", "模型ID:", "接口地址:", "API变量名:", "并发线程数:"]
         row = 0
         for lbl in labels:
             ttk.Label(frame, text=lbl).grid(row=row, column=0, sticky=tk.W, pady=6, padx=(0, 10))
@@ -164,8 +166,13 @@ class ModelDialog(tk.Toplevel):
         for i, var in enumerate([self._name_var, self._model_id_var, self._base_url_var, self._api_key_var_var], 1):
             ttk.Entry(frame, textvariable=var, width=40).grid(row=i, column=1, sticky=tk.W, pady=6)
 
+        # 并发线程数
+        self._workers_entry = ttk.Spinbox(frame, from_=1, to=32, textvariable=self._workers_var, width=10)
+        self._workers_entry.grid(row=5, column=1, sticky=tk.W, pady=6)
+
         # API变量名旁的提示
         ttk.Label(frame, text="(本地模型可留空)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
+        ttk.Label(frame, text="(本地模型固定为1)", foreground="gray").grid(row=5, column=2, sticky=tk.W, padx=5)
 
         # 底部按钮
         btn_frame = ttk.Frame(self, padding=(20, 0, 20, 15))
@@ -174,7 +181,17 @@ class ModelDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="✖ 取消", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(btn_frame, text="🦙 Ollama 预设", command=self._fill_ollama_preset).pack(side=tk.LEFT, padx=5)
 
+        self._api_key_var_var.trace_add("write", self._on_api_key_changed)
+        self._on_api_key_changed()
+
         self._center(parent)
+
+    def _on_api_key_changed(self, *args):
+        if not self._api_key_var_var.get().strip():
+            self._workers_var.set("1")
+            self._workers_entry.state(["disabled"])
+        else:
+            self._workers_entry.state(["!disabled"])
 
     def _center(self, parent):
         """将对话框居中于父窗口。"""
@@ -196,11 +213,17 @@ class ModelDialog(tk.Toplevel):
         model_id = self._model_id_var.get().strip()
         base_url = self._base_url_var.get().strip()
         api_key_var = self._api_key_var_var.get().strip()
+        workers = self._workers_var.get().strip()
 
         # 名称、模型ID、接口地址为必填；API变量名可为空（本地模型无需 API Key）
         if not all([name, model_id, base_url]):
             messagebox.showwarning("警告", "模型名称、模型ID、接口地址不能为空！", parent=self)
             return
+            
+        try:
+            workers_int = int(workers)
+        except ValueError:
+            workers_int = 1 if not api_key_var else 4
 
         self.result = {
             "type": self._type_var.get(),
@@ -208,6 +231,7 @@ class ModelDialog(tk.Toplevel):
             "model_id": model_id,
             "base_url": base_url,
             "api_key_var": api_key_var,
+            "workers": workers_int,
         }
         self.destroy()
 
@@ -433,6 +457,8 @@ class PhotoIdentifyGUI(tk.Tk):
         elif names:
             self.scan_model_combo.set(names[0])
             self.scan_model_id_var.set(self._scan_model_map[names[0]])
+            
+        self._update_scan_workers_display()
 
     def _set_search_model_by_id(self, model_id: str):
         """根据 model_id 设置检索页下拉选中项。"""
@@ -455,18 +481,33 @@ class PhotoIdentifyGUI(tk.Tk):
         name = self.scan_model_combo.get()
         if name and hasattr(self, "_scan_model_map"):
             self.scan_model_id_var.set(self._scan_model_map.get(name, ""))
+            self._update_scan_workers_display()
+            
+    def _update_scan_workers_display(self):
+        """更新扫描页的并发线程数显示"""
+        model_id = self.scan_model_id_var.get()
+        if not model_id:
+            self.scan_workers_var.set("并发: -")
+            return
+            
+        model = self._model_mgr.get_model_by_model_id(model_id)
+        if model:
+            workers = model.get("workers", 4)
+            self.scan_workers_var.set(f"并发: {workers} 线程")
+        else:
+            self.scan_workers_var.set("并发: -")
 
     # ── 获取当前模型的 API 参数 ──────────────────────────────────
 
-    def _get_model_api_params(self, model_id_var: tk.StringVar, usage_label: str) -> tuple[str, str, str] | None:
-        """获取指定模型变量对应的 (model_id, base_url, api_key)。
+    def _get_model_api_params(self, model_id_var: tk.StringVar, usage_label: str) -> tuple[str, str, str, int] | None:
+        """获取指定模型变量对应的 (model_id, base_url, api_key, workers)。
 
         Args:
             model_id_var: 存储当前选中 model_id 的 StringVar。
             usage_label: 用于提示信息的描述，如 "文本模型" 或 "视觉模型"。
 
         Returns:
-            (model_id, base_url, api_key) 三元组，或失败时返回 None。
+            (model_id, base_url, api_key, workers) 四元组，或失败时返回 None。
         """
         model_id = model_id_var.get().strip()
         if not model_id:
@@ -478,9 +519,11 @@ class PhotoIdentifyGUI(tk.Tk):
             messagebox.showwarning("警告", f"未找到模型 {model_id!r} 的配置，请检查「模型管理」页。")
             return None
 
+        workers = model.get("workers", 4)
+
         # 本地模型（如 Ollama）无需 API Key
         if model.get("is_local"):
-            return model_id, model["base_url"], ""
+            return model_id, model["base_url"], "", workers
 
         api_key = ModelManager.get_api_key_value(model["api_key_var"])
         if not api_key:
@@ -492,14 +535,14 @@ class PhotoIdentifyGUI(tk.Tk):
             )
             return None
 
-        return model_id, model["base_url"], api_key
+        return model_id, model["base_url"], api_key, workers
 
-    def _get_search_api_params(self) -> tuple[str, str, str] | None:
-        """获取检索页当前选中模型的 (model_id, base_url, api_key)。"""
+    def _get_search_api_params(self) -> tuple[str, str, str, int] | None:
+        """获取检索页当前选中模型的 (model_id, base_url, api_key, workers)。"""
         return self._get_model_api_params(self.search_model_id_var, "文本/多模态模型")
 
-    def _get_scan_api_params(self) -> tuple[str, str, str] | None:
-        """获取扫描页当前选中模型的 (model_id, base_url, api_key)。"""
+    def _get_scan_api_params(self) -> tuple[str, str, str, int] | None:
+        """获取扫描页当前选中模型的 (model_id, base_url, api_key, workers)。"""
         return self._get_model_api_params(self.scan_model_id_var, "视觉/多模态模型")
 
     # ── Tab 1: 图片检索 ──────────────────────────────────────────
@@ -653,6 +696,10 @@ class PhotoIdentifyGUI(tk.Tk):
         self._scan_model_map = {}
         self.scan_model_combo = ttk.Combobox(form_frame, state="readonly", width=40)
         self.scan_model_combo.grid(row=0, column=1, sticky=tk.W, pady=10)
+        
+        self.scan_workers_var = tk.StringVar(value="并发: -")
+        ttk.Label(form_frame, textvariable=self.scan_workers_var, foreground="gray").grid(row=0, column=2, sticky=tk.W, padx=10, pady=10)
+        
         self.scan_model_combo.bind("<<ComboboxSelected>>", self._on_scan_model_selected)
         self._refresh_scan_model_combo()
         
@@ -1683,6 +1730,7 @@ class PhotoIdentifyGUI(tk.Tk):
         ttk.Button(toolbar, text="✏️ 编辑", command=self._model_edit).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="🗑 删除", command=self._model_delete).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="🔄 刷新状态", command=self._model_refresh).pack(side=tk.LEFT, padx=10)
+        ttk.Button(toolbar, text="💾 导出CSV", command=self._model_export_csv).pack(side=tk.LEFT, padx=4)
 
         # 将环境变量设置按钮放右侧
         ttk.Button(toolbar, text="⚙ 环境变量设置", command=self.open_env_vars).pack(side=tk.RIGHT, padx=4)
@@ -1695,7 +1743,7 @@ class PhotoIdentifyGUI(tk.Tk):
         tree_frame = ttk.Frame(self.model_tab, padding=(10, 0, 10, 10))
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("type", "name", "model_id", "base_url", "api_key_var", "status")
+        columns = ("type", "name", "model_id", "base_url", "api_key_var", "workers", "status")
         self._model_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
 
         col_settings = [
@@ -1704,6 +1752,7 @@ class PhotoIdentifyGUI(tk.Tk):
             ("model_id",    "模型ID",       160, tk.W),
             ("base_url",    "接口地址",     200, tk.W),
             ("api_key_var", "API变量名",    150, tk.W),
+            ("workers",     "并发数",       60,  tk.CENTER),
             ("status",      "API状态",      70,  tk.CENTER),
         ]
         for col, heading, width, anchor in col_settings:
@@ -1753,7 +1802,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 tag = "fail"
             iid = self._model_tree.insert(
                 "", tk.END,
-                values=(m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", status_text),
+                values=(m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", m.get("workers", 4), status_text),
                 tags=(tag,)
             )
             self._tree_item_to_db_id[iid] = m["id"]
@@ -1780,7 +1829,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             r = dlg.result
-            self._model_mgr.add_model(r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"])
+            self._model_mgr.add_model(r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"], r.get("workers", 4))
             self._model_refresh()
 
     def _model_edit(self):
@@ -1795,7 +1844,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             r = dlg.result
-            self._model_mgr.update_model(db_id, r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"])
+            self._model_mgr.update_model(db_id, r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"], r.get("workers", 4))
             self._model_refresh()
 
     def _model_delete(self):
@@ -1838,8 +1887,44 @@ class PhotoIdentifyGUI(tk.Tk):
             model["model_id"],
             model["base_url"],
             model["api_key_var"],
+            model.get("workers", 4),
         )
         self._model_refresh()
+
+    def _model_export_csv(self):
+        """导出模型配置到 CSV"""
+        import csv
+        models = self._model_mgr.get_all_models()
+        if not models:
+            messagebox.showinfo("提示", "当前没有可导出的模型配置。")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")],
+            title="导出模型配置",
+            initialfile="models_export.csv"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(["模型类型", "模型名称", "模型ID", "接口地址", "API变量名", "并发数", "是否本地"])
+                for m in models:
+                    writer.writerow([
+                        m.get("type", ""),
+                        m.get("name", ""),
+                        m.get("model_id", ""),
+                        m.get("base_url", ""),
+                        m.get("api_key_var", ""),
+                        m.get("workers", 4),
+                        "是" if m.get("is_local") else "否"
+                    ])
+            messagebox.showinfo("成功", f"成功导出 {len(models)} 个模型配置")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {e}")
 
     # ── 信息扫描相关方法 ──────────────────────────────────────────
 
@@ -1902,7 +1987,7 @@ class PhotoIdentifyGUI(tk.Tk):
         api_params = self._get_scan_api_params()
         if api_params is None:
             return
-        model_id, base_url, api_key = api_params
+        model_id, base_url, api_key, current_workers = api_params
             
         self.scan_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.NORMAL)
@@ -1951,10 +2036,13 @@ class PhotoIdentifyGUI(tk.Tk):
             llm_writer = TkLineWriter(self.log_text, 1)
             face_writer = TkLineWriter(self.log_text, 2)
 
-            logging.info("扫描启动 — 模型: %s, 接口: %s", model_id, base_url)
+            logging.info("扫描启动 — 模型: %s, 接口: %s, 并发: %d", model_id, base_url, current_workers)
 
             try:
-                scan(
+                # 不再使用固定 DEFAULT_WORKERS，而是从模型配置传入
+                # if "127.0.0.1" in base_url or "localhost" in base_url: 这段不再需要，因为如果是本地模型则必定 workers=1 已经控制了
+                
+                result_stats = scan(
                     paths=self.scan_paths,
                     db_path=self.scan_db_var.get(),
                     api_key=api_key,
@@ -1962,6 +2050,7 @@ class PhotoIdentifyGUI(tk.Tk):
                     model=model_id,
                     rpm_limit=DEFAULT_RPM_LIMIT,
                     tpm_limit=DEFAULT_TPM_LIMIT,
+                    workers=current_workers,
                     cancel_event=self._scan_cancel_event,
                     video_frame_interval=float(self.scan_frame_interval_var.get() or DEFAULT_VIDEO_FRAME_INTERVAL),
                     enable_face_scan=self.enable_face_scan_var.get(),
@@ -1971,6 +2060,15 @@ class PhotoIdentifyGUI(tk.Tk):
                 if current_gen == self._scan_generation:
                     if self._scan_cancel_event and not self._scan_cancel_event.is_set():
                         self.after(0, lambda: self.scan_status_var.set("扫描完成！可以去搜索页检索了。"))
+                        def _append_summary(stats=result_stats):
+                            self.log_text.configure(state=tk.NORMAL)
+                            self.log_text.insert(tk.END, f"\n\n✨ 所有流水线处理完毕！\n"
+                                f"   - [信息扫描] 耗时 {stats.get('llm_cost', 0):.1f}s, 共扫描 {stats.get('total', 0)} 张图像\n"
+                                f"   - [人物识别] 耗时 {stats.get('face_cost', 0):.1f}s, 共识别出 {stats.get('face_found', 0)} 张含人脸\n"
+                                f"   - 扫描与聚类总耗时: {stats.get('total_cost', 0):.1f}s\n\n")
+                            self.log_text.configure(state=tk.DISABLED)
+                            self.log_text.see(tk.END)
+                        self.after(0, _append_summary)
                     else:
                         self.after(0, lambda: self.scan_status_var.set("扫描已中止。"))
             except Exception as e:
@@ -2078,7 +2176,7 @@ class PhotoIdentifyGUI(tk.Tk):
             api_params = self._get_search_api_params()
             if api_params is None:
                 return
-            model_id, base_url, api_key = api_params
+            model_id, base_url, api_key, _ = api_params
         else:
             model_id, base_url, api_key = "", "", ""
 

@@ -18,7 +18,7 @@ DEFAULT_TEXT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 # 默认采样参数
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 300
 
 # ── 速率限制 ──────────────────────────────────────────────
 DEFAULT_RPM_LIMIT = 1000
