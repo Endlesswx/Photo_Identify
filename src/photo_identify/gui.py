@@ -20,7 +20,7 @@ from photo_identify.config import (
     DEFAULT_RPM_LIMIT,
     DEFAULT_TPM_LIMIT,
 )
-from photo_identify.model_manager import ModelManager, get_model_db_path
+from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_TYPES
 from photo_identify.search import search
 from photo_identify.scanner import scan
 
@@ -124,8 +124,6 @@ class TkLineWriter:
 class ModelDialog(tk.Toplevel):
     """新增/编辑模型的对话框。"""
 
-    MODEL_TYPES = ["视觉模型", "文本模型"]
-
     def __init__(self, parent, title: str, model_data: dict | None = None):
         """
         Args:
@@ -140,7 +138,7 @@ class ModelDialog(tk.Toplevel):
         self.result = None  # 用户点保存后存变量值
 
         # ── 变量 ──
-        self._type_var = tk.StringVar(value=model_data["type"] if model_data else self.MODEL_TYPES[0])
+        self._type_var = tk.StringVar(value=model_data["type"] if model_data else MODEL_TYPES[0])
         self._name_var = tk.StringVar(value=model_data.get("name", "") if model_data else "")
         self._model_id_var = tk.StringVar(value=model_data.get("model_id", "") if model_data else "")
         self._base_url_var = tk.StringVar(value=model_data.get("base_url", "") if model_data else "")
@@ -159,36 +157,49 @@ class ModelDialog(tk.Toplevel):
         # 类型下拉
         ttk.Combobox(
             frame, textvariable=self._type_var,
-            values=self.MODEL_TYPES, state="readonly", width=30
+            values=MODEL_TYPES, state="readonly", width=30
         ).grid(row=0, column=1, sticky=tk.W, pady=6)
 
         # 文本字段
         for i, var in enumerate([self._name_var, self._model_id_var, self._base_url_var, self._api_key_var_var], 1):
             ttk.Entry(frame, textvariable=var, width=40).grid(row=i, column=1, sticky=tk.W, pady=6)
 
+        # API变量名旁的提示
+        ttk.Label(frame, text="(本地模型可留空)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
+
         # 底部按钮
         btn_frame = ttk.Frame(self, padding=(20, 0, 20, 15))
         btn_frame.pack(fill=tk.X)
         ttk.Button(btn_frame, text="✔ 保存", command=self._on_save).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="✖ 取消", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="🦙 Ollama 预设", command=self._fill_ollama_preset).pack(side=tk.LEFT, padx=5)
 
         self._center(parent)
 
     def _center(self, parent):
+        """将对话框居中于父窗口。"""
         self.update_idletasks()
         pw = parent.winfo_rootx() + parent.winfo_width() // 2
         ph = parent.winfo_rooty() + parent.winfo_height() // 2
         w, h = self.winfo_width(), self.winfo_height()
         self.geometry(f"+{pw - w // 2}+{ph - h // 2}")
 
+    def _fill_ollama_preset(self):
+        """一键填充 Ollama 本地模型预设值。"""
+        self._type_var.set("多模态模型")
+        self._base_url_var.set("http://localhost:11434/v1")
+        self._api_key_var_var.set("")
+
     def _on_save(self):
+        """校验并保存表单数据。"""
         name = self._name_var.get().strip()
         model_id = self._model_id_var.get().strip()
         base_url = self._base_url_var.get().strip()
         api_key_var = self._api_key_var_var.get().strip()
 
-        if not all([name, model_id, base_url, api_key_var]):
-            messagebox.showwarning("警告", "所有字段均不能为空！", parent=self)
+        # 名称、模型ID、接口地址为必填；API变量名可为空（本地模型无需 API Key）
+        if not all([name, model_id, base_url]):
+            messagebox.showwarning("警告", "模型名称、模型ID、接口地址不能为空！", parent=self)
             return
 
         self.result = {
@@ -386,12 +397,12 @@ class PhotoIdentifyGUI(tk.Tk):
     # ── 工具方法：下拉列表数据填充 ──────────────────────────────
 
     def _get_text_models(self) -> list[dict]:
-        """获取所有文本模型列表。"""
-        return self._model_mgr.get_models_by_type("文本模型")
+        """获取可用于文本检索的模型列表（文本模型 + 多模态模型）。"""
+        return self._model_mgr.get_models_for_usage("text")
 
     def _get_vision_models(self) -> list[dict]:
-        """获取所有视觉模型列表。"""
-        return self._model_mgr.get_models_by_type("视觉模型")
+        """获取可用于视觉扫描的模型列表（视觉模型 + 多模态模型）。"""
+        return self._model_mgr.get_models_for_usage("vision")
 
     def _refresh_search_model_combo(self):
         """刷新检索页模型下拉列表。"""
@@ -447,22 +458,30 @@ class PhotoIdentifyGUI(tk.Tk):
 
     # ── 获取当前模型的 API 参数 ──────────────────────────────────
 
-    def _get_search_api_params(self) -> tuple[str, str, str] | None:
-        """获取检索页当前选中模型的 (model_id, base_url, api_key)。
+    def _get_model_api_params(self, model_id_var: tk.StringVar, usage_label: str) -> tuple[str, str, str] | None:
+        """获取指定模型变量对应的 (model_id, base_url, api_key)。
+
+        Args:
+            model_id_var: 存储当前选中 model_id 的 StringVar。
+            usage_label: 用于提示信息的描述，如 "文本模型" 或 "视觉模型"。
 
         Returns:
             (model_id, base_url, api_key) 三元组，或失败时返回 None。
         """
-        model_id = self.search_model_id_var.get().strip()
+        model_id = model_id_var.get().strip()
         if not model_id:
-            messagebox.showwarning("警告", "请在「模型管理」页添加文本模型，并在检索页选择一个模型！")
+            messagebox.showwarning("警告", f"请在「模型管理」页添加{usage_label}，并选择一个模型！")
             return None
-        
+
         model = self._model_mgr.get_model_by_model_id(model_id)
         if not model:
             messagebox.showwarning("警告", f"未找到模型 {model_id!r} 的配置，请检查「模型管理」页。")
             return None
-        
+
+        # 本地模型（如 Ollama）无需 API Key
+        if model.get("is_local"):
+            return model_id, model["base_url"], ""
+
         api_key = ModelManager.get_api_key_value(model["api_key_var"])
         if not api_key:
             messagebox.showwarning(
@@ -472,36 +491,16 @@ class PhotoIdentifyGUI(tk.Tk):
                 f"设置后点击「🔄 刷新状态」即可，无需重启应用。"
             )
             return None
-        
+
         return model_id, model["base_url"], api_key
+
+    def _get_search_api_params(self) -> tuple[str, str, str] | None:
+        """获取检索页当前选中模型的 (model_id, base_url, api_key)。"""
+        return self._get_model_api_params(self.search_model_id_var, "文本/多模态模型")
 
     def _get_scan_api_params(self) -> tuple[str, str, str] | None:
-        """获取扫描页当前选中模型的 (model_id, base_url, api_key)。
-
-        Returns:
-            (model_id, base_url, api_key) 三元组，或失败时返回 None。
-        """
-        model_id = self.scan_model_id_var.get().strip()
-        if not model_id:
-            messagebox.showwarning("警告", "请在「模型管理」页添加视觉模型，并在扫描页选择一个模型！")
-            return None
-        
-        model = self._model_mgr.get_model_by_model_id(model_id)
-        if not model:
-            messagebox.showwarning("警告", f"未找到模型 {model_id!r} 的配置，请检查「模型管理」页。")
-            return None
-        
-        api_key = ModelManager.get_api_key_value(model["api_key_var"])
-        if not api_key:
-            messagebox.showwarning(
-                "警告",
-                f"未找到环境变量 {model['api_key_var']}！\n"
-                f"请在「模型管理」页点击「⚙ 环境变量设置」进行配置。\n"
-                f"设置后点击「🔄 刷新状态」即可，无需重启应用。"
-            )
-            return None
-        
-        return model_id, model["base_url"], api_key
+        """获取扫描页当前选中模型的 (model_id, base_url, api_key)。"""
+        return self._get_model_api_params(self.scan_model_id_var, "视觉/多模态模型")
 
     # ── Tab 1: 图片检索 ──────────────────────────────────────────
 
@@ -1727,6 +1726,8 @@ class PhotoIdentifyGUI(tk.Tk):
 
         # 双击编辑
         self._model_tree.bind("<Double-1>", lambda e: self._model_edit())
+        # 右键菜单
+        self._model_tree.bind("<Button-3>", self._show_model_context_menu)
 
         # 存储 tree item id → model db id 的映射
         self._tree_item_to_db_id: dict[str, int] = {}
@@ -1741,18 +1742,25 @@ class PhotoIdentifyGUI(tk.Tk):
 
         models = self._model_mgr.get_all_models()
         for m in models:
-            status_ok = m["api_key_status"]
-            status_text = "✅" if status_ok else "❌"
-            tag = "ok" if status_ok else "fail"
+            if m.get("is_local"):
+                status_text = "🏠 本地"
+                tag = "ok"
+            elif m["api_key_status"]:
+                status_text = "✅"
+                tag = "ok"
+            else:
+                status_text = "❌"
+                tag = "fail"
             iid = self._model_tree.insert(
                 "", tk.END,
-                values=(m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"], status_text),
+                values=(m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", status_text),
                 tags=(tag,)
             )
             self._tree_item_to_db_id[iid] = m["id"]
 
-        ok_count = sum(1 for m in models if m["api_key_status"])
-        self._model_status_var.set(f"共 {len(models)} 个模型 · {ok_count} 个 APIkey 已配置")
+        local_count = sum(1 for m in models if m.get("is_local"))
+        remote_ok = sum(1 for m in models if not m.get("is_local") and m["api_key_status"])
+        self._model_status_var.set(f"共 {len(models)} 个模型 · {local_count} 个本地 · {remote_ok} 个远程APIkey已配置")
 
         # 同步刷新两个下拉列表
         self._refresh_search_model_combo()
@@ -1801,6 +1809,36 @@ class PhotoIdentifyGUI(tk.Tk):
         if not messagebox.askyesno("确认删除", f"确定要删除模型「{model['name']}」吗？"):
             return
         self._model_mgr.delete_model(db_id)
+        self._model_refresh()
+
+    def _show_model_context_menu(self, event):
+        """模型列表右键菜单。"""
+        iid = self._model_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._model_tree.selection_set(iid)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="✏️ 编辑", command=self._model_edit)
+        menu.add_command(label="📋 复制模型", command=self._model_copy)
+        menu.add_separator()
+        menu.add_command(label="🗑 删除", command=self._model_delete)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _model_copy(self):
+        """复制当前选中的模型，名称添加 -Copy 后缀。"""
+        db_id = self._get_selected_model_db_id()
+        if db_id is None:
+            return
+        model = self._model_mgr.get_model_by_id(db_id)
+        if not model:
+            return
+        self._model_mgr.add_model(
+            model["type"],
+            model["name"] + "-Copy",
+            model["model_id"],
+            model["base_url"],
+            model["api_key_var"],
+        )
         self._model_refresh()
 
     # ── 信息扫描相关方法 ──────────────────────────────────────────
@@ -2060,9 +2098,11 @@ class PhotoIdentifyGUI(tk.Tk):
             limit_val = 30
 
         # 在后台线程执行搜索避免阻塞 GUI
+        import time as _time
         def _search_thread():
+            t0 = _time.perf_counter()
             try:
-                results = search(
+                results, warnings = search(
                     query=query,
                     db_paths=self.search_dbs,
                     limit=limit_val,
@@ -2072,21 +2112,28 @@ class PhotoIdentifyGUI(tk.Tk):
                     model=model_id,
                     rerank=is_llm_mode,
                 )
-                self.after(0, self._on_search_done, results, None)
+                elapsed = _time.perf_counter() - t0
+                self.after(0, self._on_search_done, results, None, elapsed, warnings)
             except Exception as e:
-                self.after(0, self._on_search_done, None, str(e))
+                elapsed = _time.perf_counter() - t0
+                self.after(0, self._on_search_done, None, str(e), elapsed, [])
 
         threading.Thread(target=_search_thread, daemon=True).start()
 
-    def _on_search_done(self, results, error):
+    def _on_search_done(self, results, error, elapsed=0.0, warnings=None):
+        """搜索完成回调，显示结果、耗时和警告。"""
         self.toggle_state(tk.NORMAL)
+        time_str = f"（耗时 {elapsed:.1f}s）"
+
         if error is not None:
-            self.status_var.set(f"搜索失败: {error}")
+            self.status_var.set(f"搜索失败: {error} {time_str}")
+            self.status_label.configure(foreground="red")
             messagebox.showerror("错误", f"搜索执行发生错误：{error}")
             return
 
         if not results:
-            self.status_var.set("搜索完成：未找到匹配的图片。")
+            self.status_var.set(f"搜索完成：未找到匹配的图片。{time_str}")
+            self.status_label.configure(foreground="blue")
             self.current_results = []
             self.current_index = 0
             self._update_display()
@@ -2094,7 +2141,15 @@ class PhotoIdentifyGUI(tk.Tk):
             self._clear_gallery()
             return
 
-        self.status_var.set(f"搜索完成：共找到并重排序 {len(results)} 张图片。")
+        # 检查是否有警告（如 LLM 排序失败）
+        if warnings:
+            warn_text = "; ".join(warnings)
+            self.status_var.set(f"⚠️ {warn_text} —— 共找到 {len(results)} 张图片 {time_str}")
+            self.status_label.configure(foreground="red")
+        else:
+            self.status_var.set(f"搜索完成：共找到并重排序 {len(results)} 张图片。{time_str}")
+            self.status_label.configure(foreground="blue")
+
         self.current_results = results
         self.current_index = 0
         self.show_gallery_view()

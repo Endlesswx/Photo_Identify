@@ -183,6 +183,32 @@ class Storage:
         cursor = self._conn.execute("SELECT path, size_bytes, modified_time, md5 FROM images")
         return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
 
+    def delete_by_paths(self, paths_to_delete: list[str]) -> int:
+        """从数据库中删除指定路径的记录（支持批量）。
+
+        Args:
+            paths_to_delete: 需要删除的图片路径列表。
+
+        Returns:
+            删除的记录数。
+        """
+        if not paths_to_delete:
+            return 0
+            
+        deleted_count = 0
+        cursor = self._conn.cursor()
+        
+        # SQLite IN clause 变量数量限制，因此分批删除
+        batch_size = 500
+        for i in range(0, len(paths_to_delete), batch_size):
+            batch = paths_to_delete[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            cursor.execute(f"DELETE FROM images WHERE path IN ({placeholders})", batch)
+            deleted_count += cursor.rowcount
+            
+        self._conn.commit()
+        return deleted_count
+
     def get_skipped_paths(self) -> set[str]:
         """获取所有持续失败的文件路径集合，扫描时跳过。"""
         try:

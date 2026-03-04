@@ -258,10 +258,9 @@ def call_image_model(
     prompt = _build_prompt()
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = _build_payload(model, temperature, max_tokens, prompt, image_b64, image_format)
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:  # 本地模型（如 Ollama）无需 Authorization 头
+        headers["Authorization"] = f"Bearer {api_key}"
     token_cost = _estimate_tokens(prompt, max_tokens)
 
     last_error = None

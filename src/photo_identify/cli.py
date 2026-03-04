@@ -82,7 +82,7 @@ def _cmd_search(args):
     from photo_identify.search import format_results, search
 
     api_key = load_api_key(args.api_key)
-    results = search(
+    results, warnings = search(
         query=args.query,
         db_path=str(args.db),
         limit=args.limit,
@@ -90,6 +90,9 @@ def _cmd_search(args):
         api_key=api_key,
         base_url=args.base_url,
     )
+    if warnings:
+        for w in warnings:
+            print(f"  ⚠️ {w}", file=sys.stderr)
     print(format_results(results))
 
 

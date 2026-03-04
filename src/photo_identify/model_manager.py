@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Optional
 
 
+# 模型类型常量
+MODEL_TYPES = ["视觉模型", "文本模型", "多模态模型"]
+
 # 默认预设模型数据
 _DEFAULT_MODELS = [
     {
@@ -77,9 +80,14 @@ class ModelManager:
             self._conn.commit()
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
-        """将数据库行转为字典，附加 api_key_status 字段。"""
+        """将数据库行转为字典，附加 api_key_status 和 is_local 字段。"""
         d = dict(row)
-        d["api_key_status"] = self.check_api_key_status(d["api_key_var"])
+        # api_key_var 为空表示本地模型（如 Ollama），无需 API Key
+        d["is_local"] = not d["api_key_var"].strip()
+        if d["is_local"]:
+            d["api_key_status"] = True  # 本地模型视为始终可用
+        else:
+            d["api_key_status"] = self.check_api_key_status(d["api_key_var"])
         return d
 
     # ── 公共接口 ──────────────────────────────────────────────
@@ -93,13 +101,34 @@ class ModelManager:
         """获取指定类型的模型列表。
 
         Args:
-            model_type: "视觉模型" 或 "文本模型"
+            model_type: "视觉模型"、"文本模型" 或 "多模态模型"
 
         Returns:
             模型字典列表。
         """
         rows = self._conn.execute(
             "SELECT * FROM models WHERE type=? ORDER BY id", (model_type,)
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_models_for_usage(self, usage: str) -> list[dict]:
+        """根据用途获取可用模型列表（多模态模型同时适用于文本和视觉）。
+
+        Args:
+            usage: "text" 返回文本模型+多模态模型；"vision" 返回视觉模型+多模态模型。
+
+        Returns:
+            模型字典列表。
+        """
+        if usage == "text":
+            types = ("文本模型", "多模态模型")
+        elif usage == "vision":
+            types = ("视觉模型", "多模态模型")
+        else:
+            types = (usage,)
+        placeholders = ",".join("?" for _ in types)
+        rows = self._conn.execute(
+            f"SELECT * FROM models WHERE type IN ({placeholders}) ORDER BY id", types
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 

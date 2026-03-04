@@ -7,6 +7,7 @@
 
 import json
 import logging
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -57,16 +58,15 @@ def _llm_expand_query(query: str, api_key: str, base_url: str = DEFAULT_BASE_URL
     payload = {
         "model": model,
         "temperature": 0.1,
-        "max_tokens": 150,
+        "max_tokens": 10240,
         "messages": [
             {"role": "system", "content": _EXPAND_SYSTEM_PROMPT},
             {"role": "user", "content": query},
         ],
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:  # 本地模型（如 Ollama）无需 Authorization 头
+        headers["Authorization"] = f"Bearer {api_key}"
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{base_url}/chat/completions", data=body, headers=headers, method="POST"
@@ -77,7 +77,7 @@ def _llm_expand_query(query: str, api_key: str, base_url: str = DEFAULT_BASE_URL
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         expanded = content.strip()
         if expanded:
-            print(f"  🔍 关键词扩展: \"{query}\" → \"{expanded}\"")
+            print(f'  🔍 关键词扩展: "{query}" → "{expanded}"')
             return expanded
     except Exception as exc:
         logger.warning("LLM 关键词扩展失败，回退为原始查询: %s", exc)
@@ -86,7 +86,8 @@ def _llm_expand_query(query: str, api_key: str, base_url: str = DEFAULT_BASE_URL
 
 
 _RERANK_SYSTEM_PROMPT = """\
-你是一个图片检索重排序助手。用户提供了一个搜索描述，以及若干候选图片的序号和内容信息。
+你是一个图片检索重排序助手。请立即、直接输出 JSON 数组结果，禁止输出任何思维过程(Reasoning/Thinking)或解释说明。
+用户提供了一个搜索描述，以及若干候选图片的序号和内容信息。
 你的任务是：深入理解用户的语言意图，从候选图片中选出相对最符合要求的图片，并按匹配程度从高到低排序返回。
 
 返回规则严格遵守：
@@ -123,16 +124,15 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
     payload = {
         "model": model,
         "temperature": 0.1,
-        "max_tokens": 200,
+        "max_tokens": 10240,
         "messages": [
             {"role": "system", "content": _RERANK_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:  # 本地模型（如 Ollama）无需 Authorization 头
+        headers["Authorization"] = f"Bearer {api_key}"
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         f"{base_url}/chat/completions", data=body, headers=headers, method="POST"
@@ -141,8 +141,22 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             data = json.loads(response.read().decode("utf-8"))
-        ans = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        ans = ans.replace("```json", "").replace("```", "").strip()
+        msg = data.get("choices", [{}])[0].get("message", {})
+        ans = msg.get("content", "").strip()
+        
+        # 清除特殊标记（GLM-4 系列的 <|begin_of_box|>...<|end_of_box|> 等）
+        ans = re.sub(r'<\|[^|]*\|>', '', ans).strip()
+        
+        if not ans:
+            raise ValueError("模型返回了空内容（content 为空），可能该模型不支持重排序任务或 max_tokens 仍不足")
+        
+        # 优先用正则提取 [数字, 数字, ...] 格式（兼容模型在 content 中混入多余文字）
+        array_match = re.search(r'\[\s*\d+\s*(?:,\s*\d+\s*)*\]', ans)
+        if array_match:
+            ans = array_match.group()
+        else:
+            # 兜底清理
+            ans = ans.replace("```json", "").replace("```", "").strip()
         
         # 尝试解析 JSON 数组
         best_indices = json.loads(ans)
@@ -169,12 +183,12 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
                 reranked.append(r)
                 
         # 拼接剩余未参与重排的项
-        return reranked + remainder
+        return reranked + remainder, ""
 
     except Exception as exc:
         logger.warning("LLM 重排序失败: %s", exc)
         print(f"  ⚠️ LLM 排序失败，回退默认顺序: {exc}", file=sys.stderr)
-        return results
+        return results, f"LLM 排序失败，已回退默认顺序: {exc}"
 
 def search(
     query: str,
@@ -199,12 +213,13 @@ def search(
         rerank: 是否使用 LLM 对召回结果进行二次排序。
 
     Returns:
-        匹配的图片记录列表。
+        (results, warnings) 二元组：匹配的图片记录列表 和 警告信息列表。
     """
     expanded_query = query
     if smart or rerank:
-        if not api_key:
-            print("  ⚠️ 智能模式/重排序需要 API Key，回退为普通搜索模式", file=sys.stderr)
+        # 本地模型（如 Ollama）无需 api_key 但有 base_url，仍可使用智能模式
+        if not api_key and not base_url:
+            print("  ⚠️ 智能模式/重排序需要模型配置，回退为普通搜索模式", file=sys.stderr)
             smart = False
             rerank = False
         elif smart:
@@ -232,12 +247,16 @@ def search(
     # 如果跨库汇总结果超出 fetch_limit，按需对结果的分数等进行全局重排，这里简单截断前 fetch_limit 个
     results = results[:fetch_limit]
     
+    warnings = []
+
     if rerank and results:
-        results = _llm_rerank_results(query, results, api_key, base_url, model)
+        results, rerank_warn = _llm_rerank_results(query, results, api_key, base_url, model)
+        if rerank_warn:
+            warnings.append(rerank_warn)
         # 截断结果到要求数量
         results = results[:limit]
 
-    return results
+    return results, warnings
 
 
 def format_results(results: list[dict]) -> str:

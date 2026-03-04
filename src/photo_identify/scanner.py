@@ -773,6 +773,55 @@ def scan(
         stats.total, storage.count(),
     )
 
+    # ── Phase 3: 清理已删除的文件 (Cleanup) ──
+    try:
+        if not _cancelled:
+            all_db_paths = list(known_paths.keys())
+            to_delete = []
+            _path_exists_cache = {}
+            
+            resolved_scan_parts = []
+            for p in paths:
+                try:
+                    resolved_scan_parts.append(Path(p).resolve().parts)
+                except (OSError, ValueError):
+                    pass
+
+            for db_path in all_db_paths:
+                base_path = db_path.split("#t=")[0]
+                
+                try:
+                    base_parts = Path(base_path).resolve().parts
+                except (OSError, ValueError):
+                    continue
+                    
+                in_scope = False
+                for scan_parts in resolved_scan_parts:
+                    if base_parts[:len(scan_parts)] == scan_parts:
+                        in_scope = True
+                        break
+                        
+                if not in_scope:
+                    continue
+                    
+                if base_path not in _path_exists_cache:
+                    _path_exists_cache[base_path] = Path(base_path).exists()
+                    
+                if not _path_exists_cache[base_path]:
+                    to_delete.append(db_path)
+                    
+            if to_delete:
+                logger.info("发现 %d 条失效的数据库记录，正在清理...", len(to_delete))
+                if _llm_writer:
+                    _llm_writer.write(f"[清理记录] 正在清理 {len(to_delete)} 条失效的数据库记录...\n")
+                
+                deleted_count = storage.delete_by_paths(to_delete)
+                logger.info("清理完成，成功删除 %d 条记录。", deleted_count)
+                if _llm_writer:
+                    _llm_writer.write(f"[清理记录] ✓ 成功清理 {deleted_count} 条失效记录\n")
+    except Exception as e:
+        logger.error("清理失效记录时发生错误: %s", e)
+
     _do_clustering()
 
     storage.close()
