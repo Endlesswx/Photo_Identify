@@ -11,6 +11,15 @@ import json
 import re
 import urllib.request
 import urllib.error
+import os
+import sys
+
+# 确保能加载项目内部模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.abspath(os.path.join(current_dir, "../src"))
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
 from photo_identify.model_manager import ModelManager, get_model_db_path
 
 # 重排序系统提示词（与 search.py 完全一致）

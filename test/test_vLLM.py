@@ -8,9 +8,9 @@ import subprocess
 
 # 1. 确保能加载项目内部模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, "../../"))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+src_dir = os.path.abspath(os.path.join(current_dir, "../src"))
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 
 from photo_identify.llm import async_call_image_model
 
