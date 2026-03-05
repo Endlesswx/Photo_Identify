@@ -172,7 +172,7 @@ class ModelDialog(tk.Toplevel):
 
         # API变量名旁的提示
         ttk.Label(frame, text="(本地模型可留空)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
-        ttk.Label(frame, text="(本地模型固定为1)", foreground="gray").grid(row=5, column=2, sticky=tk.W, padx=5)
+        ttk.Label(frame, text="(建议: Ollama为1，vLLM依据显存调整)", foreground="gray").grid(row=5, column=2, sticky=tk.W, padx=5)
 
         # 底部按钮
         btn_frame = ttk.Frame(self, padding=(20, 0, 20, 15))
@@ -187,11 +187,8 @@ class ModelDialog(tk.Toplevel):
         self._center(parent)
 
     def _on_api_key_changed(self, *args):
-        if not self._api_key_var_var.get().strip():
-            self._workers_var.set("1")
-            self._workers_entry.state(["disabled"])
-        else:
-            self._workers_entry.state(["!disabled"])
+        # 移除强制禁用 workers_entry 和重置为 1 的逻辑，因为用户需要自定义并发（如 vLLM 可多线程）
+        pass
 
     def _center(self, parent):
         """将对话框居中于父窗口。"""
@@ -223,7 +220,7 @@ class ModelDialog(tk.Toplevel):
         try:
             workers_int = int(workers)
         except ValueError:
-            workers_int = 1 if not api_key_var else 4
+            workers_int = 4
 
         self.result = {
             "type": self._type_var.get(),

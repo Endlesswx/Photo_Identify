@@ -7,13 +7,13 @@
 - JSON 返回值解析与校验
 """
 
+import asyncio
 import base64
 import json
 import logging
 import re
 import time
-import urllib.error
-import urllib.request
+import aiohttp
 
 from photo_identify.config import (
     DEFAULT_BASE_URL,
@@ -73,32 +73,33 @@ def _build_payload(model: str, temperature: float, max_tokens: int, prompt: str,
     }
 
 
-def _request_json(url: str, payload: dict, headers: dict, timeout: int) -> tuple[int, dict]:
-    """发送 JSON POST 请求并返回状态码与响应内容。
+async def _request_json_async(url: str, payload: dict, headers: dict, timeout: int, session: aiohttp.ClientSession) -> tuple[int, dict]:
+    """发送 JSON POST 异步请求并返回状态码与响应内容。
 
     Args:
         url: 请求地址。
         payload: JSON 请求载荷。
         headers: 请求头字典。
         timeout: 超时时间（秒）。
+        session: aiohttp 会话实例。
 
     Returns:
         (HTTP 状态码, 解析后的响应字典)。
     """
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
             status = response.status
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        status = exc.code
-    try:
-        data = json.loads(raw.decode("utf-8")) if raw else {}
-    except json.JSONDecodeError:
-        data = {"raw": raw.decode("utf-8", errors="ignore")}
-    return status, data
+            try:
+                data = await response.json()
+            except aiohttp.ContentTypeError:
+                raw = await response.text()
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    data = {"raw": raw}
+            return status, data
+    except Exception as exc:
+        return 500, {"raw": str(exc), "error": str(exc)}
 
 
 def _estimate_tokens(prompt: str, max_tokens: int) -> int:
@@ -130,17 +131,16 @@ class RateLimiter:
         self._tpm_limit = tpm_limit
         self._requests: list[float] = []
         self._tokens: list[tuple[float, int]] = []
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
 
-    def wait(self, token_cost: int):
-        """根据速率限制等待适当时间后放行（线程安全）。
+    async def wait(self, token_cost: int):
+        """根据速率限制等待适当时间后放行（协程安全）。
 
         Args:
             token_cost: 本次请求估算的 token 成本。
         """
-        # 第一步：在锁内计算需要等待的时间，但不在锁内 sleep
         sleep_time = 0.0
-        with self._lock:
+        async with self._lock:
             now = time.monotonic()
             self._requests = [t for t in self._requests if now - t < 60]
             self._tokens = [t for t in self._tokens if now - t[0] < 60]
@@ -157,13 +157,11 @@ class RateLimiter:
                     if wait_seconds > 0:
                         sleep_time = max(sleep_time, wait_seconds)
 
-        # 第二步：在锁外 sleep，不阻塞其他线程
         if sleep_time > 0:
             logger.debug("速率节流，等待 %.1f 秒", sleep_time)
-            time.sleep(sleep_time)
+            await asyncio.sleep(sleep_time)
 
-        # 第三步：重新获取锁，记录本次请求
-        with self._lock:
+        async with self._lock:
             now = time.monotonic()
             self._requests.append(now)
             self._tokens.append((now, token_cost))
@@ -203,29 +201,26 @@ def _extract_json_from_text(text: str) -> dict | None:
 class CircuitBreaker:
     """全局断路器，用于探测并熔断长时间无响应的 API 请求假死。"""
     def __init__(self, max_consecutive_failures: int = 5):
-        import threading
         self.max_consecutive_failures = max_consecutive_failures
         self.consecutive_failures = 0
         self.is_open = False
-        self._lock = threading.Lock()
 
     def record_failure(self):
-        with self._lock:
-            self.consecutive_failures += 1
-            if self.consecutive_failures >= self.max_consecutive_failures:
-                self.is_open = True
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            self.is_open = True
                 
     def record_success(self):
-        with self._lock:
-            self.consecutive_failures = 0
-            self.is_open = False
+        self.consecutive_failures = 0
+        self.is_open = False
 
 # 全局共享断路器实例
 global_circuit_breaker = CircuitBreaker()
 
 
-def call_image_model(
+async def async_call_image_model(
     image_bytes: bytes,
+    session: aiohttp.ClientSession,
     image_format: str = "jpeg",
     api_key: str = "",
     base_url: str = DEFAULT_BASE_URL,
@@ -235,10 +230,11 @@ def call_image_model(
     timeout: int = DEFAULT_TIMEOUT,
     rate_limiter: RateLimiter | None = None,
 ) -> dict:
-    """调用多模态模型分析图片，包含自动重试和 JSON 解析。
+    """调用多模态模型分析图片，包含自动重试和 JSON 解析（异步版本）。
 
     Args:
         image_bytes: 压缩后的图片字节内容。
+        session: aiohttp ClientSession
         image_format: 图片格式（如 jpeg）。
         api_key: API Key。
         base_url: API Base URL。
@@ -266,9 +262,9 @@ def call_image_model(
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         if rate_limiter:
-            rate_limiter.wait(token_cost)
+            await rate_limiter.wait(token_cost)
         try:
-            status, data = _request_json(f"{base_url}/chat/completions", payload, headers, timeout)
+            status, data = await _request_json_async(f"{base_url}/chat/completions", payload, headers, timeout, session)
             # 成功请求则重置断路器
             if status < 500:
                 global_circuit_breaker.record_success()
@@ -278,14 +274,14 @@ def call_image_model(
             logger.warning("API 请求异常 (第 %d 次): %s", attempt, exc)
             
             # 对"完全读不出"或超时这类网络连通性异常触发快速失效并记录断路器
-            if "timed out" in str(exc).lower() or "connection" in str(exc).lower():
+            if "timed out" in str(exc).lower() or "connection" in str(exc).lower() or "timeout" in str(exc).lower():
                 global_circuit_breaker.record_failure()
                 if global_circuit_breaker.is_open:
                     logger.error("连续网络超时达到阈值，触发断路器熔断！")
                     return {"error": f"触发断路器：网络持续无法连接或超时 ({last_error})", "__circuit_breaker_open__": True}
             
             if attempt < MAX_RETRIES:
-                time.sleep(min(RETRY_BASE_DELAY ** attempt, 3.0))
+                await asyncio.sleep(min(RETRY_BASE_DELAY ** attempt, 3.0))
             continue
 
         if status >= 500:
@@ -293,11 +289,15 @@ def call_image_model(
             logger.warning("服务端错误 (第 %d 次): %s", attempt, last_error)
             global_circuit_breaker.record_failure()
             if global_circuit_breaker.is_open:
-                    logger.error("连续服务端 500 错误达到阈值，触发断路器熔断！")
-                    return {"error": f"触发断路器：服务端持续返回错误 ({last_error})", "__circuit_breaker_open__": True}
+                logger.error("连续服务端报错 (>=500) 达到熔断阈值，触发断路器熔断！")
+                return {"error": f"触发断路器：服务端持续返回错误 ({last_error})", "__circuit_breaker_open__": True}
                     
             if attempt < MAX_RETRIES:
-                time.sleep(min(RETRY_BASE_DELAY ** attempt, 3.0))
+                import random
+                # 对于 500 错误采用指数退避并增加明显的随机抖动，防止重试风暴打垮服务端
+                backoff = min(RETRY_BASE_DELAY ** (attempt + 1), 15.0) + random.uniform(1.0, 3.0)
+                logger.debug("触发 5xx 错误降级策略，等待 %.1f 秒后重试", backoff)
+                await asyncio.sleep(backoff)
             continue
 
         if status >= 400:

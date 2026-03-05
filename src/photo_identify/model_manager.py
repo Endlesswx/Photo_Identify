@@ -36,6 +36,13 @@ _DEFAULT_MODELS = [
         "base_url": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
         "api_key_var": "XFYUN_API_KEY",
     },
+    {
+        "type": "多模态模型",
+        "name": "vLLM (本地多模态)",
+        "model_id": "qwen3.5-9b-awq",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "api_key_var": "",
+    },
 ]
 
 
@@ -93,12 +100,12 @@ class ModelManager:
         d["is_local"] = not d.get("api_key_var", "").strip()
         if d["is_local"]:
             d["api_key_status"] = True  # 本地模型视为始终可用
-            d["workers"] = 1 # 本地模型并发固定为1
         else:
             d["api_key_status"] = self.check_api_key_status(d["api_key_var"])
-            # 如果是后来加的列为None或不存在，给默认值4
-            if d.get("workers") is None:
-                d["workers"] = 4
+            
+        # 如果是后来加的列为None或不存在，给默认值
+        if d.get("workers") is None:
+            d["workers"] = 1 if d["is_local"] else 4
         return d
 
     # ── 公共接口 ──────────────────────────────────────────────
@@ -171,9 +178,6 @@ class ModelManager:
         Returns:
             新插入记录的 id。
         """
-        # 本地模型固定1线程
-        if not api_key_var.strip():
-            workers = 1
             
         cursor = self._conn.execute(
             "INSERT INTO models (type, name, model_id, base_url, api_key_var, workers) VALUES (?,?,?,?,?,?)",
@@ -193,9 +197,6 @@ class ModelManager:
         workers: int = 4,
     ) -> None:
         """更新模型配置。"""
-        # 本地模型固定1线程
-        if not api_key_var.strip():
-            workers = 1
             
         self._conn.execute(
             "UPDATE models SET type=?, name=?, model_id=?, base_url=?, api_key_var=?, workers=? WHERE id=?",

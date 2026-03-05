@@ -1,18 +1,20 @@
-"""图片扫描主流程：并发遍历目录，调用 LLM 分析并入库。
+"""图片扫描主流程：异步并发遍历目录，调用 LLM 分析并入库。
 
 负责编排整个扫描过程：
 - 递归收集图片文件
 - 基于 path+size+mtime 快速跳过 + MD5 精确去重
-- 多线程并发调用 LLM API
+- 使用 asyncio 和 aiohttp 异步并发调用模型 API 极大提升吞吐量 (如 vLLM Continuous Batching)
+- 把图片压缩预处理等 CPU 密集型任务拆分并使用协程在独立线程池中处理，解放事件循环
 - 逐条写入 SQLite（断点续扫）
 - tqdm 实时进度条显示
 """
+
 
 import logging
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import IO
@@ -41,8 +43,10 @@ from photo_identify.image_utils import (
     list_images,
     get_image_frame_bytes,
 )
-from photo_identify.llm import RateLimiter, call_image_model
+from photo_identify.llm import RateLimiter, async_call_image_model
 from photo_identify.storage import Storage
+import aiohttp
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +102,7 @@ def _extract_faces_with_resize(image_bytes: bytes) -> list[dict]:
         return []
 
 
-def _analyze_single(
+async def _analyze_single_async(
     path: str,
     api_key: str,
     base_url: str,
@@ -106,18 +110,26 @@ def _analyze_single(
     temperature: float,
     max_tokens: int,
     timeout: int,
+    session: aiohttp.ClientSession,
     rate_limiter: RateLimiter,
     enable_face_scan: bool = False,
     face_cache: dict | None = None,
     face_cache_lock: threading.Lock | None = None,
 ) -> dict:
-    """分析单张图片：读取→压缩→调用 LLM→合并结果。"""
-    image_bytes = get_image_frame_bytes(path)
-    metadata = extract_metadata(path)
-    metadata["md5"] = compute_file_md5_chunked(path)
-    metadata["sha256"] = compute_file_sha256_chunked(path)
+    """分析单张图片：读取→压缩(CPU多核)→调用 LLM(异步)→合并结果。"""
+    # CPU 密集型操作：读取、元数据提取、计算 Hash、压缩 等，放到线程池里以免阻塞事件循环
+    def _cpu_bound_prep():
+        b = get_image_frame_bytes(path)
+        m = extract_metadata(path)
+        m["md5"] = compute_file_md5_chunked(path)
+        m["sha256"] = compute_file_sha256_chunked(path)
+        
+        # 针对 Ultra 5 245KF 优化，引入 max_dim=1120 的限制
+        c_bytes, c_fmt = compress_for_upload(b, max_dim=1120)
+        return b, m, c_bytes, c_fmt
 
-    compressed_bytes, upload_format = compress_for_upload(image_bytes)
+    image_bytes, metadata, compressed_bytes, upload_format = await asyncio.to_thread(_cpu_bound_prep)
+
     logger.debug(
         "图片压缩: %s  %d KB → %d KB",
         Path(path).name,
@@ -125,8 +137,9 @@ def _analyze_single(
         len(compressed_bytes) // 1024,
     )
 
-    llm_result = call_image_model(
+    llm_result = await async_call_image_model(
         image_bytes=compressed_bytes,
+        session=session,
         image_format=upload_format,
         api_key=api_key,
         base_url=base_url,
@@ -147,7 +160,7 @@ def _analyze_single(
         if cached_faces is not None:
             metadata["faces"] = cached_faces
         else:
-            metadata["faces"] = _extract_faces_with_resize(image_bytes)
+            metadata["faces"] = await asyncio.to_thread(_extract_faces_with_resize, image_bytes)
 
     metadata["analyzed_at"] = datetime.now().isoformat()
     return metadata
@@ -483,159 +496,186 @@ def scan(
             bar_format=_bar_fmt, leave=True, mininterval=0.3, ascii=True,
         )
 
-        def _llm_worker(img_path: str) -> tuple[str, dict | list[dict] | None]:
-            if cancel_event and cancel_event.is_set():
-                return img_path, None
+        async def _llm_worker(img_path: str, session: aiohttp.ClientSession, sem: asyncio.Semaphore) -> tuple[str, dict | list[dict] | None]:
+            async with sem:
+                if cancel_event and cancel_event.is_set():
+                    return img_path, None
 
-            ext = Path(img_path).suffix.lower()
-            fname = Path(img_path).name
+                ext = Path(img_path).suffix.lower()
+                fname = Path(img_path).name
 
-            # ---- 视频多帧路径 ----
-            if ext in _VIDEO_EXTS:
+                # ---- 视频多帧路径 ----
+                if ext in _VIDEO_EXTS:
+                    # 对于极端 CPU 耗时的抽帧操作，必须限制其瞬时并发，防止耗尽默认 ThreadPoolExecutor 导致死锁
+                    if getattr(_llm_worker, "cpu_sem", None) is None:
+                        # 全局限制最多 2 个视频同时解码抽帧，避免把 CPU 彻底卡死
+                        _llm_worker.cpu_sem = asyncio.Semaphore(2)
+                        
+                    try:
+                        async with _llm_worker.cpu_sem:
+                            frames = await asyncio.to_thread(extract_video_frames, img_path, video_frame_interval)
+                    except Exception as exc:
+                        logger.error("视频抽帧失败 %s: %s", img_path, exc)
+                        _llm_bar.set_description_str(f"[信息扫描] 失败 {fname}", refresh=False)
+                        _llm_bar.update(1)
+                        if _face_bar:
+                            _face_bar.update(1)
+                        return img_path, {"__failed__": True, "reason": str(exc)}
+
+                    file_metadata = extract_metadata(img_path)
+                    file_md5 = compute_file_md5_chunked(img_path)
+                    file_sha256 = compute_file_sha256_chunked(img_path)
+                    results: list[dict] = []
+
+                    for ts, frame_bytes in frames:
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        frame_md5 = compute_md5(frame_bytes)
+                        with _md5_lock:
+                            if frame_md5 in known_md5s:
+                                results.append(_SKIPPED_SENTINEL)
+                                continue
+                            known_md5s.add(frame_md5)
+                            if enable_face_scan:
+                                face_scanned_md5s.add(frame_md5)
+
+                        ts_label = f"{ts:.1f}s"
+                        
+                        def _cpu_video_prep():
+                            return compress_for_upload(frame_bytes, max_dim=1120)
+                            
+                        compressed, fmt = await asyncio.to_thread(_cpu_video_prep)
+                        
+                        logger.info("视频帧分析 %s @ %s", fname, ts_label)
+                        try:
+                            llm_result = await async_call_image_model(
+                                image_bytes=compressed,
+                                session=session,
+                                image_format=fmt,
+                                api_key=api_key,
+                                base_url=base_url,
+                                model=model,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                timeout=timeout,
+                                rate_limiter=rate_limiter,
+                            )
+                        except Exception as exc:
+                            logger.error("视频帧分析失败 %s@%s: %s", img_path, ts_label, exc)
+                            continue
+
+                        record = dict(file_metadata)
+                        record["md5"] = frame_md5
+                        record["sha256"] = file_sha256
+                        record["path"] = f"{img_path}#t={ts_label}"
+                        record["file_name"] = f"{Path(img_path).stem}_{ts_label}{Path(img_path).suffix}"
+                        record.update(llm_result)
+                        record["analyzed_at"] = datetime.now().isoformat()
+                        results.append(record)
+
+                    _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=False)
+                    _llm_bar.update(1)
+                    return img_path, results if results else None
+
+                    # ---- 普通图片路径 ----
                 try:
-                    frames = extract_video_frames(img_path, video_frame_interval)
+                    # 限定 IO 型和 CPU 轻量 Hash 操作的最大并发以免占用太多句柄
+                    if getattr(_llm_worker, "io_sem", None) is None:
+                        _llm_worker.io_sem = asyncio.Semaphore(20)
+                    async with _llm_worker.io_sem:
+                        md5 = await asyncio.to_thread(compute_file_md5_chunked, img_path)
+                except (OSError, PermissionError) as exc:
+                    logger.warning("无法读取文件 %s: %s", img_path, exc)
+                    _llm_bar.update(1)
+                    if _face_bar:
+                        _face_bar.update(1)
+                    return img_path, None
+
+                need_llm = True
+                need_face = enable_face_scan
+
+                with _md5_lock:
+                    if md5 in known_md5s:
+                        need_llm = False
+                    if need_face and md5 in face_scanned_md5s:
+                        need_face = False
+                    if need_llm:
+                        known_md5s.add(md5)
+                    if need_face:
+                        face_scanned_md5s.add(md5)
+
+                # 完全跳过
+                if not need_llm and not need_face:
+                    _llm_bar.set_description_str(f"[信息扫描] ✓ {fname}", refresh=False)
+                    _llm_bar.update(1)
+                    if _face_bar:
+                        _face_bar.update(1)
+                    return img_path, _SKIPPED_SENTINEL
+
+                # LLM 已做过，人脸待处理 → 推迟到 Phase 2 处理
+                if not need_llm and need_face:
+                    _llm_bar.set_description_str(f"[信息扫描] 已有 {fname}", refresh=False)
+                    _llm_bar.update(1)
+                    
+                    # 放在主线程进行 put，这里标记为需要 face 但无需 llm
+                    return img_path, {"__needs_face_only__": True, "md5": md5}
+
+                # 正常 LLM 分析（人脸推迟到 Phase 2 补充批次）
+                try:
+                    result = await _analyze_single_async(
+                        path=img_path,
+                        api_key=api_key,
+                        base_url=base_url,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=timeout,
+                        session=session,
+                        rate_limiter=rate_limiter,
+                        enable_face_scan=False,
+                    )
+
+                    _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=False)
+                    _llm_bar.update(1)
+
+                    if need_face and enable_face_scan:
+                        # 不在这里 put，在主线程 upsert 后统一 put
+                        result["__needs_face_after_upsert__"] = True
+                        result["md5"] = result.get("md5", md5)
+                    else:
+                        if _face_bar:
+                            _face_bar.update(1)
+
+                    return img_path, result
                 except Exception as exc:
-                    logger.error("视频抽帧失败 %s: %s", img_path, exc)
-                    _llm_bar.set_description_str(f"[信息扫描] 失败 {fname}", refresh=False)
+                    logger.error("分析失败 %s: %s", img_path, exc, exc_info=False)
                     _llm_bar.update(1)
                     if _face_bar:
                         _face_bar.update(1)
                     return img_path, {"__failed__": True, "reason": str(exc)}
 
-                file_metadata = extract_metadata(img_path)
-                file_md5 = compute_file_md5_chunked(img_path)
-                file_sha256 = compute_file_sha256_chunked(img_path)
-                results: list[dict] = []
-
-                for ts, frame_bytes in frames:
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    frame_md5 = compute_md5(frame_bytes)
-                    with _md5_lock:
-                        if frame_md5 in known_md5s:
-                            results.append(_SKIPPED_SENTINEL)
-                            continue
-                        known_md5s.add(frame_md5)
-                        if enable_face_scan:
-                            face_scanned_md5s.add(frame_md5)
-
-                    ts_label = f"{ts:.1f}s"
-                    compressed, fmt = compress_for_upload(frame_bytes)
-                    logger.info("视频帧分析 %s @ %s", fname, ts_label)
-                    try:
-                        llm_result = call_image_model(
-                            image_bytes=compressed,
-                            image_format=fmt,
-                            api_key=api_key,
-                            base_url=base_url,
-                            model=model,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            timeout=timeout,
-                            rate_limiter=rate_limiter,
-                        )
-                    except Exception as exc:
-                        logger.error("视频帧分析失败 %s@%s: %s", img_path, ts_label, exc)
-                        continue
-
-                    record = dict(file_metadata)
-                    record["md5"] = frame_md5
-                    record["sha256"] = file_sha256
-                    record["path"] = f"{img_path}#t={ts_label}"
-                    record["file_name"] = f"{Path(img_path).stem}_{ts_label}{Path(img_path).suffix}"
-                    record.update(llm_result)
-                    record["analyzed_at"] = datetime.now().isoformat()
-                    results.append(record)
-
-                _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=False)
-                _llm_bar.update(1)
-                return img_path, results if results else None
-
-                # ---- 普通图片路径 ----
-            try:
-                md5 = compute_file_md5_chunked(img_path)
-            except (OSError, PermissionError) as exc:
-                logger.warning("无法读取文件 %s: %s", img_path, exc)
-                _llm_bar.update(1)
-                if _face_bar:
-                    _face_bar.update(1)
-                return img_path, None
-
-            need_llm = True
-            need_face = enable_face_scan
-
-            with _md5_lock:
-                if md5 in known_md5s:
-                    need_llm = False
-                if need_face and md5 in face_scanned_md5s:
-                    need_face = False
-                if need_llm:
-                    known_md5s.add(md5)
-                if need_face:
-                    face_scanned_md5s.add(md5)
-
-            # 完全跳过
-            if not need_llm and not need_face:
-                _llm_bar.set_description_str(f"[信息扫描] ✓ {fname}", refresh=False)
-                _llm_bar.update(1)
-                if _face_bar:
-                    _face_bar.update(1)
-                return img_path, _SKIPPED_SENTINEL
-
-            # LLM 已做过，人脸待处理 → 推迟到 Phase 2 处理
-            if not need_llm and need_face:
-                _llm_bar.set_description_str(f"[信息扫描] 已有 {fname}", refresh=False)
-                _llm_bar.update(1)
+        async def _run_async_scan():
+            nonlocal circuit_breaker_err
+            # 连接数池放大以支持大量并发
+            import socket
+            connector = aiohttp.TCPConnector(limit=100, family=socket.AF_INET)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                sem = asyncio.Semaphore(workers) # 使用用户配置的并发数
+                tasks = [asyncio.create_task(_llm_worker(p, session, sem)) for p in to_analyze]
                 
-                # 放在主线程进行 put，这里标记为需要 face 但无需 llm
-                return img_path, {"__needs_face_only__": True, "md5": md5}
-
-            # 正常 LLM 分析（人脸推迟到 Phase 2 补充批次）
-            try:
-                result = _analyze_single(
-                    path=img_path,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                    rate_limiter=rate_limiter,
-                    enable_face_scan=False,
-                )
-
-                _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=False)
-                _llm_bar.update(1)
-
-                if need_face and enable_face_scan:
-                    # 不在这里 put，在主线程 upsert 后统一 put
-                    result["__needs_face_after_upsert__"] = True
-                    result["md5"] = result.get("md5", md5)
-                else:
-                    if _face_bar:
-                        _face_bar.update(1)
-
-                return img_path, result
-            except Exception as exc:
-                logger.error("分析失败 %s: %s", img_path, exc, exc_info=False)
-                _llm_bar.update(1)
-                if _face_bar:
-                    _face_bar.update(1)
-                return img_path, {"__failed__": True, "reason": str(exc)}
-
-        # Phase 1 并发执行
-        try:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(_llm_worker, p): p for p in to_analyze}
-                for future in as_completed(futures):
+                # as_completed 的协程等价
+                for future in asyncio.as_completed(tasks):
                     if cancel_event and cancel_event.is_set():
-                        for f in futures:
-                            f.cancel()
+                        for t in tasks:
+                            t.cancel()
                         logger.warning("扫描已被用户中止，已分析的数据已保存。")
                         break
                     try:
-                        img_path, result = future.result()
-                    except CancelledError:
+                        img_path, result = await future
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"意外错误 {e}")
                         continue
                     if isinstance(result, list):
                         for r in result:
@@ -645,8 +685,8 @@ def scan(
                                 logger.error("检测到 API 熔断，已提前终止后续扫描。")
                                 if cancel_event:
                                     cancel_event.set()
-                                for f in futures:
-                                    f.cancel()
+                                for t in tasks:
+                                    t.cancel()
                                 break
                                 
                             stats.current += 1
@@ -666,8 +706,8 @@ def scan(
                             logger.error("检测到 API 熔断，已提前终止后续扫描。")
                             if cancel_event:
                                 cancel_event.set()
-                            for f in futures:
-                                f.cancel()
+                            for t in tasks:
+                                t.cancel()
                             break
                             
                         stats.current += 1
@@ -690,6 +730,10 @@ def scan(
                             stats.processed += 1
                             if needs_face and enable_face_scan:
                                 _face_queue.put((img_path, result.get("md5")))
+
+        # 启动异步协程执行并阻塞等待结束
+        try:
+            asyncio.run(_run_async_scan())
         except KeyboardInterrupt:
             logger.warning("用户中断 (Ctrl+C)，已分析的数据已保存。")
 
