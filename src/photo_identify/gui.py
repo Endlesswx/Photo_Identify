@@ -21,7 +21,7 @@ from photo_identify.config import (
     DEFAULT_TPM_LIMIT,
     DEFAULT_WORKERS,
 )
-from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_TYPES
+from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_CAPABILITIES
 from photo_identify.search import search
 from photo_identify.scanner import scan
 
@@ -139,7 +139,16 @@ class ModelDialog(tk.Toplevel):
         self.result = None  # 用户点保存后存变量值
 
         # ── 变量 ──
-        self._type_var = tk.StringVar(value=model_data["type"] if model_data else MODEL_TYPES[0])
+        # 将 type 拆分为多个 boolean 变量
+        self._capabilities = {"text": tk.BooleanVar(), "image": tk.BooleanVar(), "video": tk.BooleanVar(), "audio": tk.BooleanVar()}
+        if model_data and "type" in model_data:
+            caps = [c.strip() for c in model_data["type"].split(",")]
+            for k in self._capabilities:
+                if k in caps:
+                    self._capabilities[k].set(True)
+        else:
+            self._capabilities["text"].set(True) # 默认给个文本
+            
         self._name_var = tk.StringVar(value=model_data.get("name", "") if model_data else "")
         self._model_id_var = tk.StringVar(value=model_data.get("model_id", "") if model_data else "")
         self._base_url_var = tk.StringVar(value=model_data.get("base_url", "") if model_data else "")
@@ -156,11 +165,13 @@ class ModelDialog(tk.Toplevel):
             ttk.Label(frame, text=lbl).grid(row=row, column=0, sticky=tk.W, pady=6, padx=(0, 10))
             row += 1
 
-        # 类型下拉
-        ttk.Combobox(
-            frame, textvariable=self._type_var,
-            values=MODEL_TYPES, state="readonly", width=30
-        ).grid(row=0, column=1, sticky=tk.W, pady=6)
+        # 类型复选框
+        type_frame = ttk.Frame(frame)
+        type_frame.grid(row=0, column=1, sticky=tk.W, pady=6)
+        ttk.Checkbutton(type_frame, text="文本", variable=self._capabilities["text"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(type_frame, text="图片", variable=self._capabilities["image"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(type_frame, text="视频", variable=self._capabilities["video"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(type_frame, text="音频", variable=self._capabilities["audio"]).pack(side=tk.LEFT, padx=(0, 10))
 
         # 文本字段
         for i, var in enumerate([self._name_var, self._model_id_var, self._base_url_var, self._api_key_var_var], 1):
@@ -200,7 +211,10 @@ class ModelDialog(tk.Toplevel):
 
     def _fill_ollama_preset(self):
         """一键填充 Ollama 本地模型预设值。"""
-        self._type_var.set("多模态模型")
+        self._capabilities["text"].set(True)
+        self._capabilities["image"].set(True)
+        self._capabilities["video"].set(False)
+        self._capabilities["audio"].set(False)
         self._base_url_var.set("http://localhost:11434/v1")
         self._api_key_var_var.set("")
 
@@ -217,13 +231,20 @@ class ModelDialog(tk.Toplevel):
             messagebox.showwarning("警告", "模型名称、模型ID、接口地址不能为空！", parent=self)
             return
             
+        selected_caps = [k for k, v in self._capabilities.items() if v.get()]
+        if not selected_caps:
+            messagebox.showwarning("警告", "至少需要选择一项模型能力！", parent=self)
+            return
+            
+        combined_type = ",".join(selected_caps)
+            
         try:
             workers_int = int(workers)
         except ValueError:
             workers_int = 4
 
         self.result = {
-            "type": self._type_var.get(),
+            "type": combined_type,
             "name": name,
             "model_id": model_id,
             "base_url": base_url,
@@ -423,7 +444,7 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _get_vision_models(self) -> list[dict]:
         """获取可用于视觉扫描的模型列表（视觉模型 + 多模态模型）。"""
-        return self._model_mgr.get_models_for_usage("vision")
+        return self._model_mgr.get_models_for_usage("image")
 
     def _refresh_search_model_combo(self):
         """刷新检索页模型下拉列表。"""
@@ -536,11 +557,11 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _get_search_api_params(self) -> tuple[str, str, str, int] | None:
         """获取检索页当前选中模型的 (model_id, base_url, api_key, workers)。"""
-        return self._get_model_api_params(self.search_model_id_var, "文本/多模态模型")
+        return self._get_model_api_params(self.search_model_id_var, "包含文本能力的模型")
 
     def _get_scan_api_params(self) -> tuple[str, str, str, int] | None:
         """获取扫描页当前选中模型的 (model_id, base_url, api_key, workers)。"""
-        return self._get_model_api_params(self.scan_model_id_var, "视觉/多模态模型")
+        return self._get_model_api_params(self.scan_model_id_var, "包含图片处理能力的模型")
 
     # ── Tab 1: 图片检索 ──────────────────────────────────────────
 
@@ -701,7 +722,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self._refresh_scan_model_combo()
         
         ttk.Label(form_frame, text="数据库路径:").grid(row=1, column=0, sticky=tk.W, pady=10)
-        ttk.Entry(form_frame, textvariable=self.scan_db_var, width=40).grid(row=1, column=1, sticky=tk.W, pady=10)
+        ttk.Entry(form_frame, textvariable=self.scan_db_var, width=50).grid(row=1, column=1, sticky=tk.W, pady=10)
         ttk.Button(form_frame, text="📂 浏览", command=self._browse_scan_db).grid(row=1, column=2, padx=10, sticky=tk.W, pady=10)
         
         ttk.Label(form_frame, text="扫描目录:").grid(row=2, column=0, sticky=tk.NW, pady=10)
@@ -1797,9 +1818,18 @@ class PhotoIdentifyGUI(tk.Tk):
             else:
                 status_text = "❌"
                 tag = "fail"
+                
+            # 将 text,image 等缩写为中文单字并拼接
+            caps = [c.strip() for c in m["type"].split(",") if c.strip()]
+            short_names = []
+            for c in caps:
+                full_name = MODEL_CAPABILITIES.get(c, c)
+                short_names.append(full_name[0] if full_name else c)
+            type_display = "+".join(short_names) if short_names else "未知"
+            
             iid = self._model_tree.insert(
                 "", tk.END,
-                values=(m["type"], m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", m.get("workers", 4), status_text),
+                values=(type_display, m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", m.get("workers", 4), status_text),
                 tags=(tag,)
             )
             self._tree_item_to_db_id[iid] = m["id"]
@@ -1910,8 +1940,10 @@ class PhotoIdentifyGUI(tk.Tk):
                 writer = csv.writer(f)
                 writer.writerow(["模型类型", "模型名称", "模型ID", "接口地址", "API变量名", "并发数", "是否本地"])
                 for m in models:
+                    caps = [c.strip() for c in m.get("type", "").split(",") if c.strip()]
+                    type_display = "+".join(MODEL_CAPABILITIES.get(c, c) for c in caps)
                     writer.writerow([
-                        m.get("type", ""),
+                        type_display,
                         m.get("name", ""),
                         m.get("model_id", ""),
                         m.get("base_url", ""),

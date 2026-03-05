@@ -10,34 +10,39 @@ from pathlib import Path
 from typing import Optional
 
 
-# 模型类型常量
-MODEL_TYPES = ["视觉模型", "文本模型", "多模态模型"]
+# 模型能力常量
+MODEL_CAPABILITIES = {
+    "text": "文本",
+    "image": "图片",
+    "video": "视频",
+    "audio": "音频",
+}
 
 # 默认预设模型数据
 _DEFAULT_MODELS = [
     {
-        "type": "视觉模型",
+        "type": "image",
         "name": "THUDM/GLM-4.1V-9B-Thinking",
         "model_id": "THUDM/GLM-4.1V-9B-Thinking",
         "base_url": "https://api.siliconflow.cn/v1",
         "api_key_var": "SILICONFLOW_API_KEY",
     },
     {
-        "type": "文本模型",
+        "type": "text",
         "name": "Qwen/Qwen2.5-7B-Instruct",
         "model_id": "Qwen/Qwen2.5-7B-Instruct",
         "base_url": "https://api.siliconflow.cn/v1",
         "api_key_var": "SILICONFLOW_API_KEY",
     },
     {
-        "type": "文本模型",
+        "type": "text",
         "name": "讯飞云Kimi-K2.5",
         "model_id": "xopkimik25",
         "base_url": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
         "api_key_var": "XFYUN_API_KEY",
     },
     {
-        "type": "多模态模型",
+        "type": "text,image",
         "name": "vLLM (本地多模态)",
         "model_id": "qwen3.5-9b-awq",
         "base_url": "http://127.0.0.1:8000/v1",
@@ -76,6 +81,15 @@ class ModelManager:
         """)
         self._conn.commit()
         
+        # 兼容旧版本：更新旧的中文枚举为新的能力标识组合
+        try:
+            self._conn.execute("UPDATE models SET type = 'text' WHERE type = '文本模型'")
+            self._conn.execute("UPDATE models SET type = 'image' WHERE type = '视觉模型'")
+            self._conn.execute("UPDATE models SET type = 'text,image' WHERE type = '多模态模型'")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
         # 兼容旧版本：尝试添加 workers 字段（默认为4）
         try:
             self._conn.execute("ALTER TABLE models ADD COLUMN workers INTEGER DEFAULT 4")
@@ -116,39 +130,28 @@ class ModelManager:
         return [self._row_to_dict(r) for r in rows]
 
     def get_models_by_type(self, model_type: str) -> list[dict]:
-        """获取指定类型的模型列表。
+        """获取指定类型（包含该能力）的模型列表。
 
         Args:
-            model_type: "视觉模型"、"文本模型" 或 "多模态模型"
+            model_type: 如 "text" 或 "image" 等单一能力。
 
         Returns:
             模型字典列表。
         """
-        rows = self._conn.execute(
-            "SELECT * FROM models WHERE type=? ORDER BY id", (model_type,)
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        rows = self._conn.execute("SELECT * FROM models ORDER BY id").fetchall()
+        models = [self._row_to_dict(r) for r in rows]
+        return [m for m in models if model_type in [t.strip() for t in m["type"].split(",")]]
 
     def get_models_for_usage(self, usage: str) -> list[dict]:
-        """根据用途获取可用模型列表（多模态模型同时适用于文本和视觉）。
+        """根据用途获取可用模型列表。由于现在变成了能力标志，usage 即为能力标志。
 
         Args:
-            usage: "text" 返回文本模型+多模态模型；"vision" 返回视觉模型+多模态模型。
+            usage: 如 "text" 或 "image"
 
         Returns:
             模型字典列表。
         """
-        if usage == "text":
-            types = ("文本模型", "多模态模型")
-        elif usage == "vision":
-            types = ("视觉模型", "多模态模型")
-        else:
-            types = (usage,)
-        placeholders = ",".join("?" for _ in types)
-        rows = self._conn.execute(
-            f"SELECT * FROM models WHERE type IN ({placeholders}) ORDER BY id", types
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        return self.get_models_by_type(usage)
 
     def get_model_by_id(self, model_db_id: int) -> Optional[dict]:
         """根据数据库 id 获取单条模型配置。"""
