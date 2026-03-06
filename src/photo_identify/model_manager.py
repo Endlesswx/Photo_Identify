@@ -97,6 +97,13 @@ class ModelManager:
         except sqlite3.OperationalError:
             pass # 字段已存在
 
+        # 兼容旧版本：尝试添加 video_workers 字段（默认为3）
+        try:
+            self._conn.execute("ALTER TABLE models ADD COLUMN video_workers INTEGER DEFAULT 3")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass # 字段已存在
+
         # 若表为空，插入预设数据
         count = self._conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
         if count == 0:
@@ -120,6 +127,8 @@ class ModelManager:
         # 如果是后来加的列为None或不存在，给默认值
         if d.get("workers") is None:
             d["workers"] = 1 if d["is_local"] else 4
+        if d.get("video_workers") is None:
+            d["video_workers"] = 3
         return d
 
     # ── 公共接口 ──────────────────────────────────────────────
@@ -175,6 +184,7 @@ class ModelManager:
         base_url: str,
         api_key_var: str,
         workers: int = 4,
+        video_workers: int = 3,
     ) -> int:
         """添加新模型配置。
 
@@ -183,8 +193,8 @@ class ModelManager:
         """
             
         cursor = self._conn.execute(
-            "INSERT INTO models (type, name, model_id, base_url, api_key_var, workers) VALUES (?,?,?,?,?,?)",
-            (model_type, name, model_id, base_url, api_key_var, workers),
+            "INSERT INTO models (type, name, model_id, base_url, api_key_var, workers, video_workers) VALUES (?,?,?,?,?,?,?)",
+            (model_type, name, model_id, base_url, api_key_var, workers, video_workers),
         )
         self._conn.commit()
         return cursor.lastrowid or 0
@@ -198,12 +208,13 @@ class ModelManager:
         base_url: str,
         api_key_var: str,
         workers: int = 4,
+        video_workers: int = 3,
     ) -> None:
         """更新模型配置。"""
             
         self._conn.execute(
-            "UPDATE models SET type=?, name=?, model_id=?, base_url=?, api_key_var=?, workers=? WHERE id=?",
-            (model_type, name, model_id, base_url, api_key_var, workers, model_db_id),
+            "UPDATE models SET type=?, name=?, model_id=?, base_url=?, api_key_var=?, workers=?, video_workers=? WHERE id=?",
+            (model_type, name, model_id, base_url, api_key_var, workers, video_workers, model_db_id),
         )
         self._conn.commit()
 

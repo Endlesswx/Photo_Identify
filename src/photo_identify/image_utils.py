@@ -96,6 +96,7 @@ def get_image_frame_bytes(path: str | Path) -> bytes:
     
     如果是普通图片，直接返回字节。
     如果是视频或包含视频的 .livp ，提取其中一帧并返回 JPEG 字节，避免大文件内存溢出。
+    支持带有 #t=x.xs 的视频路径，直接抽取指定时间戳的帧。
     
     Args:
         path: 文件路径。
@@ -103,39 +104,61 @@ def get_image_frame_bytes(path: str | Path) -> bytes:
     Returns:
         代表文件画面的字节流。
     """
-    path_obj = Path(path)
+    path_str = str(path)
+    timestamp_sec = None
+    if "#t=" in path_str:
+        actual_path_str, ts_str = path_str.split("#t=", 1)
+        if ts_str.endswith("s"):
+            ts_str = ts_str[:-1]
+        try:
+            timestamp_sec = float(ts_str)
+        except ValueError:
+            pass
+    else:
+        actual_path_str = path_str
+
+    path_obj = Path(actual_path_str)
     ext = path_obj.suffix.lower()
     
     # 视频格式：用 opencv 抽帧
     if ext in {".mp4", ".mov", ".avi", ".mkv"}:
-        return _extract_frame_from_video(str(path_obj))
+        return _extract_frame_from_video(actual_path_str, timestamp_sec)
         
     # .livp 格式: 寻找 zip 中的 heic 或 mp4
     if ext == ".livp":
-        return _extract_from_livp(str(path_obj))
+        return _extract_from_livp(actual_path_str)
         
     # 默认回退：直接读取
     return path_obj.read_bytes()
 
-def _extract_frame_from_video(video_path: str) -> bytes:
+def _extract_frame_from_video(video_path: str, timestamp_sec: float | None = None) -> bytes:
     """使用 OpenCV 从视频中提取一帧转为 JPEG 字节。"""
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"无法打开视频文件: {video_path}")
             
-        # 尝试跳过开头的纯黑帧，取第10帧或者中间帧，这里简单取第 10 帧或者读到的第一帧
-        for _ in range(10):
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-        # 兜底：如果前10帧都没读到或者视频太短，重置重新读第一帧
-        if 'frame' not in locals() or frame is None:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if timestamp_sec is not None and timestamp_sec >= 0:
+            cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_sec * 1000)
             ret, frame = cap.read()
             if not ret or frame is None:
-                raise ValueError("无法从视频中提取视频帧")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    raise ValueError("无法从视频中提取视频帧")
+        else:
+            # 尝试跳过开头的纯黑帧，取第10帧或者中间帧，这里简单取第 10 帧或者读到的第一帧
+            for _ in range(10):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+            # 兜底：如果前10帧都没读到或者视频太短，重置重新读第一帧
+            if 'frame' not in locals() or frame is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    raise ValueError("无法从视频中提取视频帧")
                 
         cap.release()
         
@@ -150,12 +173,48 @@ def _extract_frame_from_video(video_path: str) -> bytes:
         raise RuntimeError(f"提取视频帧失败 {video_path}: {e}")
 
 
-def extract_video_frames(video_path: str, interval: float = 5.0) -> list[tuple[float, bytes]]:
-    """从视频中按固定间隔抽取多帧，至少抽取 1 帧。
+def calc_dynamic_frame_count(duration: float) -> int:
+    """根据视频时长动态计算最优抽帧数量。
+
+    策略依据：短视频（≤30s）占绝大多数，少量帧即可覆盖内容；
+    长视频使用对数增长，上限 10 帧避免过度消耗。
+
+    Args:
+        duration: 视频时长（秒）。
+
+    Returns:
+        建议的抽帧数量（1-10）。
+    """
+    if duration <= 3:
+        return 1
+    if duration <= 10:
+        return 2
+    if duration <= 30:
+        return 3
+    if duration <= 60:
+        return 4
+    if duration <= 120:
+        return 5
+    if duration <= 180:
+        return 6
+    if duration <= 300:
+        return 7
+    if duration <= 600:
+        return 8
+    # >10min：对数增长，上限 10 帧
+    import math
+    return min(10, 8 + int(math.log2(max(1, duration / 300))))
+
+
+def extract_video_frames(video_path: str, frame_count: int | None = None) -> list[tuple[float, bytes]]:
+    """从视频中动态抽取多帧，至少抽取 1 帧。
+
+    使用均匀分布策略选取时间点，自动避开首尾纯黑帧。
+    当 frame_count 为 None 时，根据视频时长自动计算最优抽帧数。
 
     Args:
         video_path: 视频文件路径。
-        interval: 抽帧间隔秒数。
+        frame_count: 指定抽帧数量；None 表示自动计算。
 
     Returns:
         [(timestamp_seconds, jpeg_bytes), ...] 列表。
@@ -168,15 +227,19 @@ def extract_video_frames(video_path: str, interval: float = 5.0) -> list[tuple[f
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
 
-    # 计算需要抽帧的时间点（至少 1 帧）
+    # 动态计算抽帧数
+    if frame_count is None:
+        frame_count = calc_dynamic_frame_count(duration)
+
+    # 计算均匀分布的时间点：ts[i] = duration * (i+1) / (count+1)
+    # 自动避开 0s（可能是黑帧）和末尾
     timestamps: list[float] = []
-    if duration <= 0 or duration <= interval:
+    if duration <= 0:
         timestamps = [0.0]
     else:
-        t = 0.0
-        while t < duration:
-            timestamps.append(t)
-            t += interval
+        for i in range(frame_count):
+            ts = duration * (i + 1) / (frame_count + 1)
+            timestamps.append(ts)
 
     frames: list[tuple[float, bytes]] = []
     for ts in timestamps:
@@ -209,7 +272,8 @@ def _extract_from_livp(livp_path: str) -> bytes:
     """从 .livp (本质是 zip) 提取代表图像。优先找 heic/jpg，其次 mp4。"""
     try:
         if not zipfile.is_zipfile(livp_path):
-            raise ValueError(f"无效的 .livp 文件（不是 zip）: {livp_path}")
+            # 兼容：有些 LIVP 实际上不是 ZIP，而是已经重命名的普通 HEIC 或图片，尝试直接读取内容
+            return Path(livp_path).read_bytes()
             
         with zipfile.ZipFile(livp_path, 'r') as zf:
             namelist = zf.namelist()

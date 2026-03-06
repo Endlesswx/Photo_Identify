@@ -1,5 +1,3 @@
-# 压缩视频分辨率及码率，供大模型分析
-
 import os
 import subprocess
 import concurrent.futures
@@ -8,149 +6,127 @@ import time
 from tqdm import tqdm
 import threading
 
-# ================= 配置区域 =================
-# 源目录 (机械硬盘)
+# ================= 最终极速配置 =================
 SOURCE_DIR = Path(r"F:\图片\iPhone相册") 
-# 输出目录 (SSD)
 OUTPUT_DIR = Path(r"E:\Caches\相册视频-压缩后")
 
-# 并行计算线程数 (Ultra 5 245KF 建议 12-14)
+# 【火力全开】
+# 既然之前 CPU 能跑 99%，我们直接给到 14 线程
+# 配合 ultrafast 模式，彻底吃满每一个 CPU 周期
 MAX_COMPUTE_WORKERS = 12
-
-# 【关键优化】硬盘读取并发锁
-# 机械硬盘最忌讳多线程随机读。限制为 2，强制让磁头尽量顺序读取。
-# 48G 内存足够我们把视频读到内存里再处理。
-DISK_READ_SEMAPHORE = threading.BoundedSemaphore(2) 
-# ===========================================
-
-def get_duration(file_path):
-    """获取视频时长 (只读头部信息，速度快)"""
-    try:
-        # ffprobe 只读 header，对 IO 压力较小，但仍需加锁防止争抢
-        with DISK_READ_SEMAPHORE:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
-            res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
-        return float(res.stdout.strip())
-    except:
-        return 0
+# ===============================================
 
 def process_video(task_args):
     input_file, output_file = task_args
     
-    # 1. 检查跳过逻辑 (同上)
-    jpg_check = input_file.with_suffix(".jpg")
-    if jpg_check.exists():
-        return (0, f"⏭️  跳过 (JPG存在): {input_file.name}")
+    # --- 1. 过滤逻辑 ---
+    # 过滤同名 JPG (Live Photo)
+    try:
+        if input_file.with_suffix(".jpg").exists():
+            return (0, None)
+    except: pass
+
+    # 过滤已完成文件 (大于10KB才算真正完成，防止之前的1KB尸体干扰)
     if output_file.exists():
-        return (0, f"⏭️  跳过 (已完成): {input_file.name}")
-
-    # 2. 获取时长
-    duration = get_duration(input_file)
-    if duration == 0:
-        return (2, f"⚠️  错误: 无法读取 {input_file.name}")
-
-    # 3. 动态 FPS 策略
-    if duration <= 30:
-        fps = "2"
-    elif duration <= 120:
-        fps = "1"
-    elif duration <= 300:
-        fps = "0.2"
-    else:
-        fps = "0.1"
-
-    # 4. 【核心优化】读取文件到内存
-    # 如果文件小于 2GB，直接读入内存；否则走普通流式（防止爆内存，虽然你有48G）
-    file_size_mb = input_file.stat().st_size / (1024 * 1024)
-    video_data = None
-    use_pipe = False
+        if output_file.stat().st_size > 10 * 1024: 
+            return (0, None)
+        else:
+            try: output_file.unlink() # 删除之前的 1KB 坏文件
+            except: pass
 
     try:
-        if file_size_mb < 2048: # 2GB以下的文件全部进内存
-            with DISK_READ_SEMAPHORE: # 加锁读取，保护 HDD
-                with open(input_file, 'rb') as f:
-                    video_data = f.read()
-            use_pipe = True
-        
-        # 5. FFmpeg 命令构建
-        # -i pipe:0  从标准输入读取数据
-        # -preset ultrafast  极速模式 (比 veryfast 快 30-50%)
-        # -threads 1  限制单进程线程数，减少上下文切换，依靠多进程并发
-        
+        # --- 2. 获取时长 ---
+        cmd_probe = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_file)]
+        res = subprocess.run(cmd_probe, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+        duration = float(res.stdout.strip()) if res.stdout.strip() else 0
+        if duration == 0: return (2, f"⚠️ 元数据读失败: {input_file.name}")
+
+        # --- 3. 动态帧率策略 (修正版) ---
+        if duration < 1.0:
+            # 【修复】对于小于1秒的极短视频 (如Live Photo瞬间)，强制保留原始帧率或至少 5fps
+            # 防止 fps=2 导致 0.1秒的视频采不到帧
+            fps = "5" 
+        elif duration <= 30: fps = "2"
+        elif duration <= 120: fps = "1"
+        elif duration <= 300: fps = "0.2"
+        else: fps = "0.1"
+
+        # --- 4. FFmpeg 命令构建 (修复核心) ---
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
-        input_args = ["-i", "pipe:0"] if use_pipe else ["-i", str(input_file)]
+        # 【关键修复1】scale过滤器：trunc(oh*a/2)*2 
+        # 这个公式的意思是：先算出宽度，除以2取整再乘以2，强行变成偶数，防止 "270" 这种奇数导致崩溃
+        scale_filter = f"scale=trunc(oh*a/2)*2:480,fps={fps}"
         
         cmd = [
-            "ffmpeg", "-y"] + input_args + [
-            "-vf", f"scale=-2:480,fps={fps}", 
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
-            "-threads", "1", # 让 CPU 核心专注于多任务并行
+            "ffmpeg", "-y", "-i", str(input_file), 
+            "-vf", scale_filter, 
+            "-c:v", "libx264", 
+            "-preset", "ultrafast", 
+            "-crf", "32",
+            "-pix_fmt", "yuv420p", # 【关键修复2】强制 8bit 兼容模式，解决 HDR P010 问题
+            "-threads", "1", 
             "-an", "-loglevel", "error",
             str(output_file)
         ]
 
-        # 执行命令
-        # 如果使用 pipe，将 video_data 传入 input
-        subprocess.run(
-            cmd, 
-            input=video_data if use_pipe else None,
-            check=True, 
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
+        subprocess.run(cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
         
-        # 释放内存
-        del video_data 
-        return (1, f"✅ [{fps}fps] {input_file.name}")
+        # --- 5. 产物校验 (防止 1KB 尸体) ---
+        if not output_file.exists() or output_file.stat().st_size < 5 * 1024:
+            # 如果生成的文件小于 5KB，肯定也是坏的，删掉报错
+            if output_file.exists(): output_file.unlink()
+            return (2, f"❌ 转换失败(文件过小): {input_file.name}")
+
+        return (1, None)
 
     except Exception as e:
-        return (2, f"❌ 失败: {input_file.name} - {str(e)}")
+        if output_file.exists():
+            try: output_file.unlink()
+            except: pass
+        return (2, f"❌ {input_file.name}: {str(e)}")
 
 def main():
-    if not SOURCE_DIR.exists():
-        print(f"❌ 错误: 源目录不存在")
-        return
+    if not SOURCE_DIR.exists(): return
 
-    # 扫描文件
+    print("🔍 扫描文件...")
     all_files = list(SOURCE_DIR.rglob("*"))
     valid_files = [f for f in all_files if f.suffix.lower() in ('.mov', '.mp4')]
     
-    print(f"🚀 极速模式启动 | 视频数: {len(valid_files)}")
-    print(f"⚡ 优化策略: 内存缓冲(RAM Buffer) + 顺序读盘(Sequential Read) + UltraFast")
-    print(f"💾 内存: 48GB (小文件全量载入) | CPU: 12 并发")
+    print(f"🚀 最终极速版 (CPU 满载模式) | 视频数: {len(valid_files)}")
+    print(f"⚡ 线程数: {MAX_COMPUTE_WORKERS} | 策略: 直读 + 过滤同名JPG")
     print("-" * 50)
 
     tasks = []
     for f in valid_files:
         try:
-            rel_path = f.relative_to(SOURCE_DIR)
-            out_f = OUTPUT_DIR / rel_path.with_suffix(".mp4")
+            out_f = OUTPUT_DIR / f.relative_to(SOURCE_DIR).with_suffix(".mp4")
             tasks.append((f, out_f))
-        except ValueError: pass
+        except: pass
 
     start_time = time.time()
     stats = {"processed": 0, "skipped": 0, "error": 0}
 
-    # 使用 ThreadPoolExecutor
-    # 虽然 Python 有 GIL，但 subprocess 调用 FFmpeg 是独立的 OS 进程，不受 GIL 限制，且 I/O 也是释放 GIL 的
-    # 这里用线程池管理 FFmpeg 子进程是最轻量高效的
+    # 使用 ThreadPoolExecutor 管理 FFmpeg 子进程
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_COMPUTE_WORKERS) as executor:
+        # 提交所有任务
         future_to_file = {executor.submit(process_video, task): task for task in tasks}
+        
         pbar = tqdm(total=len(tasks), unit="vid", dynamic_ncols=True)
-
+        
         for future in concurrent.futures.as_completed(future_to_file):
             status, msg = future.result()
-            if status == 0: stats["skipped"] += 1
+            if status == 0: 
+                stats["skipped"] += 1
             elif status == 1: 
                 stats["processed"] += 1
-                # tqdm.write(msg) # 想看详细日志可以解开注释
             else: 
                 stats["error"] += 1
                 tqdm.write(msg)
             pbar.update(1)
         pbar.close()
 
-    print(f"\n🎉 耗时: {time.time() - start_time:.2f}s | 成功: {stats['processed']} | 跳过: {stats['skipped']}")
+    print(f"\n🎉 耗时: {time.time() - start_time:.2f}s | 成功: {stats['processed']} | 跳过: {stats['skipped']} | 错误: {stats['error']}")
 
 if __name__ == "__main__":
     main()

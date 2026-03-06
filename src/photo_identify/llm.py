@@ -29,47 +29,43 @@ logger = logging.getLogger(__name__)
 
 
 def _build_prompt() -> str:
-    """生成图片分析的中文提示词。
+    """生成图片/视频分析的中文提示词。
 
     Returns:
         用于多模态模型的中文提示词。
     """
     return (
-        "请用中文分析图片，直接输出纯 JSON（不要用 markdown 代码块包裹），包含字段："
+        "请用中文分析提供的媒体（图片或视频），直接输出纯 JSON（不要用 markdown 代码块包裹），包含字段："
         "scene（场景描述）、objects（主要物体列表，JSON 数组）、style（风格与色调）、"
         "location_time（可能的地点/时间）、wallpaper_hint（壁纸建议）。"
     )
 
 
 def _build_payload(model: str, temperature: float, max_tokens: int, prompt: str, image_b64: str, image_format: str) -> dict:
-    """构建 chat-completions 请求载荷。
+    """构建 chat-completions 请求载荷。"""
+    
+    if image_format == "mp4":
+        media_url = f"data:video/mp4;base64,{image_b64}"
+        media_item = {"type": "video_url", "video_url": {"url": media_url}}
+    else:
+        media_url = f"data:image/{image_format};base64,{image_b64}"
+        media_item = {"type": "image_url", "image_url": {"url": media_url}}
 
-    Args:
-        model: 模型名称。
-        temperature: 采样温度。
-        max_tokens: 最大输出 token 数。
-        prompt: 图片分析提示词。
-        image_b64: 图片 base64 编码字符串。
-        image_format: 图片格式（如 jpeg/png）。
+    messages = []
+    messages.append({"role": "system", "content": "你是媒体分析助手。"})
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            media_item,
+        ],
+    })
 
-    Returns:
-        API 请求载荷字典。
-    """
-    image_url = f"data:image/{image_format};base64,{image_b64}"
     return {
         "model": model,
-        "temperature": temperature,
+        "temperature": 0.0 if image_format == "mp4" else temperature,
         "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": "你是图片分析助手。"},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            },
-        ],
+        "messages": messages,
     }
 
 
@@ -263,8 +259,16 @@ async def async_call_image_model(
     for attempt in range(1, MAX_RETRIES + 1):
         if rate_limiter:
             await rate_limiter.wait(token_cost)
+            
+        # 第一次请求且是视频时，加入随机抖动错开大文件传输和解码峰值
+        if attempt == 1 and image_format == "mp4":
+            import random
+            await asyncio.sleep(random.uniform(1.0, 4.0))
+            
+        current_timeout = timeout if image_format != "mp4" else max(timeout, 300)
+            
         try:
-            status, data = await _request_json_async(f"{base_url}/chat/completions", payload, headers, timeout, session)
+            status, data = await _request_json_async(f"{base_url}/chat/completions", payload, headers, current_timeout, session)
             # 成功请求则重置断路器
             if status < 500:
                 global_circuit_breaker.record_success()
@@ -301,6 +305,19 @@ async def async_call_image_model(
             continue
 
         if status >= 400:
+            # 某些后端（如 vLLM）当视频并发解码时资源耗尽会返回 "Could not open video stream" 的 HTTP 400
+            # 这种情况视为服务端临时资源瓶颈，允许进行降级重试
+            err_msg = str(data).lower()
+            if "could not open video stream" in err_msg or "too many requests" in err_msg:
+                last_error = f"HTTP {status}: {data}"
+                logger.warning(">>>>>>>> [系统拦截] 服务端解码队列已满，触发降级重试 (第 %d 次): %s", attempt, last_error)
+                if attempt < MAX_RETRIES:
+                    import random
+                    backoff = min(RETRY_BASE_DELAY ** (attempt + 1), 15.0) + random.uniform(2.0, 5.0)
+                    logger.warning(">>>>>>>> 等待 %.1f 秒后重新投递...", backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+
             return {"error": f"HTTP {status}: {data}", "llm_raw": json.dumps(data, ensure_ascii=False)}
 
         choices = data.get("choices") or []
@@ -311,13 +328,19 @@ async def async_call_image_model(
         raw_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
 
         parsed = _extract_json_from_text(raw_text)
+
+        def _to_str(val):
+            if isinstance(val, list):
+                return ", ".join(map(str, val))
+            return str(val or "")
+
         if parsed and isinstance(parsed, dict):
             return {
-                "scene": parsed.get("scene", ""),
-                "objects": parsed.get("objects", []),
-                "style": parsed.get("style", ""),
-                "location_time": parsed.get("location_time", ""),
-                "wallpaper_hint": parsed.get("wallpaper_hint", ""),
+                "scene": _to_str(parsed.get("scene")),
+                "objects": parsed.get("objects") if isinstance(parsed.get("objects"), list) else [],
+                "style": _to_str(parsed.get("style")),
+                "location_time": _to_str(parsed.get("location_time")),
+                "wallpaper_hint": _to_str(parsed.get("wallpaper_hint")),
                 "llm_raw": raw_text,
             }
         # JSON 解析失败，存 raw

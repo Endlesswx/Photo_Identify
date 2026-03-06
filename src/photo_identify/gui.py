@@ -16,7 +16,6 @@ from PIL import Image, ImageTk, ImageOps
 from photo_identify.image_utils import get_image_frame_bytes
 from photo_identify.config import (
     DEFAULT_DB_PATH,
-    DEFAULT_VIDEO_FRAME_INTERVAL,
     DEFAULT_RPM_LIMIT,
     DEFAULT_TPM_LIMIT,
     DEFAULT_WORKERS,
@@ -154,12 +153,13 @@ class ModelDialog(tk.Toplevel):
         self._base_url_var = tk.StringVar(value=model_data.get("base_url", "") if model_data else "")
         self._api_key_var_var = tk.StringVar(value=model_data.get("api_key_var", "") if model_data else "")
         self._workers_var = tk.StringVar(value=str(model_data.get("workers", 4)) if model_data else "4")
+        self._video_workers_var = tk.StringVar(value=str(model_data.get("video_workers", 3)) if model_data else "3")
 
         # ── 布局 ──
         frame = ttk.Frame(self, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        labels = ["模型类型:", "模型名称:", "模型ID:", "接口地址:", "API变量名:", "并发线程数:"]
+        labels = ["模型类型:", "模型名称:", "模型ID:", "接口地址:", "API变量名:", "并发线程数:", "视频并发数:"]
         row = 0
         for lbl in labels:
             ttk.Label(frame, text=lbl).grid(row=row, column=0, sticky=tk.W, pady=6, padx=(0, 10))
@@ -181,9 +181,18 @@ class ModelDialog(tk.Toplevel):
         self._workers_entry = ttk.Spinbox(frame, from_=1, to=32, textvariable=self._workers_var, width=10)
         self._workers_entry.grid(row=5, column=1, sticky=tk.W, pady=6)
 
+        # 视频并发数
+        self._video_workers_label = ttk.Label(frame, text="视频并发数:")
+        self._video_workers_entry = ttk.Spinbox(frame, from_=1, to=32, textvariable=self._video_workers_var, width=10)
+        self._video_workers_hint = ttk.Label(frame, text="(视频抽帧同时处理数)", foreground="gray")
+
         # API变量名旁的提示
         ttk.Label(frame, text="(本地模型可留空)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
         ttk.Label(frame, text="(建议: Ollama为1，vLLM依据显存调整)", foreground="gray").grid(row=5, column=2, sticky=tk.W, padx=5)
+
+        # 绑定视频复选框变化以动态显示/隐藏视频并发数行
+        self._capabilities["video"].trace_add("write", self._on_video_cap_changed)
+        self._on_video_cap_changed()  # 初始化显示状态
 
         # 底部按钮
         btn_frame = ttk.Frame(self, padding=(20, 0, 20, 15))
@@ -196,6 +205,15 @@ class ModelDialog(tk.Toplevel):
         self._on_api_key_changed()
 
         self._center(parent)
+
+    def _on_video_cap_changed(self, *args):
+        """视频能力复选框变化时，动态显示/隐藏视频并发数行。"""
+        if self._capabilities["video"].get():
+            self._video_workers_entry.grid(row=6, column=1, sticky=tk.W, pady=6)
+            self._video_workers_hint.grid(row=6, column=2, sticky=tk.W, padx=5)
+        else:
+            self._video_workers_entry.grid_remove()
+            self._video_workers_hint.grid_remove()
 
     def _on_api_key_changed(self, *args):
         # 移除强制禁用 workers_entry 和重置为 1 的逻辑，因为用户需要自定义并发（如 vLLM 可多线程）
@@ -243,6 +261,12 @@ class ModelDialog(tk.Toplevel):
         except ValueError:
             workers_int = 4
 
+        video_workers = self._video_workers_var.get().strip()
+        try:
+            video_workers_int = int(video_workers)
+        except ValueError:
+            video_workers_int = 3
+
         self.result = {
             "type": combined_type,
             "name": name,
@@ -250,6 +274,7 @@ class ModelDialog(tk.Toplevel):
             "base_url": base_url,
             "api_key_var": api_key_var,
             "workers": workers_int,
+            "video_workers": video_workers_int,
         }
         self.destroy()
 
@@ -375,6 +400,8 @@ class PhotoIdentifyGUI(tk.Tk):
             self._set_scan_model_by_id(cfg.get("scan", "model_id"))
         if cfg.has_option("scan", "db_path"):
             self.scan_db_var.set(cfg.get("scan", "db_path"))
+        if cfg.has_option("scan", "transcoded_video_path") and hasattr(self, "transcoded_video_path_var"):
+            self.transcoded_video_path_var.set(cfg.get("scan", "transcoded_video_path"))
         if cfg.has_option("scan", "paths"):
             raw = cfg.get("scan", "paths").strip()
             if raw:
@@ -383,8 +410,6 @@ class PhotoIdentifyGUI(tk.Tk):
                 self.paths_listbox.delete(0, tk.END)
                 for p in paths:
                     self.paths_listbox.insert(tk.END, p)
-        if cfg.has_option("scan", "frame_interval"):
-            self.scan_frame_interval_var.set(cfg.get("scan", "frame_interval"))
         if cfg.has_option("scan", "enable_face_scan"):
             self.enable_face_scan_var.set(cfg.getboolean("scan", "enable_face_scan"))
 
@@ -402,8 +427,8 @@ class PhotoIdentifyGUI(tk.Tk):
         cfg["scan"] = {
             "model_id": self.scan_model_id_var.get(),
             "db_path": self.scan_db_var.get(),
+            "transcoded_video_path": self.transcoded_video_path_var.get() if hasattr(self, "transcoded_video_path_var") else "",
             "paths": "|".join(self.scan_paths),
-            "frame_interval": self.scan_frame_interval_var.get(),
             "enable_face_scan": str(self.enable_face_scan_var.get()),
         }
 
@@ -506,26 +531,43 @@ class PhotoIdentifyGUI(tk.Tk):
         model_id = self.scan_model_id_var.get()
         if not model_id:
             self.scan_workers_var.set("并发: -")
+            if hasattr(self, "transcoded_entry"):
+                self.transcoded_entry.config(state=tk.DISABLED)
+                self.transcoded_btn.config(state=tk.DISABLED)
             return
             
         model = self._model_mgr.get_model_by_model_id(model_id)
         if model:
             workers = model.get("workers", 4)
-            self.scan_workers_var.set(f"并发: {workers} 线程")
+            caps = [c.strip() for c in model.get("type", "").split(",")]
+            if "video" in caps:
+                video_workers = model.get("video_workers", 3)
+                self.scan_workers_var.set(f"并发: {workers} 线程 | 视频: {video_workers} 线程")
+                if hasattr(self, "transcoded_entry"):
+                    self.transcoded_entry.config(state=tk.NORMAL)
+                    self.transcoded_btn.config(state=tk.NORMAL)
+            else:
+                self.scan_workers_var.set(f"并发: {workers} 线程")
+                if hasattr(self, "transcoded_entry"):
+                    self.transcoded_entry.config(state=tk.DISABLED)
+                    self.transcoded_btn.config(state=tk.DISABLED)
         else:
             self.scan_workers_var.set("并发: -")
+            if hasattr(self, "transcoded_entry"):
+                self.transcoded_entry.config(state=tk.DISABLED)
+                self.transcoded_btn.config(state=tk.DISABLED)
 
     # ── 获取当前模型的 API 参数 ──────────────────────────────────
 
-    def _get_model_api_params(self, model_id_var: tk.StringVar, usage_label: str) -> tuple[str, str, str, int] | None:
-        """获取指定模型变量对应的 (model_id, base_url, api_key, workers)。
+    def _get_model_api_params(self, model_id_var: tk.StringVar, usage_label: str) -> tuple[str, str, str, int, int] | None:
+        """获取指定模型变量对应的 (model_id, base_url, api_key, workers, video_workers)。
 
         Args:
             model_id_var: 存储当前选中 model_id 的 StringVar。
             usage_label: 用于提示信息的描述，如 "文本模型" 或 "视觉模型"。
 
         Returns:
-            (model_id, base_url, api_key, workers) 四元组，或失败时返回 None。
+            (model_id, base_url, api_key, workers, video_workers) 五元组，或失败时返回 None。
         """
         model_id = model_id_var.get().strip()
         if not model_id:
@@ -538,10 +580,11 @@ class PhotoIdentifyGUI(tk.Tk):
             return None
 
         workers = model.get("workers", 4)
+        video_workers = model.get("video_workers", 3)
 
         # 本地模型（如 Ollama）无需 API Key
         if model.get("is_local"):
-            return model_id, model["base_url"], "", workers
+            return model_id, model["base_url"], "", workers, video_workers
 
         api_key = ModelManager.get_api_key_value(model["api_key_var"])
         if not api_key:
@@ -553,14 +596,14 @@ class PhotoIdentifyGUI(tk.Tk):
             )
             return None
 
-        return model_id, model["base_url"], api_key, workers
+        return model_id, model["base_url"], api_key, workers, video_workers
 
-    def _get_search_api_params(self) -> tuple[str, str, str, int] | None:
-        """获取检索页当前选中模型的 (model_id, base_url, api_key, workers)。"""
+    def _get_search_api_params(self) -> tuple[str, str, str, int, int] | None:
+        """获取检索页当前选中模型的 (model_id, base_url, api_key, workers, video_workers)。"""
         return self._get_model_api_params(self.search_model_id_var, "包含文本能力的模型")
 
-    def _get_scan_api_params(self) -> tuple[str, str, str, int] | None:
-        """获取扫描页当前选中模型的 (model_id, base_url, api_key, workers)。"""
+    def _get_scan_api_params(self) -> tuple[str, str, str, int, int] | None:
+        """获取扫描页当前选中模型的 (model_id, base_url, api_key, workers, video_workers)。"""
         return self._get_model_api_params(self.scan_model_id_var, "包含图片处理能力的模型")
 
     # ── Tab 1: 图片检索 ──────────────────────────────────────────
@@ -736,9 +779,16 @@ class PhotoIdentifyGUI(tk.Tk):
         ttk.Button(btn_frame, text="➖ 移除选中", command=self.remove_scan_path).pack(fill=tk.X, pady=2)
         ttk.Button(btn_frame, text="🗑 清空列表", command=self.clear_scan_paths).pack(fill=tk.X, pady=2)
 
-        self.scan_frame_interval_var = tk.StringVar(value=str(DEFAULT_VIDEO_FRAME_INTERVAL))
-        ttk.Label(form_frame, text="视频抽帧间隔(秒):").grid(row=3, column=0, sticky=tk.W, pady=10)
-        ttk.Entry(form_frame, textvariable=self.scan_frame_interval_var, width=10).grid(row=3, column=1, sticky=tk.W, pady=10)
+        # 转码后视频路径
+        self.transcoded_video_path_var = tk.StringVar()
+        ttk.Label(form_frame, text="转码后视频路径:").grid(row=3, column=0, sticky=tk.W, pady=10)
+        self.transcoded_entry = ttk.Entry(form_frame, textvariable=self.transcoded_video_path_var, width=50)
+        self.transcoded_entry.grid(row=3, column=1, sticky=tk.W, pady=10)
+        self.transcoded_btn = ttk.Button(form_frame, text="📂 浏览", command=self._browse_transcoded_path)
+        self.transcoded_btn.grid(row=3, column=2, padx=10, sticky=tk.W, pady=10)
+        
+        # 初始调用一次状态更新以设置转码路径输入框的 state
+        self._update_scan_workers_display()
 
         # 人脸扫描相关配置
         face_frame = ttk.Frame(form_frame)
@@ -923,7 +973,7 @@ class PhotoIdentifyGUI(tk.Tk):
                         file_path = p.get("path", "")
                         actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
                         if actual_path and os.path.isfile(actual_path):
-                            frame_bytes = get_image_frame_bytes(actual_path)
+                            frame_bytes = get_image_frame_bytes(file_path)
                             pil_img = Image.open(io.BytesIO(frame_bytes))
                             img = crop_and_circle_face(pil_img, p.get("bbox", "[]"), size=40)
                     except Exception as e:
@@ -1135,7 +1185,7 @@ class PhotoIdentifyGUI(tk.Tk):
                     file_path = p.get("path", "")
                     actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
                     if actual_path and os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(actual_path)
+                        frame_bytes = get_image_frame_bytes(file_path)
                         pil_img = Image.open(io.BytesIO(frame_bytes))
                         img = crop_and_circle_face(pil_img, p.get("bbox", "[]"), size=40)
                 except Exception:
@@ -1309,7 +1359,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 img = None
                 try:
                     if os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(actual_path)
+                        frame_bytes = get_image_frame_bytes(file_path)
                         pil_img = Image.open(io.BytesIO(frame_bytes))
                         pil_img = ImageOps.exif_transpose(pil_img)
                         if pil_img.mode != 'RGB':
@@ -1489,14 +1539,14 @@ class PhotoIdentifyGUI(tk.Tk):
                     try:
                         actual_path = new_path.split("#t=")[0] if "#t=" in new_path else new_path
                         if os.path.isfile(actual_path):
-                            frame_bytes = get_image_frame_bytes(actual_path)
+                            frame_bytes = get_image_frame_bytes(new_path)
                             pil_img = Image.open(io.BytesIO(frame_bytes))
                             img = crop_and_circle_face(pil_img, face_bbox, size=40)
                             photo = ImageTk.PhotoImage(img)
                             self.person_thumbnail_images.append(photo)
                             img_lbl = getattr(frame, "img_lbl", None)
                             if img_lbl:
-                                img_lbl.configure(image=photo, text="")
+                                img_lbl.configure(image=photo, text="", width=0, height=0)
                     except Exception as e:
                         pass
                         
@@ -1645,7 +1695,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 img = None
                 try:
                     if os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(actual_path)
+                        frame_bytes = get_image_frame_bytes(file_path)
                         pil_img = Image.open(io.BytesIO(frame_bytes))
                         pil_img = ImageOps.exif_transpose(pil_img)
                         if pil_img.mode != 'RGB':
@@ -1761,17 +1811,18 @@ class PhotoIdentifyGUI(tk.Tk):
         tree_frame = ttk.Frame(self.model_tab, padding=(10, 0, 10, 10))
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("type", "name", "model_id", "base_url", "api_key_var", "workers", "status")
+        columns = ("type", "name", "model_id", "base_url", "api_key_var", "workers", "video_workers", "status")
         self._model_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
 
         col_settings = [
-            ("type",        "模型类型",     80,  tk.CENTER),
-            ("name",        "模型名称",     160, tk.W),
-            ("model_id",    "模型ID",       160, tk.W),
-            ("base_url",    "接口地址",     200, tk.W),
-            ("api_key_var", "API变量名",    150, tk.W),
-            ("workers",     "并发数",       60,  tk.CENTER),
-            ("status",      "API状态",      70,  tk.CENTER),
+            ("type",           "模型类型",     80,  tk.CENTER),
+            ("name",           "模型名称",     160, tk.W),
+            ("model_id",       "模型ID",       160, tk.W),
+            ("base_url",       "接口地址",     200, tk.W),
+            ("api_key_var",    "API变量名",    150, tk.W),
+            ("workers",        "并发数",       60,  tk.CENTER),
+            ("video_workers",  "视频并发",     70,  tk.CENTER),
+            ("status",         "API状态",      70,  tk.CENTER),
         ]
         for col, heading, width, anchor in col_settings:
             self._model_tree.heading(col, text=heading)
@@ -1827,9 +1878,12 @@ class PhotoIdentifyGUI(tk.Tk):
                 short_names.append(full_name[0] if full_name else c)
             type_display = "+".join(short_names) if short_names else "未知"
             
+            # 视频并发数：仅支持视频的模型显示数值，否则显示 "-"
+            video_workers_display = str(m.get("video_workers", 3)) if "video" in caps else "-"
+
             iid = self._model_tree.insert(
                 "", tk.END,
-                values=(type_display, m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", m.get("workers", 4), status_text),
+                values=(type_display, m["name"], m["model_id"], m["base_url"], m["api_key_var"] or "(无需)", m.get("workers", 4), video_workers_display, status_text),
                 tags=(tag,)
             )
             self._tree_item_to_db_id[iid] = m["id"]
@@ -1856,7 +1910,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             r = dlg.result
-            self._model_mgr.add_model(r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"], r.get("workers", 4))
+            self._model_mgr.add_model(r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"], r.get("workers", 4), r.get("video_workers", 3))
             self._model_refresh()
 
     def _model_edit(self):
@@ -1871,7 +1925,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             r = dlg.result
-            self._model_mgr.update_model(db_id, r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"], r.get("workers", 4))
+            self._model_mgr.update_model(db_id, r["type"], r["name"], r["model_id"], r["base_url"], r["api_key_var"], r.get("workers", 4), r.get("video_workers", 3))
             self._model_refresh()
 
     def _model_delete(self):
@@ -1915,6 +1969,7 @@ class PhotoIdentifyGUI(tk.Tk):
             model["base_url"],
             model["api_key_var"],
             model.get("workers", 4),
+            model.get("video_workers", 3),
         )
         self._model_refresh()
 
@@ -1938,7 +1993,7 @@ class PhotoIdentifyGUI(tk.Tk):
         try:
             with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                writer.writerow(["模型类型", "模型名称", "模型ID", "接口地址", "API变量名", "并发数", "是否本地"])
+                writer.writerow(["模型类型", "模型名称", "模型ID", "接口地址", "API变量名", "并发数", "视频并发数", "是否本地"])
                 for m in models:
                     caps = [c.strip() for c in m.get("type", "").split(",") if c.strip()]
                     type_display = "+".join(MODEL_CAPABILITIES.get(c, c) for c in caps)
@@ -1949,6 +2004,7 @@ class PhotoIdentifyGUI(tk.Tk):
                         m.get("base_url", ""),
                         m.get("api_key_var", ""),
                         m.get("workers", 4),
+                        m.get("video_workers", 3) if "video" in caps else "-",
                         "是" if m.get("is_local") else "否"
                     ])
             messagebox.showinfo("成功", f"成功导出 {len(models)} 个模型配置")
@@ -1994,6 +2050,11 @@ class PhotoIdentifyGUI(tk.Tk):
         self.paths_listbox.delete(0, tk.END)
         self.scan_paths.clear()
 
+    def _browse_transcoded_path(self):
+        path = filedialog.askdirectory(title="选择转码后视频目录")
+        if path:
+            self.transcoded_video_path_var.set(path)
+
     def _browse_scan_db(self):
         """通过文件对话框选择数据库路径。"""
         path = filedialog.asksaveasfilename(
@@ -2016,7 +2077,7 @@ class PhotoIdentifyGUI(tk.Tk):
         api_params = self._get_scan_api_params()
         if api_params is None:
             return
-        model_id, base_url, api_key, current_workers = api_params
+        model_id, base_url, api_key, current_workers, current_video_workers = api_params
             
         self.scan_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.NORMAL)
@@ -2065,12 +2126,16 @@ class PhotoIdentifyGUI(tk.Tk):
             llm_writer = TkLineWriter(self.log_text, 1)
             face_writer = TkLineWriter(self.log_text, 2)
 
-            logging.info("扫描启动 — 模型: %s, 接口: %s, 并发: %d", model_id, base_url, current_workers)
+            logging.info("扫描启动 — 模型: %s, 接口: %s, 并发: %d, 视频并发: %d", model_id, base_url, current_workers, current_video_workers)
 
             try:
-                # 不再使用固定 DEFAULT_WORKERS，而是从模型配置传入
-                # if "127.0.0.1" in base_url or "localhost" in base_url: 这段不再需要，因为如果是本地模型则必定 workers=1 已经控制了
-                
+                # 判断当前模型是否支持视频
+                model_data = self._model_mgr.get_model_by_model_id(model_id)
+                supports_video = False
+                if model_data:
+                    caps = [c.strip() for c in model_data.get("type", "").split(",")]
+                    supports_video = "video" in caps
+
                 result_stats = scan(
                     paths=self.scan_paths,
                     db_path=self.scan_db_var.get(),
@@ -2081,9 +2146,11 @@ class PhotoIdentifyGUI(tk.Tk):
                     tpm_limit=DEFAULT_TPM_LIMIT,
                     workers=current_workers,
                     cancel_event=self._scan_cancel_event,
-                    video_frame_interval=float(self.scan_frame_interval_var.get() or DEFAULT_VIDEO_FRAME_INTERVAL),
                     enable_face_scan=self.enable_face_scan_var.get(),
                     progress_writers=(llm_writer, face_writer),
+                    video_workers=current_video_workers,
+                    model_supports_video=supports_video,
+                    transcoded_video_path=self.transcoded_video_path_var.get().strip() if hasattr(self, "transcoded_video_path_var") else "",
                 )
                 # 只有当前代际仍然有效时才更新状态
                 if current_gen == self._scan_generation:
@@ -2205,7 +2272,7 @@ class PhotoIdentifyGUI(tk.Tk):
             api_params = self._get_search_api_params()
             if api_params is None:
                 return
-            model_id, base_url, api_key, _ = api_params
+            model_id, base_url, api_key, _, _ = api_params
         else:
             model_id, base_url, api_key = "", "", ""
 
@@ -2312,7 +2379,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 img = None
                 try:
                     if os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(actual_path)
+                        frame_bytes = get_image_frame_bytes(file_path)
                         img = Image.open(io.BytesIO(frame_bytes))
                         if img.mode != 'RGB':
                             img = img.convert('RGB')
@@ -2526,7 +2593,7 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         try:
-            frame_bytes = get_image_frame_bytes(actual_path)
+            frame_bytes = get_image_frame_bytes(file_path)
             self.original_image = Image.open(io.BytesIO(frame_bytes))
             self.original_image = ImageOps.exif_transpose(self.original_image)
             self._resize_and_display()

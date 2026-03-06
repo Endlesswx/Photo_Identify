@@ -33,8 +33,6 @@ DEFAULT_IMAGE_EXTENSIONS = frozenset({
 MAX_UPLOAD_DIMENSION = 1280
 # 上传时转换为 JPEG 的质量
 UPLOAD_JPEG_QUALITY = 85
-# 视频抽帧间隔（秒），每隔此秒数提取一帧送 LLM 分析
-DEFAULT_VIDEO_FRAME_INTERVAL = 5
 
 # ── 并发 ──────────────────────────────────────────────────
 DEFAULT_WORKERS = 4

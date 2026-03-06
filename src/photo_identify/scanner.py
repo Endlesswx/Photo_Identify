@@ -25,7 +25,6 @@ from photo_identify.config import (
     DEFAULT_BASE_URL,
     DEFAULT_IMAGE_EXTENSIONS,
     DEFAULT_MAX_TOKENS,
-    DEFAULT_VIDEO_FRAME_INTERVAL,
     DEFAULT_VISION_MODEL,
     DEFAULT_RPM_LIMIT,
     DEFAULT_TEMPERATURE,
@@ -180,9 +179,11 @@ def scan(
     workers: int = DEFAULT_WORKERS,
     extensions: frozenset[str] = DEFAULT_IMAGE_EXTENSIONS,
     cancel_event: threading.Event | None = None,
-    video_frame_interval: float = DEFAULT_VIDEO_FRAME_INTERVAL,
     enable_face_scan: bool = False,
     progress_writers: tuple[IO, IO] | None = None,
+    video_workers: int = 3,
+    model_supports_video: bool = False,
+    transcoded_video_path: str = "",
 ):
     """执行图片扫描主流程。
 
@@ -293,8 +294,26 @@ def scan(
             break
         stats.current += 1
 
-        # 已处理过的视频直接跳过（视频帧不做人脸提取）
+        try:
+            st = Path(img_path).stat()
+            if st.st_size == 0:
+                stats.skipped += 1
+                logger.debug("跳过大小为 0 的文件: %s", img_path)
+                continue
+        except OSError:
+            stats.skipped += 1
+            continue
+
         ext = Path(img_path).suffix.lower()
+
+        # 1.如果视频文件同目录存在与视频文件名称一样的jpg文件，跳过该视频的扫描。
+        if ext in _VIDEO_EXTS:
+            img_p = Path(img_path)
+            if img_p.with_suffix(".jpg").exists() or img_p.with_suffix(".JPG").exists():
+                stats.skipped += 1
+                continue
+
+        # 已处理过的视频直接跳过（视频帧不做人脸提取）
         if ext in _VIDEO_EXTS and img_path in known_video_bases:
             stats.skipped += 1
             continue
@@ -306,18 +325,15 @@ def scan(
 
         cached = known_paths.get(img_path)
         if cached:
-            try:
-                st = Path(img_path).stat()
-                cached_size, cached_mtime, cached_md5 = cached
-                if cached_size == st.st_size and cached_mtime == datetime.fromtimestamp(st.st_mtime).isoformat():
-                    if enable_face_scan and cached_md5 not in face_scanned_md5s:
-                        # LLM 已完成，仅需人脸提取 → 直接进入 Phase 2
+            cached_size, cached_mtime, cached_md5 = cached
+            if cached_size == st.st_size and cached_mtime == datetime.fromtimestamp(st.st_mtime).isoformat():
+                if enable_face_scan and cached_md5 not in face_scanned_md5s:
+                    # LLM 已完成，仅需人脸提取 → 视频跳过，图片进入 Phase 2
+                    if ext not in _VIDEO_EXTS:
                         face_todo.append((img_path, cached_md5))
-                        face_scanned_md5s.add(cached_md5)
-                    stats.skipped += 1
-                    continue
-            except OSError:
-                pass
+                    face_scanned_md5s.add(cached_md5)
+                stats.skipped += 1
+                continue
         to_analyze.append(img_path)
 
     if cancel_event and cancel_event.is_set():
@@ -440,6 +456,10 @@ def scan(
                         
                     img_path, md5 = item
                     fname = Path(img_path).name
+                    logger.info("开始人物识别: %s", fname)
+                    if _face_bar:
+                        _face_bar.set_description_str(f"[人物识别] {fname}", refresh=True)
+                        
                     cached_faces = None
                     with _face_cache_lock:
                         cached_faces = _face_cache.pop(img_path, None)
@@ -496,24 +516,110 @@ def scan(
             bar_format=_bar_fmt, leave=True, mininterval=0.3, ascii=True,
         )
 
-        async def _llm_worker(img_path: str, session: aiohttp.ClientSession, sem: asyncio.Semaphore) -> tuple[str, dict | list[dict] | None]:
+        async def _llm_worker(img_path: str, session: aiohttp.ClientSession, sem: asyncio.Semaphore, video_sem: asyncio.Semaphore, io_sem: asyncio.Semaphore) -> tuple[str, dict | list[dict] | None]:
             async with sem:
                 if cancel_event and cancel_event.is_set():
                     return img_path, None
 
                 ext = Path(img_path).suffix.lower()
                 fname = Path(img_path).name
+                logger.info("开始扫描: %s", fname)
+                _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=True)
 
                 # ---- 视频多帧路径 ----
                 if ext in _VIDEO_EXTS:
-                    # 对于极端 CPU 耗时的抽帧操作，必须限制其瞬时并发，防止耗尽默认 ThreadPoolExecutor 导致死锁
-                    if getattr(_llm_worker, "cpu_sem", None) is None:
-                        # 全局限制最多 2 个视频同时解码抽帧，避免把 CPU 彻底卡死
-                        _llm_worker.cpu_sem = asyncio.Semaphore(2)
+                    if model_supports_video and transcoded_video_path:
+                        # 尝试通过基础扫描路径提取相对目录结构，以便精准匹配转码后的子目录文件
+                        rel_dir = ""
+                        for base_p in paths:
+                            try:
+                                # 找到当前文件属于哪个指定的扫描根目录
+                                if Path(img_path).is_relative_to(Path(base_p)):
+                                    rel_dir = Path(img_path).parent.relative_to(Path(base_p))
+                                    break
+                            except ValueError:
+                                pass
+                                
+                        original_name = Path(img_path).stem
+                        # 优先尝试带相对目录路径的文件 (兼容 video_compression.py 保持目录结构的逻辑)
+                        transcoded_file_with_dir = Path(transcoded_video_path) / rel_dir / f"{original_name}.mp4"
+                        transcoded_file_root = Path(transcoded_video_path) / f"{original_name}.mp4"
                         
+                        transcoded_file = transcoded_file_with_dir if transcoded_file_with_dir.exists() else transcoded_file_root
+
+                        if transcoded_file.exists():
+                            file_metadata = extract_metadata(img_path)
+                            # 因为是直接传整个视频给大模型，MD5 可以用原视频的 MD5 来作为记录标识
+                            try:
+                                async with io_sem:
+                                    file_md5 = await asyncio.to_thread(compute_file_md5_chunked, img_path)
+                                    file_sha256 = await asyncio.to_thread(compute_file_sha256_chunked, img_path)
+                            except OSError:
+                                return img_path, None
+
+                            with _md5_lock:
+                                if file_md5 in known_md5s:
+                                    _llm_bar.set_description_str(f"[信息扫描] ✓ {fname}", refresh=False)
+                                    _llm_bar.update(1)
+                                    if _face_bar:
+                                        _face_bar.update(1)
+                                    return img_path, [_SKIPPED_SENTINEL]
+                                known_md5s.add(file_md5)
+                                if enable_face_scan:
+                                    face_scanned_md5s.add(file_md5)
+                                    
+                            logger.info("分析转码后视频文件 %s", fname)
+                            try:
+                                def _read_video():
+                                    with open(transcoded_file, "rb") as f:
+                                        return f.read()
+                                video_bytes = await asyncio.to_thread(_read_video)
+                                
+                                file_size_mb = len(video_bytes) / 1024 / 1024
+                                if not video_bytes:
+                                    raise ValueError(f"转码后的视频文件为空(0 bytes): {transcoded_file}")
+                                if len(video_bytes) < 10240: # 小于 10KB
+                                    raise ValueError(f"转码后的视频文件极小({len(video_bytes)} bytes)，文件可能已损坏或转码失败: {transcoded_file}")
+                                    
+                                logger.info("推送视频给大模型: %s (原文件: %s, 转码文件: %s, 大小: %.2f MB)", 
+                                            fname, img_path, transcoded_file, file_size_mb)
+                                
+                                async with video_sem:
+                                    llm_result = await async_call_image_model(
+                                        image_bytes=video_bytes,
+                                        session=session,
+                                        image_format="mp4",
+                                        api_key=api_key,
+                                        base_url=base_url,
+                                        model=model,
+                                        temperature=temperature,
+                                        max_tokens=max_tokens,
+                                        timeout=timeout,
+                                        rate_limiter=rate_limiter,
+                                    )
+                                record = dict(file_metadata)
+                                record["md5"] = file_md5
+                                record["sha256"] = file_sha256
+                                record["path"] = img_path
+                                record["file_name"] = fname
+                                record.update(llm_result)
+                                record["analyzed_at"] = datetime.now().isoformat()
+                                
+                                _llm_bar.set_description_str(f"[信息扫描] {fname}", refresh=False)
+                                _llm_bar.update(1)
+                                return img_path, [record]
+                            except Exception as exc:
+                                logger.error("转码视频分析失败 %s: %s", img_path, exc)
+                                _llm_bar.set_description_str(f"[信息扫描] 失败 {fname}", refresh=False)
+                                _llm_bar.update(1)
+                                if _face_bar:
+                                    _face_bar.update(1)
+                                return img_path, {"__failed__": True, "reason": str(exc)}
+
+                    # 对于极端 CPU 耗时的抽帧操作，必须限制其瞬时并发，防止耗尽默认 ThreadPoolExecutor 导致死锁
                     try:
-                        async with _llm_worker.cpu_sem:
-                            frames = await asyncio.to_thread(extract_video_frames, img_path, video_frame_interval)
+                        async with video_sem:
+                            frames = await asyncio.to_thread(extract_video_frames, img_path)
                     except Exception as exc:
                         logger.error("视频抽帧失败 %s: %s", img_path, exc)
                         _llm_bar.set_description_str(f"[信息扫描] 失败 {fname}", refresh=False)
@@ -580,9 +686,7 @@ def scan(
                     # ---- 普通图片路径 ----
                 try:
                     # 限定 IO 型和 CPU 轻量 Hash 操作的最大并发以免占用太多句柄
-                    if getattr(_llm_worker, "io_sem", None) is None:
-                        _llm_worker.io_sem = asyncio.Semaphore(20)
-                    async with _llm_worker.io_sem:
+                    async with io_sem:
                         md5 = await asyncio.to_thread(compute_file_md5_chunked, img_path)
                 except (OSError, PermissionError) as exc:
                     logger.warning("无法读取文件 %s: %s", img_path, exc)
@@ -659,9 +763,13 @@ def scan(
             # 连接数池放大以支持大量并发
             import socket
             connector = aiohttp.TCPConnector(limit=100, family=socket.AF_INET)
+            
+            video_sem = asyncio.Semaphore(max(1, video_workers))
+            io_sem = asyncio.Semaphore(20)
+            
             async with aiohttp.ClientSession(connector=connector) as session:
                 sem = asyncio.Semaphore(workers) # 使用用户配置的并发数
-                tasks = [asyncio.create_task(_llm_worker(p, session, sem)) for p in to_analyze]
+                tasks = [asyncio.create_task(_llm_worker(p, session, sem, video_sem, io_sem)) for p in to_analyze]
                 
                 # as_completed 的协程等价
                 for future in asyncio.as_completed(tasks):
@@ -771,7 +879,7 @@ def scan(
         for _ in range(workers):
             _face_queue.put(None)
 
-    for t in getattr(locals(), '_phase2_threads', []):
+    for t in locals().get('_phase2_threads', []):
         try:
             t.join()
         except:

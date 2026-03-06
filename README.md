@@ -42,9 +42,18 @@ export SILICONFLOW_API_KEY="您的_API_KEY"
 uv run python -m photo_identify gui
 ```
 
-### 2. 使用命令行 (CLI) 扫描图片目录
+### 2. 使用命令行 (CLI) 扫描图片/视频目录
 
-将指定路径（支持多个目录）下的所有图片扫描入库：
+将指定路径（支持多个目录）下的所有图片和视频扫描入库：
+
+> **💡 提示：扫描视频前建议执行视频压缩**
+> 如果您的目录中包含大量原画质视频，建议在扫描前先使用压缩工具对视频进行压缩或转码。因为大模型对视频的理解分析存在大小限制，提前压缩不仅能大幅减少传输时间和 Token 消耗，还能避免扫描大视频时遇到 API 限制或由于读取过大文件导致的内存和性能瓶颈。
+> 
+> 您可以执行以下命令使用项目中附带的压缩工具（自动遍历处理您的视频目录）：
+> ```bash
+> uv run python src/video_edit/video_compression.py
+> ```
+
 
 ```bash
 uv run python -m photo_identify scan --path "D:\Pictures" "E:\Downloads\Images"
