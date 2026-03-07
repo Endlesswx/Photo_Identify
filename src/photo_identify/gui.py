@@ -13,9 +13,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter import scrolledtext
 
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
 
-from photo_identify.image_utils import get_image_frame_bytes
+from photo_identify.image_utils import get_image_frame_bytes, get_video_duration
 from photo_identify.config import (
     DEFAULT_DB_PATH,
     DEFAULT_RPM_LIMIT,
@@ -365,6 +365,7 @@ class PhotoIdentifyGUI(tk.Tk):
         
         # 初始化模型管理器
         self._model_mgr = ModelManager(get_model_db_path(db_path))
+        self._preloaded_models = set()
         
         # Initialize variables
         self.current_results = []
@@ -428,17 +429,36 @@ class PhotoIdentifyGUI(tk.Tk):
         self._load_settings()
         self._restore_saved_tab()
 
+        # 启动时，主动派发一次当前激活 Tab 的状态更新事件（实现精准的按需预加载）
+        self.after(500, lambda: self._on_tab_changed(None))
+
         # 关闭窗口时自动保存参数
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         
     def _on_tab_changed(self, event):
         selected_tab = self.notebook.select()
-        if selected_tab == str(self.person_tab):
-            if not getattr(self, "_person_tab_loaded", False):
-                self._person_tab_loaded = True
+        tab_name = self.notebook.tab(selected_tab, "text")
+        
+        # 激活该 Tab 下可用的预加载逻辑
+        if tab_name == "图片检索":
+            # 搜索模式配置在切换回来时也能联动保证状态同步激发一次
+            self._on_search_options_changed()
+        elif tab_name == "信息扫描":
+            self._on_scan_embedding_selected(None)
+            self._on_scan_model_selected(None)
+            
+        if tab_name == "人物管理":
+            if not self._person_tab_loaded:
+                # 只有从没加载过才在这时刷新，后面手动刷
                 self._refresh_persons()
-        elif selected_tab == str(self.favorite_tab):
-            self._refresh_favorites()
+                self._person_tab_loaded = True
+        elif tab_name == "照片收藏":
+            if getattr(self, "_favorite_tab_loaded", False) is False:
+                # 可以选择每次切过来都刷新，或者仅初次刷新
+                self._refresh_favorites()
+                self._favorite_tab_loaded = True
+            else:
+                self._refresh_favorites()
         try:
             self._saved_tab_index = self.notebook.index(selected_tab)
             self._save_settings()
@@ -509,6 +529,10 @@ class PhotoIdentifyGUI(tk.Tk):
                     self.db_listbox.insert(tk.END, db)
         if cfg.has_option("search", "last_query"):
             self.query_var.set(cfg.get("search", "last_query"))
+        if cfg.has_option("search", "expand"):
+            self.search_expand_var.set(cfg.getboolean("search", "expand"))
+        if cfg.has_option("search", "rerank"):
+            self.search_rerank_var.set(cfg.getboolean("search", "rerank"))
 
         # Scan tab
         scan_model_ref = ""
@@ -567,6 +591,8 @@ class PhotoIdentifyGUI(tk.Tk):
             "limit": self.search_limit_var.get(),
             "databases": "|".join(self.search_dbs),
             "last_query": self.query_var.get(),
+            "expand": str(self.search_expand_var.get()),
+            "rerank": str(self.search_rerank_var.get()),
         }
         cfg["scan"] = {
             "model_ref": self.scan_model_id_var.get(),
@@ -753,29 +779,94 @@ class PhotoIdentifyGUI(tk.Tk):
         self.scan_embedding_id_var.set(selection_value)
         self._refresh_scan_embedding_combo()
 
+    def _preload_model_async(self, model_id_str: str, is_text: bool):
+        if is_text or not model_id_str or model_id_str in self._preloaded_models:
+            # 文本大模型通常无需发送伪造的 HTTP 测试请求进行预加载，因为：
+            # 1. API 本身就绪。2. Ollama 等本地 OpenAI 兼容后端内部也有机制。
+            # 这里专门用于拦截非本地或者不需要加载的情况。
+            return
+            
+        model = self._resolve_model_from_selection(model_id_str)
+        if not model:
+            return
+            
+        caps = [c.strip() for c in model.get("type", "").split(",")]
+        is_local = "local" in caps or "127.0.0.1" in model.get("base_url", "") or "localhost" in model.get("base_url", "")
+        if not is_local:
+            return
+            
+        self._preloaded_models.add(model_id_str)
+        self.status_var.set(f"正在后台预加载本地向量模型 {model.get('name', '...')} 请稍候...")
+        
+        def _preload_thread():
+            try:
+                from photo_identify.embedding_runtime import get_local_embedding_model
+                get_local_embedding_model(model.get("model_id", ""), device="auto")
+                self.after(0, lambda: self.status_var.set(f"向量模型 {model.get('name', '')} 就绪。"))
+            except Exception as e:
+                self.after(0, lambda: self.status_var.set(f"预加载向量模型异常: {e}"))
+                self._preloaded_models.discard(model_id_str)
+
+        threading.Thread(target=_preload_thread, daemon=True).start()
+
     def _on_search_embedding_selected(self, event=None):
         name = self.search_embedding_combo.get()
         if name and hasattr(self, "_search_embedding_map"):
-            self.search_embedding_id_var.set(self._search_embedding_map.get(name, ""))
+            model_ref = self._search_embedding_map.get(name, "")
+            self.search_embedding_id_var.set(model_ref)
+            self._preload_model_async(model_ref, is_text=False)
 
     def _on_search_model_selected(self, event=None):
         """检索页下拉选择变化时，更新 model_id 变量。"""
         name = self.search_model_combo.get()
         if name and hasattr(self, "_search_model_map"):
-            self.search_model_id_var.set(self._search_model_map.get(name, ""))
+            model_ref = self._search_model_map.get(name, "")
+            self.search_model_id_var.set(model_ref)
+            self._preload_model_async(model_ref, is_text=True)
 
     def _on_scan_embedding_selected(self, event=None):
         name = self.scan_embedding_combo.get()
         if name and hasattr(self, "_scan_embedding_map"):
-            self.scan_embedding_id_var.set(self._scan_embedding_map.get(name, ""))
+            model_ref = self._scan_embedding_map.get(name, "")
+            self.scan_embedding_id_var.set(model_ref)
             self._update_scan_workers_display()
+            self._preload_model_async(model_ref, is_text=False)
+
+    def _on_search_options_changed(self):
+        """当检索页的查询模式或预处理复选框改变时，更新关联下拉框的可选状态。"""
+        is_llm_mode = False
+        if getattr(self, "search_mode_var", None):
+            is_llm_mode = (self.search_mode_var.get() == "llm")
+            if is_llm_mode:
+                self.search_embedding_combo.config(state="readonly")
+                # 切换为向量检索可能激活了下拉框内容，执行一次预加载判断
+                self._on_search_embedding_selected()
+                
+                if hasattr(self, "expand_chk"):
+                    self.expand_chk.config(state=tk.DISABLED)
+                    if getattr(self, "search_expand_var", None):
+                        self.search_expand_var.set(False)
+            else:
+                self.search_embedding_combo.config(state="disabled")
+                if hasattr(self, "expand_chk"):
+                    self.expand_chk.config(state=tk.NORMAL)
+
+        # 如果选中了“大模型分词拓展”或“使用大模型排序”，才启用文本模型下拉框
+        if getattr(self, "search_expand_var", None) and getattr(self, "search_rerank_var", None):
+            if self.search_expand_var.get() or self.search_rerank_var.get():
+                self.search_model_combo.config(state="readonly")
+                self._on_search_model_selected()
+            else:
+                self.search_model_combo.config(state="disabled")
 
     def _on_scan_model_selected(self, event=None):
         """扫描页下拉选择变化时，更新 model_id 变量。"""
         name = self.scan_model_combo.get()
         if name and hasattr(self, "_scan_model_map"):
-            self.scan_model_id_var.set(self._scan_model_map.get(name, ""))
+            model_ref = self._scan_model_map.get(name, "")
+            self.scan_model_id_var.set(model_ref)
             self._update_scan_workers_display()
+            self._preload_model_async(model_ref, is_text=True)
             
     def _update_scan_workers_display(self):
         """更新扫描页的并发线程数显示"""
@@ -904,31 +995,22 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _init_search_tab(self):
         self.top_frame = ttk.Frame(self.search_tab, padding="10")
+        self.top_frame.grid_columnconfigure(0, weight=7)
+        self.top_frame.grid_columnconfigure(1, weight=3)
 
-        # Row 0: 模型选择下拉
-        ttk.Label(self.top_frame, text="文本处理模型:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self._search_model_map = {}
-        self.search_model_combo = ttk.Combobox(self.top_frame, state="readonly", width=40)
-        self.search_model_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
-        self.search_model_combo.bind("<<ComboboxSelected>>", self._on_search_model_selected)
-        
-        ttk.Label(self.top_frame, text="向量模型:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
-        self._search_embedding_map = {}
-        self.search_embedding_combo = ttk.Combobox(self.top_frame, state="readonly", width=30)
-        self.search_embedding_combo.grid(row=0, column=3, sticky=tk.W, padx=5, pady=5)
-        self.search_embedding_combo.bind("<<ComboboxSelected>>", self._on_search_embedding_selected)
+        # ====== LEFT FRAME (70%) ======
+        left_frame = ttk.Frame(self.top_frame)
+        left_frame.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 20))
+        left_frame.grid_columnconfigure(1, weight=1)
+        left_frame.grid_columnconfigure(2, weight=0)
 
-        # 初始化下拉选项
-        self._refresh_search_model_combo()
-        self._refresh_search_embedding_combo()
-
-        # Row 1: 检索数据库列表
-        ttk.Label(self.top_frame, text="检索数据库:").grid(row=1, column=0, sticky=tk.W+tk.N, padx=5, pady=5)
+        # L-Row 0: 检索数据库列表
+        ttk.Label(left_frame, text="检索数据库:").grid(row=0, column=0, sticky=tk.NW, padx=5, pady=5)
         
-        db_frame = ttk.Frame(self.top_frame)
-        db_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W+tk.E, padx=5, pady=5)
+        db_frame = ttk.Frame(left_frame)
+        db_frame.grid(row=0, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=5)
         
-        self.db_listbox = tk.Listbox(db_frame, height=3, selectmode=tk.EXTENDED, width=65)
+        self.db_listbox = tk.Listbox(db_frame, height=3, selectmode=tk.EXTENDED)
         self.db_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(db_frame, orient=tk.VERTICAL, command=self.db_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -936,38 +1018,87 @@ class PhotoIdentifyGUI(tk.Tk):
         
         for db in self.search_dbs:
             self.db_listbox.insert(tk.END, db)
-            
-        btn_frame = ttk.Frame(self.top_frame)
-        btn_frame.grid(row=1, column=3, sticky=tk.N+tk.W, padx=5, pady=5)
-        self.add_db_btn = ttk.Button(btn_frame, text="➕ 添 加", command=self.add_search_db)
-        self.add_db_btn.pack(fill=tk.X, pady=2)
-        self.rm_db_btn = ttk.Button(btn_frame, text="➖ 移 除", command=self.remove_search_db)
-        self.rm_db_btn.pack(fill=tk.X, pady=2)
 
-        # Row 2: Query Keyword
-        ttk.Label(self.top_frame, text="查询关键字:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-        self.query_entry = ttk.Entry(self.top_frame, textvariable=self.query_var, width=50)
-        self.query_entry.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        # L-Row 1: Search Mode & Vector Model
+        ttk.Label(left_frame, text="基础查询:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        
+        radio_frame = ttk.Frame(left_frame)
+        radio_frame.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        self.local_radio = ttk.Radiobutton(radio_frame, text="本地算法", variable=self.search_mode_var, value="local", command=self._on_search_options_changed)
+        self.local_radio.pack(side=tk.LEFT)
+        self.llm_radio = ttk.Radiobutton(radio_frame, text="向量查询", variable=self.search_mode_var, value="llm", command=self._on_search_options_changed)
+        self.llm_radio.pack(side=tk.LEFT, padx=(10, 5))
+        
+        vec_combo_frame = ttk.Frame(left_frame)
+        vec_combo_frame.grid(row=1, column=2, sticky=tk.E, padx=5, pady=5)
+        ttk.Label(vec_combo_frame, text="向量模型:").pack(side=tk.LEFT, padx=(10, 5))
+        self._search_embedding_map = {}
+        self.search_embedding_combo = ttk.Combobox(vec_combo_frame, state="readonly", width=25)
+        self.search_embedding_combo.pack(side=tk.LEFT, padx=(0, 0))
+        self.search_embedding_combo.bind("<<ComboboxSelected>>", self._on_search_embedding_selected)
+
+        # L-Row 2: Expand/Rerank Options & Text Model
+        ttk.Label(left_frame, text="拓展功能:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        
+        chk_frame = ttk.Frame(left_frame)
+        chk_frame.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+        self.search_expand_var = tk.BooleanVar(value=False)
+        self.search_rerank_var = tk.BooleanVar(value=False)
+        
+        self.expand_chk = ttk.Checkbutton(chk_frame, text="大模型分词拓展", variable=self.search_expand_var, command=self._on_search_options_changed)
+        self.expand_chk.pack(side=tk.LEFT)
+        self.rerank_chk = ttk.Checkbutton(chk_frame, text="使用大模型排序", variable=self.search_rerank_var, command=self._on_search_options_changed)
+        self.rerank_chk.pack(side=tk.LEFT, padx=(10, 5))
+        
+        txt_combo_frame = ttk.Frame(left_frame)
+        txt_combo_frame.grid(row=2, column=2, sticky=tk.E, padx=5, pady=5)
+        ttk.Label(txt_combo_frame, text="文本模型:").pack(side=tk.LEFT, padx=(10, 5))
+        self._search_model_map = {}
+        self.search_model_combo = ttk.Combobox(txt_combo_frame, state="readonly", width=25)
+        self.search_model_combo.pack(side=tk.LEFT, padx=(0, 0))
+        self.search_model_combo.bind("<<ComboboxSelected>>", self._on_search_model_selected)
+
+        # L-Row 3: Query Keyword
+        ttk.Label(left_frame, text="查询关键字:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+        self.query_entry = ttk.Entry(left_frame, textvariable=self.query_var)
+        self.query_entry.grid(row=3, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=5)
         self.query_entry.bind("<Return>", lambda e: self.do_search())
 
-        # Row 3: Search Mode Radio Buttons
-        mode_frame = ttk.Frame(self.top_frame)
-        mode_frame.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=5, pady=5)
-        ttk.Label(mode_frame, text="搜索方案:").pack(side=tk.LEFT, padx=(0, 10))
-        self.local_radio = ttk.Radiobutton(mode_frame, text="本地算法", variable=self.search_mode_var, value="local")
-        self.local_radio.pack(side=tk.LEFT)
-        self.llm_radio = ttk.Radiobutton(mode_frame, text="调用大模型匹配", variable=self.search_mode_var, value="llm")
-        self.llm_radio.pack(side=tk.LEFT, padx=10)
+        # ====== RIGHT FRAME (30%) ======
+        right_frame = ttk.Frame(self.top_frame)
+        right_frame.grid(row=0, column=1, sticky=tk.NW, padx=(10, 0), pady=0)
+        
+        # R-Row 0: Add / Remove DB Buttons
+        btn_frame = ttk.Frame(right_frame)
+        btn_frame.pack(side=tk.TOP, anchor=tk.W, pady=(5, 10))
+        self.add_db_btn = ttk.Button(btn_frame, text="➕ 添 加", command=self.add_search_db, width=12)
+        self.add_db_btn.pack(fill=tk.X, pady=2)
+        self.rm_db_btn = ttk.Button(btn_frame, text="➖ 移 除", command=self.remove_search_db, width=12)
+        self.rm_db_btn.pack(fill=tk.X, pady=2)
 
-        ttk.Label(mode_frame, text="查询张数:").pack(side=tk.LEFT, padx=(20, 5))
-        self.limit_entry = ttk.Spinbox(mode_frame, from_=1, to=1000, textvariable=self.search_limit_var, width=5)
+        # R-Row 1: Limit Label (aligned with Vec model on left essentially based on subjective spacing)
+        limit_lbl_frame = ttk.Frame(right_frame)
+        limit_lbl_frame.pack(side=tk.TOP, anchor=tk.W, pady=(0, 2))
+        ttk.Label(limit_lbl_frame, text="查询张数:").pack(side=tk.LEFT, padx=0)
+
+        # R-Row 2: Limit Spinbox
+        limit_box_frame = ttk.Frame(right_frame)
+        limit_box_frame.pack(side=tk.TOP, anchor=tk.W, pady=(0, 15))
+        self.limit_entry = ttk.Spinbox(limit_box_frame, from_=1, to=1000, textvariable=self.search_limit_var, width=10)
         self.limit_entry.pack(side=tk.LEFT)
 
-        # Row 3 (continued): Search Button
-        self.search_btn = ttk.Button(self.top_frame, text="🔍 搜索", command=self.do_search)
-        self.search_btn.grid(row=3, column=3, sticky=tk.W, padx=5, pady=5)
+        # R-Row 3: Search Button
+        search_btn_frame = ttk.Frame(right_frame)
+        search_btn_frame.pack(side=tk.TOP, anchor=tk.W, pady=0)
+        self.search_btn = ttk.Button(search_btn_frame, text="🔍 搜索", command=self.do_search, width=12)
+        self.search_btn.pack(fill=tk.X, pady=0)
 
-        # Row 4: Status Feedback
+        # 初始化下拉选项
+        self._refresh_search_model_combo()
+        self._refresh_search_embedding_combo()
+        self._on_search_options_changed()
+
+        # Row 5: Status Feedback
         self.status_label = ttk.Label(self.top_frame, textvariable=self.status_var, foreground="blue")
         self.status_label.grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=5, pady=5)
 
@@ -988,6 +1119,7 @@ class PhotoIdentifyGUI(tk.Tk):
             self.gallery_frame, 
             wrap="char",
             state="disabled", 
+
             cursor="arrow", 
             bg=self._bg_color,
             bd=0,
@@ -2962,15 +3094,19 @@ class PhotoIdentifyGUI(tk.Tk):
         self._save_settings()
 
         is_llm_mode = (self.search_mode_var.get() == "llm")
+        is_expand = self.search_expand_var.get()
+        is_rerank = self.search_rerank_var.get()
         
-        if is_llm_mode:
-            # 从选中的文本处理模型获取运行参数（用于 rerank）
+        # 处理文本模型参数（当且仅当由于开启了拓展或重排序时需要）
+        text_model_id, text_base_url, text_api_key = "", "", ""
+        if is_expand or is_rerank:
             api_params = self._get_search_api_params()
             if api_params is None:
                 return
-            model_id, base_url, api_key, _, _ = api_params
+            text_model_id, text_base_url, text_api_key, _, _ = api_params
             
-            # 获取 Embedding 模型参数
+        # 处理向量模型参数
+        if is_llm_mode:
             emb_params = self._get_search_embedding_params()
             if emb_params is None:
                 return
@@ -2980,13 +3116,14 @@ class PhotoIdentifyGUI(tk.Tk):
             emb_backend = emb_params["backend"]
             emb_workers = emb_params["workers"]
         else:
-            model_id, base_url, api_key = "", "", ""
             emb_model_id, emb_base_url, emb_api_key = "", "", ""
             emb_backend, emb_workers = "", 1
 
         self.toggle_state(tk.DISABLED)
-        if is_llm_mode:
-            self.status_var.set("正在使用大模型理解查询并召回数据，请稍候...")
+        if is_expand:
+            self.status_var.set("正在使用大模型拓展词意，请稍候...")
+        elif is_llm_mode:
+            self.status_var.set("正在使用向量匹配召回数据，请稍候...")
         else:
             self.status_var.set("正在使用本地算法检索，请稍候...")
             
@@ -3009,10 +3146,11 @@ class PhotoIdentifyGUI(tk.Tk):
                     db_paths=self.search_dbs,
                     limit=limit_val,
                     smart=is_llm_mode,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model_id,
-                    rerank=is_llm_mode,
+                    api_key=text_api_key,
+                    base_url=text_base_url,
+                    model=text_model_id,
+                    rerank=is_rerank,
+                    expand_query=is_expand,
                     embedding_model=emb_model_id,
                     embedding_base_url=emb_base_url,
                     embedding_api_key=emb_api_key,
@@ -3089,25 +3227,61 @@ class PhotoIdentifyGUI(tk.Tk):
                 file_path, actual_path = split_media_record_path(record.get("path"))
                 
                 img = None
+                is_video = False
+                duration = 0.0
                 try:
                     if os.path.isfile(actual_path):
+                        ext = os.path.splitext(actual_path)[1].lower()
+                        if ext in {".mp4", ".mov", ".avi", ".mkv"}:
+                            is_video = True
+                            duration = get_video_duration(actual_path)
+
                         frame_bytes = get_image_frame_bytes(file_path)
                         img = Image.open(io.BytesIO(frame_bytes))
                         img = ImageOps.exif_transpose(img)
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
+                        if img.mode != 'RGBA':
+                            img = img.convert('RGBA')
                         img.thumbnail((150, 150), Image.Resampling.LANCZOS)
                 except Exception:
                     pass
                 
                 if current_gen == self._thumbnail_gen:
-                    self.after(0, self._add_thumbnail, i, record, img, current_gen)
+                    self.after(0, self._add_thumbnail, i, record, img, current_gen, is_video, duration)
 
         threading.Thread(target=_thread, daemon=True).start()
 
-    def _add_thumbnail(self, index, record, img, gen):
+    def _add_thumbnail(self, index, record, img, gen, is_video=False, duration=0.0):
         if gen != self._thumbnail_gen:
             return
+            
+        if is_video and img:
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            draw = ImageDraw.Draw(img, 'RGBA')
+            
+            txt = ""
+            if duration > 0:
+                m = int(duration // 60)
+                s = int(duration % 60)
+                txt = f"{m:02d}:{s:02d}"
+            
+            if txt:
+                try:
+                    font = ImageFont.truetype("msyh.ttc", 13)
+                except Exception:
+                    try:
+                        font = ImageFont.truetype("seguisym.ttf", 13)
+                    except Exception:
+                        font = ImageFont.load_default()
+                
+                bbox = draw.textbbox((0, 0), txt, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                padding = 4
+                x, y = img.width - tw - padding * 2 - 4, 4
+                
+                draw.rectangle([x, y, x + tw + padding * 2, y + th + padding * 2], fill=(0, 0, 0, 160))
+                draw.text((x + padding, y + padding - 2), txt, font=font, fill=(255, 255, 255, 255))
+
             
         bg_color = getattr(self, "_bg_color", "#f0f0f0")
         item_frame = tk.Frame(self.gallery_text, bg=bg_color, cursor="hand2")
@@ -3388,6 +3562,30 @@ class PhotoIdentifyGUI(tk.Tk):
             max_btn_x, max_btn_y, text=max_text, fill=max_color, font=("Segoe UI", 20),
             state="hidden", tags="max_btn"
         )
+        
+        # --- 视频时长检测与显示角标（右上角在各项按钮下面） ---
+        actual_path = split_media_record_path(record.get("path"))[1]
+        try:
+            if os.path.isfile(actual_path):
+                ext = os.path.splitext(actual_path)[1].lower()
+                if ext in {".mp4", ".mov", ".avi", ".mkv"}:
+                    from photo_identify.image_utils import get_video_duration
+                    dur = get_video_duration(actual_path)
+                    if dur > 0:
+                        m = int(dur // 60)
+                        s = int(dur % 60)
+                        dur_text = f"{m:02d}:{s:02d}"
+                        # 半透明黑色背景底板
+                        self.canvas.create_rectangle(
+                            canvas_width - 60, 60, canvas_width - 10, 85,
+                            fill="#000000", outline="", stipple="gray50", tags="dur_bg"
+                        )
+                        self.canvas.create_text(
+                            canvas_width - 35, 72, text=dur_text, fill="white",
+                            font=("Arial", 11, "bold"), tags="dur_text"
+                        )
+        except Exception:
+            pass
         
         # --- 旋转 按钮逻辑 ---
         rot_text = "↻"

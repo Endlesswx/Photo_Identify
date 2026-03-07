@@ -107,11 +107,22 @@ def get_local_embedding_model(model_id: str, device: str = "auto", model_cache_d
             model_id,
             describe_local_embedding_device(resolved_device),
         )
-        model = SentenceTransformer(
-            model_id,
-            device=resolved_device,
-            cache_folder=cache_dir or None,
-        )
+        try:
+            model = SentenceTransformer(
+                model_id,
+                device=resolved_device,
+                cache_folder=cache_dir or None,
+                local_files_only=True,
+            )
+        except Exception as e:
+            logger.info("本地无完整缓存，尝试联网加载模型: %s", e)
+            model = SentenceTransformer(
+                model_id,
+                device=resolved_device,
+                cache_folder=cache_dir or None,
+                local_files_only=False,
+            )
+        
         if resolved_device.startswith("cuda"):
             model.half()
         _LOCAL_MODEL_CACHE[cache_key] = model

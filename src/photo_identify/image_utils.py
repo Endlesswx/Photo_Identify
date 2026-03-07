@@ -268,6 +268,28 @@ def extract_video_frames(video_path: str, frame_count: int | None = None) -> lis
 
     return frames
 
+def get_video_duration(video_path: str) -> float:
+    """快速探测视频时长（秒），用于界面展示时间。
+
+    Args:
+        video_path: 视频文件路径。
+
+    Returns:
+        时长（秒）。探测失败返回 0.0。
+    """
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 0.0
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        cap.release()
+        if fps > 0 and total_frames > 0:
+            return float(total_frames / fps)
+    except Exception:
+        pass
+    return 0.0
+
 def _extract_from_livp(livp_path: str) -> bytes:
     """从 .livp (本质是 zip) 提取代表图像。优先找 heic/jpg，其次 mp4。"""
     try:

@@ -139,6 +139,54 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
         return results, f"LLM 排序失败，已回退默认顺序: {exc}"
 
 
+_EXPAND_SYSTEM_PROMPT = """\
+你是一个查询词拓展助手。用户会提供一段简短的搜索意图，你的任务是提炼和拓展相关词汇，以帮助搜索引擎检索到更多可能的相关图片。
+请直接输出拓展后的同义词或相关词汇，词与词之间使用空格隔开。
+严格遵守：不要输出任何思维过程，不要带任何标点符号。比如：
+用户输入：小孩在吃苹果
+你的输出：儿童 宝宝 男孩 女孩 水果 啃 咬"""
+
+def _llm_expand_query(query: str, api_key: str, base_url: str, model: str) -> str:
+    """使用 LLM 对用户的意图进行分词拓展。"""
+    if not query.strip():
+        return ""
+        
+    payload = {
+        "model": model,
+        "temperature": 0.3,
+        "max_tokens": 128,
+        "messages": [
+            {"role": "system", "content": _EXPAND_SYSTEM_PROMPT},
+            {"role": "user", "content": query},
+        ],
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    
+    url = f"{base_url}/chat/completions" if not base_url.endswith("/chat/completions") else base_url
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        msg = data.get("choices", [{}])[0].get("message", {})
+        ans = msg.get("content", "").strip()
+        ans = re.sub(r'<\|[^|]*\|>', '', ans).strip()
+        
+        # 移除非空格的部分标点
+        import string
+        ans = ans.translate(str.maketrans("", "", string.punctuation + "，。！？；：“”‘’（）【】《》"))
+        print(f"  🧠 LLM 拓展分词结果: {ans[:50]}...")
+        return query + " " + ans
+        
+    except Exception as exc:
+        logger.warning("LLM 拓展查询词失败: %s", exc)
+        print(f"  ⚠️ LLM 拓展查询词失败，回退原始搜索: {exc}", file=sys.stderr)
+        return query
+
+
 def search(
     query: str,
     db_paths: str | list[str],
@@ -148,6 +196,7 @@ def search(
     base_url: str = DEFAULT_BASE_URL,
     model: str = DEFAULT_TEXT_MODEL,
     rerank: bool = False,
+    expand_query: bool = False,
     embedding_model: str = "",
     embedding_base_url: str = "",
     embedding_api_key: str = "",
@@ -161,10 +210,11 @@ def search(
         db_paths: SQLite 数据库文件路径。
         limit: 最大返回条数。
         smart: 是否启用基于 Embedding 的纯语义向量搜索。
-        api_key: 文本处理模型 API Key（用于 rerank）。
+        api_key: 文本处理模型 API Key（用于 rerank/expand_query）。
         base_url: 文本处理模型 API Base URL。
-        model: 文本处理模型名称（用于 rerank）。
+        model: 文本处理模型名称（用于 rerank/expand_query）。
         rerank: 是否使用 LLM 对召回结果进行二次排序。
+        expand_query: 是否使用 LLM 提前对搜索词进行拓展翻译。
         embedding_model: 向量模型名称。
         embedding_base_url: 向量模型 API Base URL。
         embedding_api_key: 向量模型 API Key。
@@ -174,6 +224,10 @@ def search(
     Returns:
         (results, warnings) 二元组：匹配的图片记录列表 和 警告信息列表。
     """
+    if expand_query and model:
+        print("  🔍 正在使用 LLM 进行搜索意图拓展...")
+        query = _llm_expand_query(query, api_key, base_url, model)
+        
     query_emb = None
     if smart:
         if not embedding_model:
