@@ -258,6 +258,23 @@ def search(
             
     # 如果有多个库，全局排序
     results.sort(key=lambda x: x.get("score", 0.0))
+    
+    import os
+    # 按照路径去重（因为已经按 score 排序，保留的是分数最好的第一个）
+    unique_results = []
+    seen_paths = set()
+    for r in results:
+        path = r.get("path")
+        if path:
+            norm_path = os.path.normpath(path).lower()
+            if norm_path not in seen_paths:
+                seen_paths.add(norm_path)
+                unique_results.append(r)
+        else:
+            unique_results.append(r)
+            
+    results = unique_results
+
     fetch_limit = limit * 2 if rerank else limit
     results = results[:fetch_limit]
     
