@@ -16,6 +16,8 @@ MODEL_CAPABILITIES = {
     "image": "图片",
     "video": "视频",
     "audio": "音频",
+    "embedding": "向量",
+    "local": "本地",
 }
 
 # 默认预设模型数据
@@ -43,10 +45,17 @@ _DEFAULT_MODELS = [
     },
     {
         "type": "text,image",
-        "name": "vLLM (本地多模态)",
+        "name": "vLLM (本地图片+文本)",
         "model_id": "qwen3.5-9b-awq",
         "base_url": "http://127.0.0.1:8000/v1",
         "api_key_var": "",
+    },
+    {
+        "type": "embedding",
+        "name": "BAAI/bge-m3 (向量模型)",
+        "model_id": "BAAI/bge-m3",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "api_key_var": "SILICONFLOW_API_KEY",
     },
 ]
 
@@ -81,7 +90,7 @@ class ModelManager:
         """)
         self._conn.commit()
         
-        # 兼容旧版本：更新旧的中文枚举为新的能力标识组合
+        # 兼容历史数据：将旧版中文类型值迁移为新的能力标识组合
         try:
             self._conn.execute("UPDATE models SET type = 'text' WHERE type = '文本模型'")
             self._conn.execute("UPDATE models SET type = 'image' WHERE type = '视觉模型'")
@@ -117,8 +126,11 @@ class ModelManager:
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
         """将数据库行转为字典，附加 api_key_status 和 is_local 字段。"""
         d = dict(row)
-        # api_key_var 为空表示本地模型（如 Ollama），无需 API Key
-        d["is_local"] = not d.get("api_key_var", "").strip()
+        caps = [c.strip() for c in str(d.get("type", "")).split(",") if c.strip()]
+        # 兼容两类本地模型：
+        # 1. 显式标记了 local 能力的进程内本地模型；
+        # 2. 旧版本仅通过留空 api_key_var 表示的本地接口模型（如 Ollama）。
+        d["is_local"] = "local" in caps or not d.get("api_key_var", "").strip()
         if d["is_local"]:
             d["api_key_status"] = True  # 本地模型视为始终可用
         else:

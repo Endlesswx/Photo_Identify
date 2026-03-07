@@ -1,8 +1,8 @@
-"""自然语言搜索模块：支持 LIKE 模糊搜索和可选的 LLM 辅助语义扩展。
+"""自然语言搜索模块：支持普通 FTS 检索和基于 Embedding 向量的语义检索。
 
 提供两种搜索策略：
-1. 普通搜索（默认）：将用户输入拆分为关键词，在 scene/objects/style 等字段中 LIKE 匹配
-2. 智能搜索（--smart 模式）：先用 LLM 将口语化查询转换为同义词/近义词关键词组，再搜索
+1. 普通搜索（默认）：优先 AND 多词 FTS 匹配，降级 OR 匹配，完全本地运行无网络请求。
+2. 智能搜索（--smart 模式）：使用 Embedding 模型将查询转化为向量，并与图片库中的描述向量计算余弦相似度，实现彻底的语义匹配。
 """
 
 import json
@@ -13,76 +13,35 @@ import urllib.error
 import urllib.request
 
 from photo_identify.config import DEFAULT_BASE_URL, DEFAULT_SEARCH_LIMIT, DEFAULT_TEXT_MODEL
+from photo_identify.embedding_runtime import get_text_embedding_sync
 from photo_identify.storage import Storage
 
 logger = logging.getLogger(__name__)
 
-# 智能搜索的 LLM 提示词模板，要求生成同义词/近义词扩展
-_EXPAND_SYSTEM_PROMPT = """\
-你是一个图片搜索关键词扩展助手。用户会用口语描述想找的图片，你的任务是：
 
-1. 提取核心搜索意图中的关键词
-2. 为每个关键词生成同义词、近义词、相关词（中文）
-3. 考虑图片描述中可能使用的专业/书面表达方式
+def _get_query_embedding(
+    query: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    backend: str = "",
+    workers: int = 1,
+) -> list[float]:
+    """根据指定后端获取用户查询文本的 Embedding 向量。"""
 
-示例：
-  输入: "美女在唱歌"
-  输出: 美女 女性 女孩 女人 唱歌 歌手 演唱 录音 麦克风 音乐
-
-  输入: "有红灯笼的那张过年图片"
-  输出: 红灯笼 灯笼 红色 过年 春节 新年 节日 喜庆
-
-  输入: "海边日落"
-  输出: 海边 海滨 海岸 沙滩 日落 夕阳 黄昏 傍晚
-
-规则：
-- 只输出关键词，用空格分隔，不要其他内容
-- 关键词数量 5-15 个
-- 优先生成与图片视觉内容相关的词汇"""
-
-
-def _llm_expand_query(query: str, api_key: str, base_url: str = DEFAULT_BASE_URL, model: str = DEFAULT_TEXT_MODEL) -> str:
-    """使用 LLM 将口语化查询扩展为包含同义词/近义词的关键词组。
-
-    例如 "美女在唱歌" → "美女 女性 女孩 唱歌 歌手 演唱 录音 麦克风 音乐"
-
-    Args:
-        query: 用户的口语化搜索输入。
-        api_key: API Key。
-        base_url: API Base URL。
-        model: 选择的大语言模型
-
-    Returns:
-        扩展后的关键词字符串，失败时返回原始查询。
-    """
-    payload = {
-        "model": model,
-        "temperature": 0.1,
-        "max_tokens": 10240,
-        "messages": [
-            {"role": "system", "content": _EXPAND_SYSTEM_PROMPT},
-            {"role": "user", "content": query},
-        ],
-    }
-    headers = {"Content-Type": "application/json"}
-    if api_key:  # 本地模型（如 Ollama）无需 Authorization 头
-        headers["Authorization"] = f"Bearer {api_key}"
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        f"{base_url}/chat/completions", data=body, headers=headers, method="POST"
-    )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        expanded = content.strip()
-        if expanded:
-            print(f'  🔍 关键词扩展: "{query}" → "{expanded}"')
-            return expanded
+        return get_text_embedding_sync(
+            text=query,
+            model=model,
+            backend=backend,
+            api_key=api_key,
+            base_url=base_url,
+            workers=workers,
+        )
     except Exception as exc:
-        logger.warning("LLM 关键词扩展失败，回退为原始查询: %s", exc)
-        print(f"  ⚠️ LLM 扩展失败，使用原始查询: {exc}", file=sys.stderr)
-    return query
+        logger.warning("获取 Query Embedding 失败: %s", exc)
+        print(f"  ⚠️ 获取语义向量失败: {exc}", file=sys.stderr)
+    return []
 
 
 _RERANK_SYSTEM_PROMPT = """\
@@ -95,18 +54,15 @@ _RERANK_SYSTEM_PROMPT = """\
 [3, 1, 5]
 如果没有符合要求的，返回 []。不要输出任何除了方括号和数字之外的内容（不要加 ```json 标记）。"""
 
-def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url: str, model: str) -> list[dict]:
+def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url: str, model: str) -> tuple[list[dict], str]:
     if not results:
-        return []
+        return [], ""
 
-    # 限制 LLM 处理的数量，防止上下文超长导致响应超时
     max_rerank = 20
     to_rerank = results[:max_rerank]
     remainder = results[max_rerank:]
 
-    # 构造 candidates 字符串
     candidates_text = []
-    # 建立 id 映射
     id_map = {}
     for i, r in enumerate(to_rerank, 1):
         id_map[i] = r
@@ -131,12 +87,12 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
         ],
     }
     headers = {"Content-Type": "application/json"}
-    if api_key:  # 本地模型（如 Ollama）无需 Authorization 头
+    if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        f"{base_url}/chat/completions", data=body, headers=headers, method="POST"
-    )
+    
+    url = f"{base_url}/chat/completions" if not base_url.endswith("/chat/completions") else base_url
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -144,21 +100,16 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
         msg = data.get("choices", [{}])[0].get("message", {})
         ans = msg.get("content", "").strip()
         
-        # 清除特殊标记（GLM-4 系列的 <|begin_of_box|>...<|end_of_box|> 等）
         ans = re.sub(r'<\|[^|]*\|>', '', ans).strip()
-        
         if not ans:
-            raise ValueError("模型返回了空内容（content 为空），可能该模型不支持重排序任务或 max_tokens 仍不足")
+            raise ValueError("模型返回了空内容")
         
-        # 优先用正则提取 [数字, 数字, ...] 格式（兼容模型在 content 中混入多余文字）
         array_match = re.search(r'\[\s*\d+\s*(?:,\s*\d+\s*)*\]', ans)
         if array_match:
             ans = array_match.group()
         else:
-            # 兜底清理
             ans = ans.replace("```json", "").replace("```", "").strip()
         
-        # 尝试解析 JSON 数组
         best_indices = json.loads(ans)
         if not isinstance(best_indices, list):
             raise ValueError("结果不是数组")
@@ -167,28 +118,26 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
         seen = set()
         for idx in best_indices:
             try:
-                # 可能是字符串数字
                 idx_int = int(idx)
                 if idx_int in id_map and idx_int not in seen:
                     reranked.append(id_map[idx_int])
-                    seen.add(idx_int) # 保证不重复
+                    seen.add(idx_int)
             except ValueError:
                 continue
                 
         print(f"  🧠 LLM 排序原始返回: {ans}, 匹配出 {len(reranked)} 项")
         
-        # 将在 max_rerank 范围内但未被 LLM 显式返回的其他图片追加到后面
         for i, r in enumerate(to_rerank, 1):
             if i not in seen:
                 reranked.append(r)
                 
-        # 拼接剩余未参与重排的项
         return reranked + remainder, ""
 
     except Exception as exc:
         logger.warning("LLM 重排序失败: %s", exc)
         print(f"  ⚠️ LLM 排序失败，回退默认顺序: {exc}", file=sys.stderr)
         return results, f"LLM 排序失败，已回退默认顺序: {exc}"
+
 
 def search(
     query: str,
@@ -199,75 +148,128 @@ def search(
     base_url: str = DEFAULT_BASE_URL,
     model: str = DEFAULT_TEXT_MODEL,
     rerank: bool = False,
-) -> list[dict]:
+    embedding_model: str = "",
+    embedding_base_url: str = "",
+    embedding_api_key: str = "",
+    embedding_backend: str = "",
+    embedding_workers: int = 1,
+) -> tuple[list[dict], list[str]]:
     """执行图片搜索并返回匹配结果。
 
     Args:
-        query: 搜索文本（口语化查询或关键词）。
-        db_paths: SQLite 数据库文件路径（单个字符串或字符串列表）。
+        query: 搜索文本。
+        db_paths: SQLite 数据库文件路径。
         limit: 最大返回条数。
-        smart: 是否启用 LLM 辅助关键词扩展。
-        api_key: API Key（smart 或 rerank 模式需要）。
-        base_url: API Base URL。
-        model: 模型名称。
+        smart: 是否启用基于 Embedding 的纯语义向量搜索。
+        api_key: 文本处理模型 API Key（用于 rerank）。
+        base_url: 文本处理模型 API Base URL。
+        model: 文本处理模型名称（用于 rerank）。
         rerank: 是否使用 LLM 对召回结果进行二次排序。
+        embedding_model: 向量模型名称。
+        embedding_base_url: 向量模型 API Base URL。
+        embedding_api_key: 向量模型 API Key。
+        embedding_backend: 向量模型运行方式，支持 ``api`` 或 ``local``。
+        embedding_workers: 本地向量模型编码时使用的批大小提示。
 
     Returns:
         (results, warnings) 二元组：匹配的图片记录列表 和 警告信息列表。
     """
-    expanded_query = query
-    if smart or rerank:
-        # 本地模型（如 Ollama）无需 api_key 但有 base_url，仍可使用智能模式
-        if not api_key and not base_url:
-            print("  ⚠️ 智能模式/重排序需要模型配置，回退为普通搜索模式", file=sys.stderr)
+    query_emb = None
+    if smart:
+        if not embedding_model:
+            print("  ⚠️ 智能模式(Semantic Search)需要配置向量模型，回退为普通本地搜索", file=sys.stderr)
             smart = False
-            rerank = False
-        elif smart:
-            expanded_query = _llm_expand_query(query, api_key, base_url, model)
+        else:
+            emb_key = embedding_api_key or api_key
+            emb_url = embedding_base_url or base_url
+            print(f"  🔍 正在获取检索词的语义向量...")
+            query_emb_list = _get_query_embedding(
+                query,
+                emb_key,
+                emb_url,
+                embedding_model,
+                backend=embedding_backend,
+                workers=embedding_workers,
+            )
+            if query_emb_list:
+                import numpy as np
+                query_emb = np.array(query_emb_list, dtype=np.float32)
+            else:
+                smart = False
 
     if isinstance(db_paths, str):
         db_paths = [db_paths]
         
     results = []
-    # 若开启 rerank，扩大召回数量供大模型选择
-    fetch_limit = limit * 2 if rerank else limit
+    warnings = []
     
     for db in db_paths:
         try:
             storage = Storage(db)
-            db_results = storage.search_fts(expanded_query, fetch_limit)
-            for r in db_results:
-                r["db_path"] = db
-            results.extend(db_results)
+            if query_emb is not None:
+                import numpy as np
+                all_embs = storage.get_all_embeddings()
+                if all_embs:
+                    ids = []
+                    vecs = []
+                    for img_id, emb_bytes in all_embs:
+                        try:
+                            vec = np.frombuffer(emb_bytes, dtype=np.float32)
+                            vecs.append(vec)
+                            ids.append(img_id)
+                        except Exception:
+                            continue
+                    
+                    if vecs:
+                        matrix = np.stack(vecs)
+                        norm_matrix = np.linalg.norm(matrix, axis=1)
+                        norm_q = np.linalg.norm(query_emb)
+                        
+                        # 避免除以 0
+                        norm_matrix[norm_matrix == 0] = 1e-9
+                        norm_q = norm_q if norm_q != 0 else 1e-9
+                        
+                        sims = np.dot(matrix, query_emb) / (norm_matrix * norm_q)
+                        
+                        # 挑选 top K，加入小阈值过滤完全无关的内容
+                        top_indices = np.argsort(sims)[::-1][:limit * 2]
+                        top_ids = [ids[i] for i in top_indices if sims[i] > 0.05]
+                        
+                        if top_ids:
+                            db_results = storage.get_images_by_ids(top_ids)
+                            # 根据 ID 重建相似度字典并赋值 score，负数越小越靠前
+                            sim_dict = {ids[i]: float(sims[i]) for i in top_indices}
+                            for r in db_results:
+                                r["score"] = -sim_dict.get(r["id"], 0.0)
+                                r["db_path"] = db
+                            db_results.sort(key=lambda x: x["score"])
+                            results.extend(db_results)
+            else:
+                # 纯本地多级 FTS 检索
+                fetch_limit = limit * 2 if rerank else limit
+                db_results = storage.search_fts(query, fetch_limit)
+                for r in db_results:
+                    r["db_path"] = db
+                results.extend(db_results)
             storage.close()
         except Exception as e:
             logger.warning("在数据库 %s 中搜索失败: %s", db, e)
             print(f"  ⚠️ 读取数据库出错 {db}: {e}", file=sys.stderr)
             
-    # 如果跨库汇总结果超出 fetch_limit，按需对结果的分数等进行全局重排，这里简单截断前 fetch_limit 个
+    # 如果有多个库，全局排序
+    results.sort(key=lambda x: x.get("score", 0.0))
+    fetch_limit = limit * 2 if rerank else limit
     results = results[:fetch_limit]
     
-    warnings = []
-
     if rerank and results:
         results, rerank_warn = _llm_rerank_results(query, results, api_key, base_url, model)
         if rerank_warn:
             warnings.append(rerank_warn)
-        # 截断结果到要求数量
-        results = results[:limit]
-
-    return results, warnings
+            
+    return results[:limit], warnings
 
 
 def format_results(results: list[dict]) -> str:
-    """将搜索结果格式化为可读文本。
-
-    Args:
-        results: 图片记录字典列表。
-
-    Returns:
-        格式化后的多行文本。
-    """
     if not results:
         return "未找到匹配的图片。"
 

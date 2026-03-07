@@ -36,7 +36,7 @@ def get_vram_usage():
 async def async_call_video_model(video_bytes: bytes, session: aiohttp.ClientSession, base_url: str, model: str) -> dict:
     """
     专门针对视频模型的 API 构造逻辑
-    注意：此处的 video_url base64 格式是为了兼容类似于 Qwen2-VL 等通过 OpenAI 格式包装的多模态模型
+    注意：此处的 video_url base64 格式是为了兼容类似于 Qwen2-VL 等通过 OpenAI 格式包装的图片/视频分析模型
     """
     video_b64 = base64.b64encode(video_bytes).decode('utf-8')
     # 构建请求 payload

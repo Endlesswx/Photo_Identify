@@ -1,4 +1,4 @@
-"""LLM API 调用层：负责多模态模型调用、速率控制和自动重试。
+"""LLM API 调用层：负责图片/视频分析模型调用、速率控制和自动重试。
 
 封装与 SiliconFlow API 的通信逻辑，包括：
 - base64 编码图片构建请求载荷
@@ -17,8 +17,8 @@ import aiohttp
 
 from photo_identify.config import (
     DEFAULT_BASE_URL,
+    DEFAULT_IMAGE_MODEL,
     DEFAULT_MAX_TOKENS,
-    DEFAULT_VISION_MODEL,
     DEFAULT_TEMPERATURE,
     DEFAULT_TIMEOUT,
     MAX_RETRIES,
@@ -32,7 +32,7 @@ def _build_prompt() -> str:
     """生成图片/视频分析的中文提示词。
 
     Returns:
-        用于多模态模型的中文提示词。
+        用于图片/视频分析模型的中文提示词。
     """
     return (
         "请用中文分析提供的媒体（图片或视频），直接输出纯 JSON（不要用 markdown 代码块包裹），包含字段："
@@ -220,13 +220,13 @@ async def async_call_image_model(
     image_format: str = "jpeg",
     api_key: str = "",
     base_url: str = DEFAULT_BASE_URL,
-    model: str = DEFAULT_VISION_MODEL,
+    model: str = DEFAULT_IMAGE_MODEL,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = DEFAULT_TIMEOUT,
     rate_limiter: RateLimiter | None = None,
 ) -> dict:
-    """调用多模态模型分析图片，包含自动重试和 JSON 解析（异步版本）。
+    """调用图片/视频分析模型分析媒体，包含自动重试和 JSON 解析（异步版本）。
 
     Args:
         image_bytes: 压缩后的图片字节内容。
@@ -355,3 +355,92 @@ async def async_call_image_model(
         }
 
     return {"error": f"重试 {MAX_RETRIES} 次后仍失败: {last_error}", "llm_raw": ""}
+
+
+async def async_call_embedding_model(
+    text: str,
+    session: aiohttp.ClientSession,
+    api_key: str = "",
+    base_url: str = DEFAULT_BASE_URL,
+    model: str = "BAAI/bge-m3",
+    timeout: int = DEFAULT_TIMEOUT,
+    rate_limiter: RateLimiter | None = None,
+) -> bytes | None:
+    """调用 Embedding 模型将文本转化为向量（异步版本）。
+
+    Args:
+        text: 需要向量化的文本。
+        session: aiohttp ClientSession
+        api_key: API Key。
+        base_url: API Base URL。
+        model: Embedding 模型名称。
+        timeout: HTTP 超时秒数。
+        rate_limiter: 速率限制器实例。
+
+    Returns:
+        如果成功，返回序列化后的 float32 向量（bytes，可直接存入 SQLite BLOB）；
+        失败返回 None。
+    """
+    if not text.strip():
+        return None
+
+    payload = {
+        "model": model,
+        "input": text,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # 简单估算 token cost
+    token_cost = max(1, len(text) // 2)
+
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        if rate_limiter:
+            await rate_limiter.wait(token_cost)
+
+        try:
+            status, data = await _request_json_async(
+                f"{base_url}/embeddings", payload, headers, timeout, session
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("Embedding API 请求异常 (第 %d 次): %s", attempt, exc)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(min(RETRY_BASE_DELAY ** attempt, 3.0))
+            continue
+
+        if status >= 500:
+            last_error = f"HTTP {status}: {data}"
+            logger.warning("Embedding 服务端错误 (第 %d 次): %s", attempt, last_error)
+            if attempt < MAX_RETRIES:
+                import random
+                await asyncio.sleep(min(RETRY_BASE_DELAY ** (attempt + 1), 15.0) + random.uniform(1.0, 3.0))
+            continue
+
+        if status >= 400:
+            logger.error("Embedding 客户端错误: HTTP %d %s", status, data)
+            return None
+
+        emb_data = data.get("data")
+        if not emb_data or not isinstance(emb_data, list):
+            logger.error("Embedding API 返回格式异常: %s", data)
+            return None
+
+        embedding_list = emb_data[0].get("embedding")
+        if not embedding_list or not isinstance(embedding_list, list):
+            logger.error("未能从返回体中提取出 embedding 数组")
+            return None
+
+        # 将 list 转换为 bytes (float32 数组)
+        import struct
+        try:
+            return struct.pack(f"<{len(embedding_list)}f", *embedding_list)
+        except Exception as e:
+            logger.error("序列化 Embedding 失败: %s", e)
+            return None
+
+    logger.error("Embedding 调用失败: %s", last_error)
+    return None
+

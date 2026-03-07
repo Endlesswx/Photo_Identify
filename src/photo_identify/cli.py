@@ -18,9 +18,9 @@ from pathlib import Path
 from photo_identify.config import (
     DEFAULT_BASE_URL,
     DEFAULT_DB_PATH,
+    DEFAULT_IMAGE_MODEL,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEXT_MODEL,
-    DEFAULT_VISION_MODEL,
     DEFAULT_RPM_LIMIT,
     DEFAULT_SEARCH_LIMIT,
     DEFAULT_TEMPERATURE,
@@ -234,7 +234,7 @@ def main():
     p_scan.add_argument("--path", nargs="+", required=True, help="要扫描的目录（支持多个）")
     p_scan.add_argument("--api-key", default="", help="API Key")
     p_scan.add_argument("--base-url", default=DEFAULT_BASE_URL, help="API Base URL")
-    p_scan.add_argument("--model", default=DEFAULT_VISION_MODEL, help="模型名称")
+    p_scan.add_argument("--model", default=DEFAULT_IMAGE_MODEL, help="模型名称")
     p_scan.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     p_scan.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p_scan.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)

@@ -10,10 +10,12 @@ from pathlib import Path
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 
 # 支持的模型
-# 视觉大模型（主要用于 scan 扫描看图分析）
-DEFAULT_VISION_MODEL = "THUDM/GLM-4.1V-9B-Thinking"
-# 纯文本指令大模型（主要用于 search / rerank 重排序与同义词扩展）
+# 默认图片分析模型（主要用于 scan 扫描看图分析）
+DEFAULT_IMAGE_MODEL = "THUDM/GLM-4.1V-9B-Thinking"
+# 默认文本处理模型（主要用于 search / rerank 重排序与同义词扩展）
 DEFAULT_TEXT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+# 向量模型（用于 Semantic Search 语义检索）
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 
 # 默认采样参数
 DEFAULT_TEMPERATURE = 0.2

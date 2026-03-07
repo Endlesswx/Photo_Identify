@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS images (
     llm_raw TEXT,
     analyzed_at TEXT,
     face_scanned INTEGER DEFAULT 0,
-    is_favorite INTEGER DEFAULT 0
+    is_favorite INTEGER DEFAULT 0,
+    text_embedding BLOB
 );
 
 CREATE TABLE IF NOT EXISTS face_embeddings (
@@ -143,6 +144,12 @@ class Storage:
         # 增加 is_favorite 字段（如果是旧库）
         try:
             cursor.execute("ALTER TABLE images ADD COLUMN is_favorite INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass # 字段已存在
+
+        # 增加 text_embedding 字段（如果是旧库）
+        try:
+            cursor.execute("ALTER TABLE images ADD COLUMN text_embedding BLOB")
         except sqlite3.OperationalError:
             pass # 字段已存在
 
@@ -266,6 +273,7 @@ class Storage:
                         file_name = ?,
                         size_bytes = ?,
                         analyzed_at = ?,
+                        text_embedding = COALESCE(?, text_embedding),
                         face_scanned = 1
                     WHERE md5 = ?
                     """,
@@ -274,6 +282,7 @@ class Storage:
                         record.get("file_name", ""),
                         record.get("size_bytes"),
                         record.get("analyzed_at", ""),
+                        record.get("text_embedding"),
                         record["md5"],
                     ),
                 )
@@ -284,6 +293,7 @@ class Storage:
                         path = ?,
                         file_name = ?,
                         size_bytes = ?,
+                        text_embedding = COALESCE(?, text_embedding),
                         analyzed_at = ?
                     WHERE md5 = ?
                     """,
@@ -291,6 +301,7 @@ class Storage:
                         record.get("path", ""),
                         record.get("file_name", ""),
                         record.get("size_bytes"),
+                        record.get("text_embedding"),
                         record.get("analyzed_at", ""),
                         record["md5"],
                     ),
@@ -303,8 +314,8 @@ class Storage:
                     width, height, image_mode, image_format, exif_json,
                     created_time, modified_time,
                     scene, objects, style, location_time, wallpaper_hint,
-                    llm_raw, analyzed_at, face_scanned
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    llm_raw, analyzed_at, face_scanned, text_embedding
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.get("path", ""),
@@ -327,6 +338,7 @@ class Storage:
                     record.get("llm_raw", ""),
                     record.get("analyzed_at", ""),
                     1 if update_face_scanned else 0,
+                    record.get("text_embedding"),
                 ),
             )
             image_id = cursor.lastrowid or 0
@@ -373,6 +385,12 @@ class Storage:
                 "INSERT INTO face_embeddings (image_id, bbox, embedding) VALUES (?, ?, ?)",
                 (image_id, bbox_str, embedding_blob)
             )
+        self._conn.commit()
+
+    def delete_face_embeddings_for_image(self, image_id: int) -> None:
+        """删除指定图片已有的人脸特征记录，避免重复写入。"""
+
+        self._conn.execute("DELETE FROM face_embeddings WHERE image_id = ?", (image_id,))
         self._conn.commit()
 
     def get_unclustered_faces(self) -> list[tuple[int, bytes]]:
@@ -529,6 +547,42 @@ class Storage:
         self._conn.execute("UPDATE persons SET name = ? WHERE id = ?", (new_name, person_id))
         self._conn.commit()
 
+    def get_all_embeddings(self) -> list[tuple[int, bytes]]:
+        """获取所有已入库图片的特征向量，用于语义搜索。
+        
+        Returns:
+            list of (image_id, text_embedding_bytes)
+        """
+        cursor = self._conn.execute("SELECT id, text_embedding FROM images WHERE text_embedding IS NOT NULL")
+        return [(row[0], row[1]) for row in cursor.fetchall()]
+
+    def get_images_by_ids(self, image_ids: list[int]) -> list[dict]:
+        """根据图片 ID 列表批量获取图片信息并保持顺序。"""
+        if not image_ids:
+            return []
+            
+        placeholders = ",".join("?" for _ in image_ids)
+        self._conn.row_factory = sqlite3.Row
+        cursor = self._conn.execute(
+            f"SELECT * FROM images WHERE id IN ({placeholders})", 
+            image_ids
+        )
+        
+        results_map = {}
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            row_dict["file_size"] = row_dict.get("size_bytes")
+            row_dict["photo_date"] = row_dict.get("created_time")
+            row_dict["updated_at"] = row_dict.get("modified_time")
+            results_map[row_dict["id"]] = row_dict
+            
+        ordered_results = []
+        for img_id in image_ids:
+            if img_id in results_map:
+                ordered_results.append(results_map[img_id])
+                
+        return ordered_results
+
     def search_fts(self, query: str, limit: int = 50) -> list[dict]:
         """全文检索
         引入 jieba 分词，把长句或未加空格的词拆分成细粒度词汇组合
@@ -574,8 +628,9 @@ class Storage:
             
         fts_results = {}
         if match_terms:
-            match_query = " OR ".join(match_terms)
-            print(f"  🔍 FTS 分词转换: \"{query}\" -> \"{match_query}\"")
+            # 严格匹配（各个输入分词之间为 AND）
+            match_query_and = " AND ".join(match_terms)
+            print(f"  🔍 FTS 分词转换 (精确): \"{query}\" -> \"{match_query_and}\"")
 
             sql = """
             SELECT
@@ -593,22 +648,43 @@ class Storage:
             JOIN images r ON fts.rowid = r.id
             WHERE images_fts MATCH ?
             """
+            
+            and_count = 0
             try:
                 # 扩大召回范围以便和 person_images 融合
-                cursor.execute(sql + f" LIMIT {limit * 5}", (match_query,))
+                cursor.execute(sql + f" LIMIT {limit * 5}", (match_query_and,))
                 for row in cursor.fetchall():
                     row_dict = dict(row)
+                    # AND 匹配的结果具有极大优势，分数给予奖励
+                    row_dict["score"] = row_dict["score"] - 100.0
                     fts_results[row_dict["id"]] = row_dict
+                    and_count += 1
             except sqlite3.OperationalError as e:
                 import sys
-                print(f"  ⚠️ FTS 查询语法有误: {match_query} ({e})", file=sys.stderr)
+                print(f"  ⚠️ FTS 精确查询语法有误: {match_query_and} ({e})", file=sys.stderr)
+                
+            # 如果精确匹配召回不足，且有多个关键词，则降级为 OR 查询进行补充
+            if and_count < limit and len(match_terms) > 1:
+                match_query_or = " OR ".join(match_terms)
+                print(f"  🔍 FTS 分词转换 (降级): \"{query}\" -> \"{match_query_or}\"")
+                try:
+                    cursor.execute(sql + f" LIMIT {limit * 5}", (match_query_or,))
+                    for row in cursor.fetchall():
+                        row_dict = dict(row)
+                        if row_dict["id"] not in fts_results:
+                            fts_results[row_dict["id"]] = row_dict
+                except sqlite3.OperationalError as e:
+                    import sys
+                    print(f"  ⚠️ FTS 降级查询语法有误: {match_query_or} ({e})", file=sys.stderr)
+
+            # 兜底
+            if not fts_results:
                 cursor.execute(
                     "SELECT * FROM images WHERE scene LIKE ? OR objects LIKE ? LIMIT ?",
                     (f"%{query}%", f"%{query}%", limit * 5)
                 )
                 for row in cursor.fetchall():
                     row_dict = dict(row)
-                    # 模拟一个负数分，使得其也能参与排序
                     row_dict["score"] = -0.5
                     fts_results[row_dict["id"]] = row_dict
         

@@ -1,5 +1,7 @@
 import configparser
+from collections import Counter
 import math
+import logging
 import os
 import subprocess
 import sys
@@ -22,7 +24,7 @@ from photo_identify.config import (
 )
 from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_CAPABILITIES
 from photo_identify.search import search
-from photo_identify.scanner import scan
+from photo_identify.scanner import FACE_SCAN_LABEL, IMAGE_EXTRACTION_LABEL, scan, scan_faces
 
 
 def crop_and_circle_face(image: Image.Image, bbox_str: str, size: int = 80) -> Image.Image:
@@ -74,6 +76,14 @@ def crop_and_circle_face(image: Image.Image, bbox_str: str, size: int = 80) -> I
     
     return result
 
+
+def split_media_record_path(file_path: str | None) -> tuple[str, str]:
+    """将数据库中的媒体记录路径拆分为原始路径和实际文件路径。"""
+
+    normalized_path = str(file_path or "").strip()
+    actual_path = normalized_path.split("#t=", 1)[0] if "#t=" in normalized_path else normalized_path
+    return normalized_path, actual_path
+
 class TkLineWriter:
     """tqdm 兼容的文件对象，将输出更新到 Text 组件的指定行。
 
@@ -121,6 +131,34 @@ class TkLineWriter:
         return False
 
 
+class TkTextLogHandler(logging.Handler):
+    """将 logging 输出安全追加到 Tkinter 文本框。"""
+
+    def __init__(self, text_widget):
+        """初始化日志处理器并保存目标文本组件。"""
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        """格式化日志记录并调度到主线程写入文本框。"""
+        try:
+            message = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        self.text_widget.after(0, self._append_message, message)
+
+    def _append_message(self, message: str) -> None:
+        """将单条日志消息追加到文本框底部。"""
+        try:
+            self.text_widget.configure(state=tk.NORMAL)
+            self.text_widget.insert(tk.END, message + "\n")
+            self.text_widget.configure(state=tk.DISABLED)
+            self.text_widget.see(tk.END)
+        except Exception:
+            pass
+
+
 class ModelDialog(tk.Toplevel):
     """新增/编辑模型的对话框。"""
 
@@ -139,7 +177,14 @@ class ModelDialog(tk.Toplevel):
 
         # ── 变量 ──
         # 将 type 拆分为多个 boolean 变量
-        self._capabilities = {"text": tk.BooleanVar(), "image": tk.BooleanVar(), "video": tk.BooleanVar(), "audio": tk.BooleanVar()}
+        self._capabilities = {
+            "text": tk.BooleanVar(),
+            "image": tk.BooleanVar(),
+            "video": tk.BooleanVar(),
+            "audio": tk.BooleanVar(),
+            "embedding": tk.BooleanVar(),
+            "local": tk.BooleanVar(),
+        }
         if model_data and "type" in model_data:
             caps = [c.strip() for c in model_data["type"].split(",")]
             for k in self._capabilities:
@@ -172,10 +217,18 @@ class ModelDialog(tk.Toplevel):
         ttk.Checkbutton(type_frame, text="图片", variable=self._capabilities["image"]).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Checkbutton(type_frame, text="视频", variable=self._capabilities["video"]).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Checkbutton(type_frame, text="音频", variable=self._capabilities["audio"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(type_frame, text="向量(Embedding)", variable=self._capabilities["embedding"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(type_frame, text="本地", variable=self._capabilities["local"]).pack(side=tk.LEFT, padx=(0, 10))
 
         # 文本字段
-        for i, var in enumerate([self._name_var, self._model_id_var, self._base_url_var, self._api_key_var_var], 1):
-            ttk.Entry(frame, textvariable=var, width=40).grid(row=i, column=1, sticky=tk.W, pady=6)
+        self._name_entry = ttk.Entry(frame, textvariable=self._name_var, width=40)
+        self._name_entry.grid(row=1, column=1, sticky=tk.W, pady=6)
+        self._model_id_entry = ttk.Entry(frame, textvariable=self._model_id_var, width=40)
+        self._model_id_entry.grid(row=2, column=1, sticky=tk.W, pady=6)
+        self._base_url_entry = ttk.Entry(frame, textvariable=self._base_url_var, width=40)
+        self._base_url_entry.grid(row=3, column=1, sticky=tk.W, pady=6)
+        self._api_key_var_entry = ttk.Entry(frame, textvariable=self._api_key_var_var, width=40)
+        self._api_key_var_entry.grid(row=4, column=1, sticky=tk.W, pady=6)
 
         # 并发线程数
         self._workers_entry = ttk.Spinbox(frame, from_=1, to=32, textvariable=self._workers_var, width=10)
@@ -187,12 +240,14 @@ class ModelDialog(tk.Toplevel):
         self._video_workers_hint = ttk.Label(frame, text="(视频抽帧同时处理数)", foreground="gray")
 
         # API变量名旁的提示
-        ttk.Label(frame, text="(本地模型可留空)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
+        ttk.Label(frame, text="(本地类型可留空)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
         ttk.Label(frame, text="(建议: Ollama为1，vLLM依据显存调整)", foreground="gray").grid(row=5, column=2, sticky=tk.W, padx=5)
 
         # 绑定视频复选框变化以动态显示/隐藏视频并发数行
         self._capabilities["video"].trace_add("write", self._on_video_cap_changed)
+        self._capabilities["local"].trace_add("write", self._on_local_cap_changed)
         self._on_video_cap_changed()  # 初始化显示状态
+        self._on_local_cap_changed()
 
         # 底部按钮
         btn_frame = ttk.Frame(self, padding=(20, 0, 20, 15))
@@ -215,6 +270,16 @@ class ModelDialog(tk.Toplevel):
             self._video_workers_entry.grid_remove()
             self._video_workers_hint.grid_remove()
 
+    def _on_local_cap_changed(self, *args):
+        """本地能力复选框变化时，动态调整接口相关输入框状态。"""
+        is_local = self._capabilities["local"].get()
+        state = tk.DISABLED if is_local else tk.NORMAL
+        if is_local:
+            self._base_url_var.set("")
+            self._api_key_var_var.set("")
+        self._base_url_entry.configure(state=state)
+        self._api_key_var_entry.configure(state=state)
+
     def _on_api_key_changed(self, *args):
         # 移除强制禁用 workers_entry 和重置为 1 的逻辑，因为用户需要自定义并发（如 vLLM 可多线程）
         pass
@@ -233,6 +298,7 @@ class ModelDialog(tk.Toplevel):
         self._capabilities["image"].set(True)
         self._capabilities["video"].set(False)
         self._capabilities["audio"].set(False)
+        self._capabilities["local"].set(False)
         self._base_url_var.set("http://localhost:11434/v1")
         self._api_key_var_var.set("")
 
@@ -243,18 +309,26 @@ class ModelDialog(tk.Toplevel):
         base_url = self._base_url_var.get().strip()
         api_key_var = self._api_key_var_var.get().strip()
         workers = self._workers_var.get().strip()
+        is_local = self._capabilities["local"].get()
 
-        # 名称、模型ID、接口地址为必填；API变量名可为空（本地模型无需 API Key）
-        if not all([name, model_id, base_url]):
-            messagebox.showwarning("警告", "模型名称、模型ID、接口地址不能为空！", parent=self)
+        if not name or not model_id:
+            messagebox.showwarning("警告", "模型名称和模型ID不能为空！", parent=self)
+            return
+
+        if not is_local and not base_url:
+            messagebox.showwarning("警告", "非本地模型必须填写接口地址！", parent=self)
             return
             
         selected_caps = [k for k, v in self._capabilities.items() if v.get()]
-        if not selected_caps:
-            messagebox.showwarning("警告", "至少需要选择一项模型能力！", parent=self)
+        usage_caps = [cap for cap in selected_caps if cap != "local"]
+        if not usage_caps:
+            messagebox.showwarning("警告", "至少需要选择一项实际模型能力！", parent=self)
             return
             
         combined_type = ",".join(selected_caps)
+        if is_local:
+            base_url = ""
+            api_key_var = ""
             
         try:
             workers_int = int(workers)
@@ -300,8 +374,9 @@ class PhotoIdentifyGUI(tk.Tk):
         self._resize_timer = None
         self.current_rotation = 0
 
-        # 检索页：文本模型选择（存 model_id）
+        # 检索页：文本处理/向量模型选择（存模型表主键，兼容旧版 model_id）
         self.search_model_id_var = tk.StringVar(value="")
+        self.search_embedding_id_var = tk.StringVar(value="")
         self.query_var = tk.StringVar(value="")
         self.search_mode_var = tk.StringVar(value="llm")
         self.search_limit_var = tk.StringVar(value="30")
@@ -310,9 +385,11 @@ class PhotoIdentifyGUI(tk.Tk):
         self.desc_var = tk.StringVar(value="")
         self.page_var = tk.StringVar(value="0 / 0")
 
-        # 扫描页：视觉模型选择（存 model_id）
+        # 扫描页：图片/向量模型选择（存模型表主键，兼容旧版 model_id）
         self.scan_model_id_var = tk.StringVar(value="")
+        self.scan_embedding_id_var = tk.StringVar(value="")
         self.enable_face_scan_var = tk.BooleanVar(value=True)
+        self._saved_tab_index = 0
 
         # Notebook (Tab) Container
         self.notebook = ttk.Notebook(self)
@@ -343,15 +420,16 @@ class PhotoIdentifyGUI(tk.Tk):
         self.notebook.add(self.model_tab, text="模型管理")
         self._init_model_tab()
 
+        # 绑定 Tab 切换事件
+        self._person_tab_loaded = False
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         # 加载上次保存的参数
         self._load_settings()
+        self._restore_saved_tab()
 
         # 关闭窗口时自动保存参数
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        
-        # 绑定 Tab 切换事件
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        self._person_tab_loaded = False
         
     def _on_tab_changed(self, event):
         selected_tab = self.notebook.select()
@@ -361,6 +439,24 @@ class PhotoIdentifyGUI(tk.Tk):
                 self._refresh_persons()
         elif selected_tab == str(self.favorite_tab):
             self._refresh_favorites()
+        try:
+            self._saved_tab_index = self.notebook.index(selected_tab)
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _restore_saved_tab(self) -> None:
+        """在窗口初始化完成后恢复上次关闭时所在的标签页。"""
+
+        try:
+            tab_count = self.notebook.index("end")
+            if tab_count <= 0:
+                return
+            target_index = min(max(int(self._saved_tab_index), 0), tab_count - 1)
+            self.notebook.select(target_index)
+            self._on_tab_changed(None)
+        except Exception:
+            pass
 
     @property
     def _settings_path(self) -> str:
@@ -377,9 +473,28 @@ class PhotoIdentifyGUI(tk.Tk):
         except Exception:
             return
 
+        if cfg.has_option("ui", "selected_tab"):
+            try:
+                self._saved_tab_index = cfg.getint("ui", "selected_tab")
+            except ValueError:
+                self._saved_tab_index = 0
+
         # Search tab
-        if cfg.has_option("search", "model_id"):
-            self._set_search_model_by_id(cfg.get("search", "model_id"))
+        search_model_ref = ""
+        if cfg.has_option("search", "model_ref"):
+            search_model_ref = cfg.get("search", "model_ref")
+        elif cfg.has_option("search", "model_id"):
+            search_model_ref = cfg.get("search", "model_id")
+        if search_model_ref:
+            self._set_search_model_by_id(search_model_ref)
+
+        search_embedding_ref = ""
+        if cfg.has_option("search", "embedding_ref"):
+            search_embedding_ref = cfg.get("search", "embedding_ref")
+        elif cfg.has_option("search", "embedding_id"):
+            search_embedding_ref = cfg.get("search", "embedding_id")
+        if search_embedding_ref:
+            self._set_search_embedding_by_id(search_embedding_ref)
         if cfg.has_option("search", "mode"):
             self.search_mode_var.set(cfg.get("search", "mode"))
         if cfg.has_option("search", "limit"):
@@ -396,8 +511,21 @@ class PhotoIdentifyGUI(tk.Tk):
             self.query_var.set(cfg.get("search", "last_query"))
 
         # Scan tab
-        if cfg.has_option("scan", "model_id"):
-            self._set_scan_model_by_id(cfg.get("scan", "model_id"))
+        scan_model_ref = ""
+        if cfg.has_option("scan", "model_ref"):
+            scan_model_ref = cfg.get("scan", "model_ref")
+        elif cfg.has_option("scan", "model_id"):
+            scan_model_ref = cfg.get("scan", "model_id")
+        if scan_model_ref:
+            self._set_scan_model_by_id(scan_model_ref)
+
+        scan_embedding_ref = ""
+        if cfg.has_option("scan", "embedding_ref"):
+            scan_embedding_ref = cfg.get("scan", "embedding_ref")
+        elif cfg.has_option("scan", "embedding_id"):
+            scan_embedding_ref = cfg.get("scan", "embedding_id")
+        if scan_embedding_ref:
+            self._set_scan_embedding_by_id(scan_embedding_ref)
         if cfg.has_option("scan", "db_path"):
             self.scan_db_var.set(cfg.get("scan", "db_path"))
         if cfg.has_option("scan", "transcoded_video_path") and hasattr(self, "transcoded_video_path_var"):
@@ -416,16 +544,35 @@ class PhotoIdentifyGUI(tk.Tk):
     def _save_settings(self):
         """将当前界面参数保存到 INI 文件。"""
         cfg = configparser.ConfigParser()
+        search_model = self._resolve_model_from_selection(self.search_model_id_var.get())
+        search_embedding_model = self._resolve_model_from_selection(self.search_embedding_id_var.get())
+        scan_model = self._resolve_model_from_selection(self.scan_model_id_var.get())
+        scan_embedding_model = self._resolve_model_from_selection(self.scan_embedding_id_var.get())
+        selected_tab = self._saved_tab_index
+        try:
+            selected_tab = self.notebook.index(self.notebook.select())
+        except Exception:
+            pass
+
+        cfg["ui"] = {
+            "selected_tab": str(selected_tab),
+        }
 
         cfg["search"] = {
-            "model_id": self.search_model_id_var.get(),
+            "model_ref": self.search_model_id_var.get(),
+            "model_id": search_model.get("model_id", "") if search_model else "",
+            "embedding_ref": self.search_embedding_id_var.get(),
+            "embedding_id": search_embedding_model.get("model_id", "") if search_embedding_model else "",
             "mode": self.search_mode_var.get(),
             "limit": self.search_limit_var.get(),
             "databases": "|".join(self.search_dbs),
             "last_query": self.query_var.get(),
         }
         cfg["scan"] = {
-            "model_id": self.scan_model_id_var.get(),
+            "model_ref": self.scan_model_id_var.get(),
+            "model_id": scan_model.get("model_id", "") if scan_model else "",
+            "embedding_ref": self.scan_embedding_id_var.get(),
+            "embedding_id": scan_embedding_model.get("model_id", "") if scan_embedding_model else "",
             "db_path": self.scan_db_var.get(),
             "transcoded_video_path": self.transcoded_video_path_var.get() if hasattr(self, "transcoded_video_path_var") else "",
             "paths": "|".join(self.scan_paths),
@@ -444,8 +591,10 @@ class PhotoIdentifyGUI(tk.Tk):
             self._save_settings()
         except Exception:
             pass
-        if hasattr(self, '_scan_cancel_event') and self._scan_cancel_event:
-            self._scan_cancel_event.set()
+        if getattr(self, "_active_task_cancel_event", None):
+            self._active_task_cancel_event.set()
+        if getattr(self, "_active_task_pause_event", None):
+            self._active_task_pause_event.clear()
         try:
             self._model_mgr.close()
         except Exception:
@@ -464,60 +613,162 @@ class PhotoIdentifyGUI(tk.Tk):
     # ── 工具方法：下拉列表数据填充 ──────────────────────────────
 
     def _get_text_models(self) -> list[dict]:
-        """获取可用于文本检索的模型列表（文本模型 + 多模态模型）。"""
+        """获取可用于文本处理的模型列表（具备文本能力的模型）。"""
         return self._model_mgr.get_models_for_usage("text")
 
-    def _get_vision_models(self) -> list[dict]:
-        """获取可用于视觉扫描的模型列表（视觉模型 + 多模态模型）。"""
+    def _get_image_models(self) -> list[dict]:
+        """获取可用于图片扫描的模型列表（具备图片能力的模型）。"""
         return self._model_mgr.get_models_for_usage("image")
+
+    def _get_embedding_models(self) -> list[dict]:
+        """获取可用于语义检索的向量模型列表。"""
+        return self._model_mgr.get_models_for_usage("embedding")
+
+    def _get_model_selection_key(self, model: dict) -> str:
+        """返回 GUI 持久化使用的模型选择键，优先使用模型表主键。"""
+
+        model_db_id = model.get("id")
+        if model_db_id is None:
+            return str(model.get("model_id", "")).strip()
+        return str(model_db_id)
+
+    def _resolve_model_from_selection(self, selection_value: str) -> dict | None:
+        """根据 GUI 持久化值解析出具体模型，兼容旧版直接保存 model_id 的配置。"""
+
+        normalized = str(selection_value or "").strip()
+        if not normalized:
+            return None
+
+        if normalized.isdigit():
+            model = self._model_mgr.get_model_by_id(int(normalized))
+            if model is not None:
+                return model
+
+        return self._model_mgr.get_model_by_model_id(normalized)
+
+    def _build_model_choice_map(self, models: list[dict]) -> dict[str, str]:
+        """为下拉框构建稳定且可区分的显示标签到选择键映射。"""
+
+        name_counts = Counter((str(model.get("name", "")).strip() or "未命名模型") for model in models)
+        choice_map: dict[str, str] = {}
+        for model in models:
+            base_name = str(model.get("name", "")).strip() or "未命名模型"
+            display_name = base_name
+            if name_counts[base_name] > 1:
+                caps = [c.strip() for c in str(model.get("type", "")).split(",") if c.strip()]
+                backend_label = "本地" if "local" in caps else "API"
+                display_name = f"{base_name} [{backend_label}]"
+            if display_name in choice_map:
+                display_name = f"{display_name} #{model.get('id', '?')}"
+            choice_map[display_name] = self._get_model_selection_key(model)
+        return choice_map
+
+    def _apply_model_combo_selection(
+        self,
+        combo: ttk.Combobox,
+        choice_map: dict[str, str],
+        selection_var: tk.StringVar,
+    ) -> None:
+        """将模型列表刷新到下拉框，并尽量保持当前选中项。"""
+
+        names = list(choice_map.keys())
+        combo["values"] = names
+
+        current_selection = selection_var.get().strip()
+        matched_name = None
+        resolved_model = self._resolve_model_from_selection(current_selection)
+        if resolved_model is not None:
+            resolved_key = self._get_model_selection_key(resolved_model)
+            matched_name = next((name for name, key in choice_map.items() if key == resolved_key), None)
+
+        if matched_name:
+            combo.set(matched_name)
+            selection_var.set(choice_map[matched_name])
+        elif names:
+            combo.set(names[0])
+            selection_var.set(choice_map[names[0]])
+        else:
+            combo.set("")
+            selection_var.set("")
 
     def _refresh_search_model_combo(self):
         """刷新检索页模型下拉列表。"""
         models = self._get_text_models()
-        self._search_model_map = {m["name"]: m["model_id"] for m in models}
-        names = list(self._search_model_map.keys())
-        self.search_model_combo["values"] = names
-        # 保持当前选中的 model_id
-        current_id = self.search_model_id_var.get()
-        matched_name = next((m["name"] for m in models if m["model_id"] == current_id), None)
-        if matched_name:
-            self.search_model_combo.set(matched_name)
-        elif names:
-            self.search_model_combo.set(names[0])
-            self.search_model_id_var.set(self._search_model_map[names[0]])
+        self._search_model_map = self._build_model_choice_map(models)
+        self._apply_model_combo_selection(
+            combo=self.search_model_combo,
+            choice_map=self._search_model_map,
+            selection_var=self.search_model_id_var,
+        )
+
+    def _refresh_search_embedding_combo(self):
+        """刷新检索页向量模型下拉列表。"""
+        models = self._get_embedding_models()
+        self._search_embedding_map = self._build_model_choice_map(models)
+        self._apply_model_combo_selection(
+            combo=self.search_embedding_combo,
+            choice_map=self._search_embedding_map,
+            selection_var=self.search_embedding_id_var,
+        )
 
     def _refresh_scan_model_combo(self):
-        """刷新扫描页模型下拉列表。"""
-        models = self._get_vision_models()
-        self._scan_model_map = {m["name"]: m["model_id"] for m in models}
-        names = list(self._scan_model_map.keys())
-        self.scan_model_combo["values"] = names
-        # 保持当前选中的 model_id
-        current_id = self.scan_model_id_var.get()
-        matched_name = next((m["name"] for m in models if m["model_id"] == current_id), None)
-        if matched_name:
-            self.scan_model_combo.set(matched_name)
-        elif names:
-            self.scan_model_combo.set(names[0])
-            self.scan_model_id_var.set(self._scan_model_map[names[0]])
+        """刷新扫描页图片模型下拉列表。"""
+        models = self._get_image_models()
+        self._scan_model_map = self._build_model_choice_map(models)
+        self._apply_model_combo_selection(
+            combo=self.scan_model_combo,
+            choice_map=self._scan_model_map,
+            selection_var=self.scan_model_id_var,
+        )
             
         self._update_scan_workers_display()
 
-    def _set_search_model_by_id(self, model_id: str):
-        """根据 model_id 设置检索页下拉选中项。"""
-        self.search_model_id_var.set(model_id)
+    def _refresh_scan_embedding_combo(self):
+        """刷新扫描页向量模型下拉列表。"""
+        models = self._get_embedding_models()
+        self._scan_embedding_map = self._build_model_choice_map(models)
+        self._apply_model_combo_selection(
+            combo=self.scan_embedding_combo,
+            choice_map=self._scan_embedding_map,
+            selection_var=self.scan_embedding_id_var,
+        )
+
+    def _set_search_model_by_id(self, selection_value: str):
+        """根据持久化值设置检索页下拉选中项，兼容旧版 model_id。"""
+        self.search_model_id_var.set(selection_value)
         self._refresh_search_model_combo()
 
-    def _set_scan_model_by_id(self, model_id: str):
-        """根据 model_id 设置扫描页下拉选中项。"""
-        self.scan_model_id_var.set(model_id)
+    def _set_search_embedding_by_id(self, selection_value: str):
+        """根据持久化值设置检索页向量下拉选中项，兼容旧版 model_id。"""
+        self.search_embedding_id_var.set(selection_value)
+        self._refresh_search_embedding_combo()
+
+    def _set_scan_model_by_id(self, selection_value: str):
+        """根据持久化值设置扫描页下拉选中项，兼容旧版 model_id。"""
+        self.scan_model_id_var.set(selection_value)
         self._refresh_scan_model_combo()
+
+    def _set_scan_embedding_by_id(self, selection_value: str):
+        """根据持久化值设置扫描页向量下拉选中项，兼容旧版 model_id。"""
+        self.scan_embedding_id_var.set(selection_value)
+        self._refresh_scan_embedding_combo()
+
+    def _on_search_embedding_selected(self, event=None):
+        name = self.search_embedding_combo.get()
+        if name and hasattr(self, "_search_embedding_map"):
+            self.search_embedding_id_var.set(self._search_embedding_map.get(name, ""))
 
     def _on_search_model_selected(self, event=None):
         """检索页下拉选择变化时，更新 model_id 变量。"""
         name = self.search_model_combo.get()
         if name and hasattr(self, "_search_model_map"):
             self.search_model_id_var.set(self._search_model_map.get(name, ""))
+
+    def _on_scan_embedding_selected(self, event=None):
+        name = self.scan_embedding_combo.get()
+        if name and hasattr(self, "_scan_embedding_map"):
+            self.scan_embedding_id_var.set(self._scan_embedding_map.get(name, ""))
+            self._update_scan_workers_display()
 
     def _on_scan_model_selected(self, event=None):
         """扫描页下拉选择变化时，更新 model_id 变量。"""
@@ -528,83 +779,126 @@ class PhotoIdentifyGUI(tk.Tk):
             
     def _update_scan_workers_display(self):
         """更新扫描页的并发线程数显示"""
-        model_id = self.scan_model_id_var.get()
-        if not model_id:
+        model_ref = self.scan_model_id_var.get()
+        embedding_model_ref = self.scan_embedding_id_var.get()
+        if not model_ref and not embedding_model_ref:
             self.scan_workers_var.set("并发: -")
             if hasattr(self, "transcoded_entry"):
                 self.transcoded_entry.config(state=tk.DISABLED)
                 self.transcoded_btn.config(state=tk.DISABLED)
             return
-            
-        model = self._model_mgr.get_model_by_model_id(model_id)
+
+        parts: list[str] = []
+        model = self._resolve_model_from_selection(model_ref) if model_ref else None
         if model:
             workers = model.get("workers", 4)
             caps = [c.strip() for c in model.get("type", "").split(",")]
+            parts.append(f"图片: {workers} 线程")
             if "video" in caps:
                 video_workers = model.get("video_workers", 3)
-                self.scan_workers_var.set(f"并发: {workers} 线程 | 视频: {video_workers} 线程")
+                parts.append(f"视频: {video_workers} 线程")
                 if hasattr(self, "transcoded_entry"):
                     self.transcoded_entry.config(state=tk.NORMAL)
                     self.transcoded_btn.config(state=tk.NORMAL)
             else:
-                self.scan_workers_var.set(f"并发: {workers} 线程")
                 if hasattr(self, "transcoded_entry"):
                     self.transcoded_entry.config(state=tk.DISABLED)
                     self.transcoded_btn.config(state=tk.DISABLED)
         else:
-            self.scan_workers_var.set("并发: -")
             if hasattr(self, "transcoded_entry"):
                 self.transcoded_entry.config(state=tk.DISABLED)
                 self.transcoded_btn.config(state=tk.DISABLED)
 
+        embedding_model = self._resolve_model_from_selection(embedding_model_ref) if embedding_model_ref else None
+        if embedding_model:
+            emb_workers = embedding_model.get("workers", 4)
+            emb_caps = [c.strip() for c in embedding_model.get("type", "").split(",")]
+            if "local" in emb_caps:
+                parts.append(f"本地向量: {emb_workers} 并发")
+            else:
+                parts.append("向量: API")
+
+        self.scan_workers_var.set(" | ".join(parts) if parts else "并发: -")
+
     # ── 获取当前模型的 API 参数 ──────────────────────────────────
+
+    def _get_model_runtime_params(self, model_id_var: tk.StringVar, usage_label: str) -> dict | None:
+        """获取指定模型变量对应的完整运行配置。"""
+
+        selection_value = model_id_var.get().strip()
+        if not selection_value:
+            messagebox.showwarning("警告", f"请在「模型管理」页添加{usage_label}，并选择一个模型！")
+            return None
+
+        model = self._resolve_model_from_selection(selection_value)
+        if not model:
+            messagebox.showwarning("警告", f"未找到模型 {selection_value!r} 的配置，请检查「模型管理」页。")
+            return None
+
+        workers = model.get("workers", 4)
+        video_workers = model.get("video_workers", 3)
+        caps = [c.strip() for c in model.get("type", "").split(",")]
+        backend = "local" if "local" in caps else "api"
+        is_local = bool(model.get("is_local"))
+        api_key = ""
+
+        if backend == "api" and model["api_key_var"].strip():
+            api_key = ModelManager.get_api_key_value(model["api_key_var"])
+            if not api_key:
+                messagebox.showwarning(
+                    "警告",
+                    f"未找到环境变量 {model['api_key_var']}！\n"
+                    f"请在「模型管理」页点击「⚙ 环境变量设置」进行配置。\n"
+                    f"设置后点击「🔄 刷新状态」即可，无需重启应用。"
+                )
+                return None
+
+        return {
+            "model_id": model["model_id"],
+            "base_url": model["base_url"],
+            "api_key": api_key,
+            "workers": workers,
+            "video_workers": video_workers,
+            "is_local": is_local,
+            "backend": backend,
+        }
 
     def _get_model_api_params(self, model_id_var: tk.StringVar, usage_label: str) -> tuple[str, str, str, int, int] | None:
         """获取指定模型变量对应的 (model_id, base_url, api_key, workers, video_workers)。
 
         Args:
             model_id_var: 存储当前选中 model_id 的 StringVar。
-            usage_label: 用于提示信息的描述，如 "文本模型" 或 "视觉模型"。
+            usage_label: 用于提示信息的描述，如 "包含文本能力的模型" 或 "包含图片能力的模型"。
 
         Returns:
             (model_id, base_url, api_key, workers, video_workers) 五元组，或失败时返回 None。
         """
-        model_id = model_id_var.get().strip()
-        if not model_id:
-            messagebox.showwarning("警告", f"请在「模型管理」页添加{usage_label}，并选择一个模型！")
+        runtime = self._get_model_runtime_params(model_id_var, usage_label)
+        if runtime is None:
             return None
-
-        model = self._model_mgr.get_model_by_model_id(model_id)
-        if not model:
-            messagebox.showwarning("警告", f"未找到模型 {model_id!r} 的配置，请检查「模型管理」页。")
-            return None
-
-        workers = model.get("workers", 4)
-        video_workers = model.get("video_workers", 3)
-
-        # 本地模型（如 Ollama）无需 API Key
-        if model.get("is_local"):
-            return model_id, model["base_url"], "", workers, video_workers
-
-        api_key = ModelManager.get_api_key_value(model["api_key_var"])
-        if not api_key:
-            messagebox.showwarning(
-                "警告",
-                f"未找到环境变量 {model['api_key_var']}！\n"
-                f"请在「模型管理」页点击「⚙ 环境变量设置」进行配置。\n"
-                f"设置后点击「🔄 刷新状态」即可，无需重启应用。"
-            )
-            return None
-
-        return model_id, model["base_url"], api_key, workers, video_workers
+        return (
+            runtime["model_id"],
+            runtime["base_url"],
+            runtime["api_key"],
+            runtime["workers"],
+            runtime["video_workers"],
+        )
 
     def _get_search_api_params(self) -> tuple[str, str, str, int, int] | None:
         """获取检索页当前选中模型的 (model_id, base_url, api_key, workers, video_workers)。"""
         return self._get_model_api_params(self.search_model_id_var, "包含文本能力的模型")
 
+    def _get_search_embedding_params(self) -> dict | None:
+        """获取检索页向量模型的完整运行配置。"""
+        return self._get_model_runtime_params(self.search_embedding_id_var, "向量模型(Embedding)")
+
     def _get_scan_api_params(self) -> tuple[str, str, str, int, int] | None:
         """获取扫描页当前选中模型的 (model_id, base_url, api_key, workers, video_workers)。"""
         return self._get_model_api_params(self.scan_model_id_var, "包含图片处理能力的模型")
+        
+    def _get_scan_embedding_params(self) -> dict | None:
+        """获取扫描页向量模型的完整运行配置。"""
+        return self._get_model_runtime_params(self.scan_embedding_id_var, "向量模型(Embedding)")
 
     # ── Tab 1: 图片检索 ──────────────────────────────────────────
 
@@ -612,13 +906,21 @@ class PhotoIdentifyGUI(tk.Tk):
         self.top_frame = ttk.Frame(self.search_tab, padding="10")
 
         # Row 0: 模型选择下拉
-        ttk.Label(self.top_frame, text="文本模型:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(self.top_frame, text="文本处理模型:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self._search_model_map = {}
         self.search_model_combo = ttk.Combobox(self.top_frame, state="readonly", width=40)
         self.search_model_combo.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
         self.search_model_combo.bind("<<ComboboxSelected>>", self._on_search_model_selected)
+        
+        ttk.Label(self.top_frame, text="向量模型:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        self._search_embedding_map = {}
+        self.search_embedding_combo = ttk.Combobox(self.top_frame, state="readonly", width=30)
+        self.search_embedding_combo.grid(row=0, column=3, sticky=tk.W, padx=5, pady=5)
+        self.search_embedding_combo.bind("<<ComboboxSelected>>", self._on_search_embedding_selected)
+
         # 初始化下拉选项
         self._refresh_search_model_combo()
+        self._refresh_search_embedding_combo()
 
         # Row 1: 检索数据库列表
         ttk.Label(self.top_frame, text="检索数据库:").grid(row=1, column=0, sticky=tk.W+tk.N, padx=5, pady=5)
@@ -748,56 +1050,84 @@ class PhotoIdentifyGUI(tk.Tk):
     def _init_scan_tab(self):
         self.scan_db_var = tk.StringVar(value=self.db_path)
         self.scan_paths = []
+        self._scan_task_generation = 0
+        self._active_task_kind = ""
+        self._active_task_label = ""
+        self._active_task_thread_ref = None
+        self._active_task_cancel_event = None
+        self._active_task_pause_event = None
+        self._active_task_restart_action = None
         
-        form_frame = ttk.Frame(self.scan_tab, padding="20")
-        form_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 视觉模型下拉
-        ttk.Label(form_frame, text="视觉模型:").grid(row=0, column=0, sticky=tk.W, pady=10)
-        self._scan_model_map = {}
-        self.scan_model_combo = ttk.Combobox(form_frame, state="readonly", width=40)
-        self.scan_model_combo.grid(row=0, column=1, sticky=tk.W, pady=10)
-        
-        self.scan_workers_var = tk.StringVar(value="并发: -")
-        ttk.Label(form_frame, textvariable=self.scan_workers_var, foreground="gray").grid(row=0, column=2, sticky=tk.W, padx=10, pady=10)
-        
-        self.scan_model_combo.bind("<<ComboboxSelected>>", self._on_scan_model_selected)
-        self._refresh_scan_model_combo()
-        
-        ttk.Label(form_frame, text="数据库路径:").grid(row=1, column=0, sticky=tk.W, pady=10)
-        ttk.Entry(form_frame, textvariable=self.scan_db_var, width=50).grid(row=1, column=1, sticky=tk.W, pady=10)
-        ttk.Button(form_frame, text="📂 浏览", command=self._browse_scan_db).grid(row=1, column=2, padx=10, sticky=tk.W, pady=10)
-        
-        ttk.Label(form_frame, text="扫描目录:").grid(row=2, column=0, sticky=tk.NW, pady=10)
-        
-        self.paths_listbox = tk.Listbox(form_frame, width=50, height=8)
-        self.paths_listbox.grid(row=2, column=1, sticky=tk.W, pady=10)
-        
-        btn_frame = ttk.Frame(form_frame)
-        btn_frame.grid(row=2, column=2, sticky=tk.NW, pady=10)
-        ttk.Button(btn_frame, text="➕ 添加目录", command=self.add_scan_path).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="➖ 移除选中", command=self.remove_scan_path).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_frame, text="🗑 清空列表", command=self.clear_scan_paths).pack(fill=tk.X, pady=2)
+        form_frame = ttk.Frame(self.scan_tab, padding=(18, 16, 18, 8))
+        form_frame.pack(fill=tk.X)
+        form_frame.grid_columnconfigure(1, weight=1)
 
-        # 转码后视频路径
+        # 1. 数据库路径
+        ttk.Label(form_frame, text="数据库路径:").grid(row=0, column=0, sticky=tk.W, pady=8)
+        ttk.Entry(form_frame, textvariable=self.scan_db_var, width=50).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=8)
+        ttk.Button(form_frame, text="📂 浏览", command=self._browse_scan_db).grid(row=0, column=3, padx=(10, 0), sticky=tk.W, pady=8)
+
+        # 2. 扫描目录 + 目录操作（含转码后视频路径）
+        ttk.Label(form_frame, text="扫描目录:").grid(row=1, column=0, sticky=tk.NW, pady=8)
+
+        scan_paths_frame = ttk.Frame(form_frame)
+        scan_paths_frame.grid(row=1, column=1, columnspan=3, sticky=tk.EW, pady=8)
+        scan_paths_frame.grid_columnconfigure(0, weight=1)
+
+        self.paths_listbox = tk.Listbox(scan_paths_frame, width=56, height=8)
+        self.paths_listbox.grid(row=0, column=0, sticky=tk.EW)
+
+        path_action_frame = ttk.Frame(scan_paths_frame)
+        path_action_frame.grid(row=0, column=1, sticky=tk.NW, padx=(12, 0))
+
+        ttk.Button(path_action_frame, text="➕ 添加目录", command=self.add_scan_path).pack(fill=tk.X, pady=2)
+        ttk.Button(path_action_frame, text="➖ 移除选中", command=self.remove_scan_path).pack(fill=tk.X, pady=2)
+        ttk.Button(path_action_frame, text="🗑 清空列表", command=self.clear_scan_paths).pack(fill=tk.X, pady=2)
+
         self.transcoded_video_path_var = tk.StringVar()
-        ttk.Label(form_frame, text="转码后视频路径:").grid(row=3, column=0, sticky=tk.W, pady=10)
+        ttk.Label(form_frame, text="转码后视频路径:").grid(row=2, column=0, sticky=tk.W, pady=(2, 8))
         self.transcoded_entry = ttk.Entry(form_frame, textvariable=self.transcoded_video_path_var, width=50)
-        self.transcoded_entry.grid(row=3, column=1, sticky=tk.W, pady=10)
+        self.transcoded_entry.grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=(2, 8))
         self.transcoded_btn = ttk.Button(form_frame, text="📂 浏览", command=self._browse_transcoded_path)
-        self.transcoded_btn.grid(row=3, column=2, padx=10, sticky=tk.W, pady=10)
-        
-        # 初始调用一次状态更新以设置转码路径输入框的 state
-        self._update_scan_workers_display()
+        self.transcoded_btn.grid(row=2, column=3, padx=(10, 0), sticky=tk.W, pady=(2, 8))
 
-        # 人脸扫描相关配置
-        face_frame = ttk.Frame(form_frame)
-        face_frame.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=10)
-        ttk.Checkbutton(face_frame, text="同时进行人物扫描 (初次加载可能较慢)", variable=self.enable_face_scan_var).pack(side=tk.LEFT)
-        
+        # 3. 模型选择行
+        model_row = ttk.Frame(form_frame)
+        model_row.grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(4, 4))
+
+        ttk.Label(model_row, text="图片+视频模型:").pack(side=tk.LEFT)
+        self._scan_model_map = {}
+        self.scan_model_combo = ttk.Combobox(model_row, state="readonly", width=30)
+        self.scan_model_combo.pack(side=tk.LEFT, padx=(6, 14))
+
+        ttk.Label(model_row, text="向量模型:").pack(side=tk.LEFT)
+        self.scan_workers_var = tk.StringVar(value="并发: -")
+        self._scan_embedding_map = {}
+        self.scan_embedding_combo = ttk.Combobox(model_row, state="readonly", width=26)
+        self.scan_embedding_combo.pack(side=tk.LEFT, padx=(6, 0))
+
+        # 3. 模型状态行
+        model_status_row = ttk.Frame(form_frame)
+        model_status_row.grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(0, 8))
+
         self.face_device_status_var = tk.StringVar(value="人脸引擎状态: 检测中...")
-        face_status_label = ttk.Label(face_frame, textvariable=self.face_device_status_var, foreground="green")
-        face_status_label.pack(side=tk.LEFT, padx=10)
+        face_status_label = ttk.Label(model_status_row, textvariable=self.face_device_status_var, foreground="green")
+        face_status_label.pack(side=tk.LEFT, padx=(0, 16))
+
+        self.scan_workers_label = ttk.Label(
+            model_status_row,
+            textvariable=self.scan_workers_var,
+            foreground="gray",
+            justify=tk.LEFT,
+            wraplength=420,
+        )
+        self.scan_workers_label.pack(side=tk.LEFT)
+
+        self.scan_model_combo.bind("<<ComboboxSelected>>", self._on_scan_model_selected)
+        self.scan_embedding_combo.bind("<<ComboboxSelected>>", self._on_scan_embedding_selected)
+        self._refresh_scan_model_combo()
+        self._refresh_scan_embedding_combo()
+        self._update_scan_workers_display()
         
         # 异步检测人脸设备状态，避免阻塞 UI
         def _check_face_device():
@@ -814,26 +1144,36 @@ class PhotoIdentifyGUI(tk.Tk):
         
         threading.Thread(target=_check_face_device, daemon=True).start()
 
-        self.scan_btn = ttk.Button(form_frame, text="▶ 开始扫描 (见下方日志)", command=self.start_scan)
-        self.scan_btn.grid(row=5, column=1, sticky=tk.EW, pady=20, ipady=5)
-
-        scan_ctrl_frame = ttk.Frame(form_frame)
-        scan_ctrl_frame.grid(row=5, column=2, sticky=tk.W, padx=10, pady=20)
-
-        self.restart_btn = ttk.Button(scan_ctrl_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
-        self.restart_btn.pack(side=tk.LEFT, padx=(0, 5), ipady=5)
-
-        self.stop_btn = ttk.Button(scan_ctrl_frame, text="⏹ 停止扫描", command=self.stop_scan, state=tk.DISABLED)
+        # 4. 操作按钮
+        action_frame = ttk.Frame(form_frame)
+        action_frame.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(8, 6))
+        self.scan_btn = ttk.Button(action_frame, text=f"▶ {IMAGE_EXTRACTION_LABEL}", command=self.start_scan)
+        self.scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.face_scan_btn = ttk.Button(action_frame, text=f"👤 {FACE_SCAN_LABEL}", command=self.start_face_scan)
+        self.face_scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.refresh_vectors_btn = ttk.Button(action_frame, text="♻ 刷新图片向量", command=self.refresh_image_embeddings)
+        self.refresh_vectors_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.pause_btn = ttk.Button(action_frame, text="⏸ 暂停扫描", command=self.toggle_pause_scan, state=tk.DISABLED)
+        self.pause_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.restart_btn = ttk.Button(action_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.stop_btn = ttk.Button(action_frame, text="⏹ 停止扫描", command=self.stop_scan, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, ipady=5)
-        
-        self._scan_cancel_event = None
-        self._scan_thread_ref = None
-        
-        self.scan_status_var = tk.StringVar(value="准备就绪")
-        ttk.Label(form_frame, textvariable=self.scan_status_var, foreground="blue").grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=5)
 
-        # 终端输出重定向区域
-        log_frame = ttk.LabelFrame(self.scan_tab, text="扫描日志", padding="5")
+        # 5. 提醒文案
+        self.scan_status_var = tk.StringVar(value="准备就绪")
+        self.scan_status_label = ttk.Label(
+            form_frame,
+            textvariable=self.scan_status_var,
+            foreground="blue",
+            justify=tk.LEFT,
+            wraplength=900,
+        )
+        self.scan_status_label.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(0, 4))
+        form_frame.bind("<Configure>", self._on_scan_form_configure)
+
+        # 6. 日志区域
+        log_frame = ttk.LabelFrame(self.scan_tab, text="任务日志", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Tools inside log_frame
@@ -844,6 +1184,14 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self.log_text = scrolledtext.ScrolledText(log_frame, state=tk.DISABLED, bg="black", fg="lightgreen", font=("Consolas", 10))
         self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+
+    def _on_scan_form_configure(self, event=None) -> None:
+        """根据扫描页容器宽度动态调整状态文案的自动换行宽度。"""
+
+        if not hasattr(self, "scan_status_label"):
+            return
+        width = getattr(event, "width", self.scan_tab.winfo_width())
+        self.scan_status_label.configure(wraplength=max(360, width - 40))
 
     # ── Tab 3: 人物管理 ──────────────────────────────────────────
 
@@ -970,12 +1318,11 @@ class PhotoIdentifyGUI(tk.Tk):
                         
                     img = None
                     try:
-                        file_path = p.get("path", "")
-                        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+                        file_path, actual_path = split_media_record_path(p.get("path"))
                         if actual_path and os.path.isfile(actual_path):
                             frame_bytes = get_image_frame_bytes(file_path)
                             pil_img = Image.open(io.BytesIO(frame_bytes))
-                            img = crop_and_circle_face(pil_img, p.get("bbox", "[]"), size=40)
+                            img = crop_and_circle_face(pil_img, p.get("bbox") or "[]", size=40)
                     except Exception as e:
                         print(f"Error loading face for {p.get('name')}: {e}")
                         
@@ -1182,12 +1529,11 @@ class PhotoIdentifyGUI(tk.Tk):
             for p in deleted_list:
                 img = None
                 try:
-                    file_path = p.get("path", "")
-                    actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+                    file_path, actual_path = split_media_record_path(p.get("path"))
                     if actual_path and os.path.isfile(actual_path):
                         frame_bytes = get_image_frame_bytes(file_path)
                         pil_img = Image.open(io.BytesIO(frame_bytes))
-                        img = crop_and_circle_face(pil_img, p.get("bbox", "[]"), size=40)
+                        img = crop_and_circle_face(pil_img, p.get("bbox") or "[]", size=40)
                 except Exception:
                     pass
                     
@@ -1353,8 +1699,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 if current_gen != self._gallery_gen:
                     break
                 
-                file_path = record.get("path", "")
-                actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+                file_path, actual_path = split_media_record_path(record.get("path"))
                 
                 img = None
                 try:
@@ -1537,7 +1882,7 @@ class PhotoIdentifyGUI(tk.Tk):
                     
                     # 重新生成左侧小头像
                     try:
-                        actual_path = new_path.split("#t=")[0] if "#t=" in new_path else new_path
+                        _, actual_path = split_media_record_path(new_path)
                         if os.path.isfile(actual_path):
                             frame_bytes = get_image_frame_bytes(new_path)
                             pil_img = Image.open(io.BytesIO(frame_bytes))
@@ -1596,26 +1941,14 @@ class PhotoIdentifyGUI(tk.Tk):
         from photo_identify.storage import Storage
         
         favs = []
-        try:
-            storage = Storage(self.db_path)
-            main_favs = storage.get_favorites()
-            for f in main_favs:
-                f["db_path"] = self.db_path
-            favs.extend(main_favs)
-            storage.close()
-        except Exception:
-            pass
-            
-        # 若配置了独立的扫描库，同时也加载扫描库里的收藏图片
-        scan_db = self.scan_db_var.get()
-        if scan_db and scan_db != self.db_path and os.path.exists(scan_db):
+        for db_path in self._get_favorite_db_paths():
             try:
-                storage_scan = Storage(scan_db)
-                scan_favs = storage_scan.get_favorites()
-                for f in scan_favs:
-                    f["db_path"] = scan_db
-                favs.extend(scan_favs)
-                storage_scan.close()
+                storage = Storage(db_path)
+                db_favs = storage.get_favorites()
+                for item in db_favs:
+                    item["db_path"] = db_path
+                favs.extend(db_favs)
+                storage.close()
             except Exception:
                 pass
                 
@@ -1644,32 +1977,17 @@ class PhotoIdentifyGUI(tk.Tk):
             messagebox.showerror("错误", f"导出失败: {e}")
 
     def _refresh_favorites(self):
-        if not self.db_path or not os.path.exists(self.db_path):
-            return
-            
         from photo_identify.storage import Storage
         favs = []
-        try:
-            storage = Storage(self.db_path)
-            main_favs = storage.get_favorites()
-            for f in main_favs:
-                f["db_path"] = self.db_path
-            favs.extend(main_favs)
-            storage.close()
-        except:
-            pass
-
-        # 若配置了独立的扫描库，同时也加载扫描库里的收藏图片
-        scan_db = self.scan_db_var.get()
-        if scan_db and scan_db != self.db_path and os.path.exists(scan_db):
+        for db_path in self._get_favorite_db_paths():
             try:
-                storage_scan = Storage(scan_db)
-                scan_favs = storage_scan.get_favorites()
-                for f in scan_favs:
-                    f["db_path"] = scan_db
-                favs.extend(scan_favs)
-                storage_scan.close()
-            except:
+                storage = Storage(db_path)
+                db_favs = storage.get_favorites()
+                for item in db_favs:
+                    item["db_path"] = db_path
+                favs.extend(db_favs)
+                storage.close()
+            except Exception:
                 pass
 
         # 重新按照 modified_time 降序排序所有合并的记录
@@ -1690,8 +2008,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 if current_gen != self._favorite_gen:
                     break
                     
-                file_path = record.get("path", "")
-                actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+                file_path, actual_path = split_media_record_path(record.get("path"))
                 img = None
                 try:
                     if os.path.isfile(actual_path):
@@ -1894,7 +2211,9 @@ class PhotoIdentifyGUI(tk.Tk):
 
         # 同步刷新两个下拉列表
         self._refresh_search_model_combo()
+        self._refresh_search_embedding_combo()
         self._refresh_scan_model_combo()
+        self._refresh_scan_embedding_combo()
 
     def _get_selected_model_db_id(self) -> int | None:
         """获取当前在 Treeview 中选中的数据库 id，未选中返回 None。"""
@@ -2066,35 +2385,278 @@ class PhotoIdentifyGUI(tk.Tk):
         if path:
             self.scan_db_var.set(path)
 
+    def _append_scan_log(self, message: str) -> None:
+        """向扫描日志框追加一段文本并滚动到末尾。"""
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, message)
+        self.log_text.configure(state=tk.DISABLED)
+        self.log_text.see(tk.END)
+
+    def _append_task_completion_log(self, task_label: str, summary: str, log_path: str = "") -> None:
+        """向扫描日志区追加明确的任务结束提示。"""
+
+        lines = ["", f"[{task_label}] {summary}"]
+        if log_path:
+            lines.append(f"[{task_label}] 日志文件: {log_path}")
+        self._append_scan_log("\n".join(lines) + "\n")
+
+    def _get_favorite_db_paths(self) -> list[str]:
+        """汇总收藏页应读取的数据库路径列表，并去重保序。"""
+
+        candidates = [self.db_path, self.scan_db_var.get(), *self.search_dbs]
+        resolved_paths: list[str] = []
+        seen: set[str] = set()
+        for db_path in candidates:
+            normalized = str(db_path or "").strip()
+            if not normalized or not os.path.exists(normalized) or normalized in seen:
+                continue
+            seen.add(normalized)
+            resolved_paths.append(normalized)
+        return resolved_paths
+
+    def _reset_scan_log(self, initial_text: str) -> None:
+        """清空扫描日志框并写入新的初始内容。"""
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.insert(tk.END, initial_text)
+        self.log_text.configure(state=tk.DISABLED)
+        self.log_text.see(tk.END)
+
+    def _has_running_scan_task(self) -> bool:
+        """判断扫描页是否存在正在执行的后台任务。"""
+        return bool(self._active_task_thread_ref and self._active_task_thread_ref.is_alive())
+
+    def _begin_scan_task(
+        self,
+        task_kind: str,
+        task_label: str,
+        thread: threading.Thread,
+        cancel_event: threading.Event,
+        pause_event: threading.Event,
+        restart_action,
+    ) -> int:
+        """注册当前激活的扫描页后台任务，并切换按钮状态。"""
+
+        self._scan_task_generation += 1
+        self._active_task_kind = task_kind
+        self._active_task_label = task_label
+        self._active_task_thread_ref = thread
+        self._active_task_cancel_event = cancel_event
+        self._active_task_pause_event = pause_event
+        self._active_task_restart_action = restart_action
+
+        self.scan_btn.config(state=tk.DISABLED)
+        self.face_scan_btn.config(state=tk.DISABLED)
+        self.refresh_vectors_btn.config(state=tk.DISABLED)
+        self.pause_btn.config(state=tk.NORMAL, text="⏸ 暂停扫描")
+        self.restart_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL)
+        return self._scan_task_generation
+
+    def _restore_scan_controls_after_task(self) -> None:
+        """将扫描页按钮恢复到空闲状态。"""
+        self._active_task_kind = ""
+        self._active_task_label = ""
+        self._active_task_thread_ref = None
+        self._active_task_cancel_event = None
+        self._active_task_pause_event = None
+        self._active_task_restart_action = None
+        self.scan_btn.config(state=tk.NORMAL)
+        self.face_scan_btn.config(state=tk.NORMAL)
+        self.refresh_vectors_btn.config(state=tk.NORMAL)
+        self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停扫描")
+        self.restart_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED)
+
+    def _finalize_scan_task(self, generation: int) -> None:
+        """仅在任务代际仍然有效时恢复扫描页按钮状态。"""
+
+        if generation == self._scan_task_generation:
+            self._restore_scan_controls_after_task()
+
+    def toggle_pause_scan(self) -> None:
+        """暂停或继续当前扫描页任务。"""
+
+        if not self._has_running_scan_task() or self._active_task_pause_event is None:
+            return
+
+        task_label = self._active_task_label or "当前任务"
+        if self._active_task_pause_event.is_set():
+            self._active_task_pause_event.clear()
+            self.pause_btn.config(text="⏸ 暂停扫描")
+            self.scan_status_var.set(f"{task_label}已继续。")
+            self._append_scan_log(f"\n[{task_label}] 已继续\n")
+        else:
+            self._active_task_pause_event.set()
+            self.pause_btn.config(text="▶ 继续扫描")
+            self.scan_status_var.set(f"{task_label}已暂停，等待继续...")
+            self._append_scan_log(f"\n[{task_label}] 已暂停，等待继续...\n")
+
+    def refresh_image_embeddings(self) -> None:
+        """基于当前数据库执行图片文本向量回填，并将日志输出到扫描日志区。"""
+        db_path = self.scan_db_var.get().strip()
+        if not db_path:
+            messagebox.showwarning("警告", "请先指定数据库路径！")
+            return
+
+        if not os.path.exists(db_path):
+            messagebox.showwarning("警告", f"数据库不存在：\n{db_path}")
+            return
+
+        if self._has_running_scan_task():
+            messagebox.showinfo("提示", "当前已有扫描或向量刷新任务正在执行，请等待其结束。")
+            return
+
+        emb_params = self._get_scan_embedding_params()
+        if emb_params is None:
+            return
+
+        emb_model_id = emb_params["model_id"]
+        emb_base_url = emb_params["base_url"]
+        emb_api_key = emb_params["api_key"]
+        emb_backend = emb_params["backend"]
+        emb_workers = emb_params["workers"]
+
+        self._save_settings()
+        self.scan_status_var.set("正在刷新图片向量，查看下方日志区...")
+        self._reset_scan_log(
+            f"[图片向量刷新] 准备中...\n[数据库] {db_path}\n[向量模型] {emb_model_id} ({emb_backend})\n"
+        )
+
+        cancel_event = threading.Event()
+        pause_event = threading.Event()
+
+        def _refresh_thread():
+            """在后台线程中执行向量回填任务。"""
+            from argparse import Namespace
+            from logging.handlers import RotatingFileHandler
+            from pathlib import Path
+
+            from data_migration.backfill_text_embeddings import (
+                DEFAULT_BATCH_SIZE,
+                DEFAULT_MAX_LENGTH,
+                run_migration,
+                validate_arguments,
+            )
+
+            root_logger = logging.getLogger()
+            root_logger.setLevel(logging.INFO)
+            old_handlers = root_logger.handlers[:]
+            for handler in old_handlers:
+                root_logger.removeHandler(handler)
+
+            gui_handler = TkTextLogHandler(self.log_text)
+            gui_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+            root_logger.addHandler(gui_handler)
+
+            log_path = os.path.splitext(db_path)[0] + ".embedding_backfill.log"
+            file_handler = RotatingFileHandler(
+                log_path, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
+            )
+            file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            root_logger.addHandler(file_handler)
+
+            try:
+                args = Namespace(
+                    db=Path(db_path),
+                    device="auto",
+                    batch_size=max(1, emb_workers) if emb_backend == "local" else DEFAULT_BATCH_SIZE,
+                    max_length=DEFAULT_MAX_LENGTH,
+                    model_cache_dir=None,
+                    limit=0,
+                    commit_every=100,
+                    dry_run=False,
+                    verbose=True,
+                    backend=emb_backend,
+                    embedding_model=emb_model_id,
+                    base_url=emb_base_url,
+                    api_key=emb_api_key,
+                    workers=emb_workers,
+                )
+                validate_arguments(args)
+                logging.info(
+                    "图片向量刷新启动 — 数据库: %s, 向量模型: %s, 后端: %s",
+                    db_path,
+                    emb_model_id,
+                    emb_backend,
+                )
+                exit_code = run_migration(args, cancel_event=cancel_event, pause_event=pause_event)
+                if cancel_event.is_set():
+                    self.after(0, lambda: self.scan_status_var.set("图片向量刷新已停止。"))
+                    self.after(0, lambda: self._append_task_completion_log("图片向量刷新", "已结束（用户停止）。", log_path))
+                elif exit_code == 0:
+                    self.after(0, lambda: self.scan_status_var.set("图片向量刷新完成，可去检索页使用语义检索。"))
+                    self.after(0, lambda: self._append_task_completion_log("图片向量刷新", "已结束（完成）。", log_path))
+                else:
+                    self.after(0, lambda: self.scan_status_var.set("图片向量刷新完成，但存在失败记录，请检查日志。"))
+                    self.after(0, lambda: self._append_task_completion_log("图片向量刷新", "已结束（存在失败记录）。", log_path))
+                    self.after(
+                        0,
+                        lambda: messagebox.showwarning("提示", "图片向量刷新已结束，但存在失败记录，请查看下方日志。"),
+                    )
+            except Exception as exc:
+                logging.exception("图片向量刷新失败")
+                self.after(0, lambda exc=exc: self.scan_status_var.set(f"图片向量刷新失败: {exc}"))
+                self.after(0, lambda exc=exc: self._append_task_completion_log("图片向量刷新", f"已结束（异常：{exc}）。"))
+                self.after(0, lambda exc=exc: messagebox.showerror("错误", f"图片向量刷新失败:\n{exc}"))
+            finally:
+                root_logger.removeHandler(gui_handler)
+                root_logger.removeHandler(file_handler)
+                file_handler.close()
+                for handler in old_handlers:
+                    root_logger.addHandler(handler)
+                self.after(0, lambda: self._finalize_scan_task(current_gen))
+
+        task = threading.Thread(target=_refresh_thread, daemon=True)
+        current_gen = self._begin_scan_task(
+            task_kind="embedding_refresh",
+            task_label="图片向量刷新",
+            thread=task,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            restart_action=self.refresh_image_embeddings,
+        )
+        task.start()
+
     def start_scan(self):
+        if self._has_running_scan_task():
+            messagebox.showinfo("提示", "当前已有扫描或向量刷新任务正在执行，请等待其结束。")
+            return
+
         if not self.scan_paths:
             messagebox.showwarning("警告", "请先添加要扫描的目录！")
             return
             
         self._save_settings()
         
-        # 从选中的视觉模型获取 API 参数
+        # 从选中的图片模型获取运行参数
         api_params = self._get_scan_api_params()
         if api_params is None:
             return
         model_id, base_url, api_key, current_workers, current_video_workers = api_params
-            
-        self.scan_btn.config(state=tk.DISABLED)
-        self.restart_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.scan_status_var.set("正在后台扫描，查看下方日志区...")
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.delete(1.0, tk.END)
-        face_hint = "准备中..." if self.enable_face_scan_var.get() else "未启用"
-        self.log_text.insert(tk.END, f"[信息扫描] 准备中...\n[人物识别] {face_hint}")
-        self.log_text.configure(state=tk.DISABLED)
         
-        self._scan_cancel_event = threading.Event()
-        # 代际计数器：防止旧线程的回调覆盖新扫描的 GUI 状态
-        if not hasattr(self, '_scan_generation'):
-            self._scan_generation = 0
-        self._scan_generation += 1
-        current_gen = self._scan_generation
+        # 获取 Embedding 模型参数
+        emb_params = self._get_scan_embedding_params()
+        if emb_params:
+            emb_model_id = emb_params["model_id"]
+            emb_base_url = emb_params["base_url"]
+            emb_api_key = emb_params["api_key"]
+            emb_backend = emb_params["backend"]
+            emb_workers = emb_params["workers"]
+        else:
+            emb_model_id, emb_base_url, emb_api_key = "", "", ""
+            emb_backend, emb_workers = "", 1
+            
+        self.scan_status_var.set("正在执行图片/视频信息提取，查看下方日志区...")
+        embedding_hint = f"{emb_model_id} ({emb_backend})" if emb_model_id else "未启用"
+        self._reset_scan_log(
+            f"[{IMAGE_EXTRACTION_LABEL}] 准备中...\n"
+            f"[{FACE_SCAN_LABEL}] 已独立，可按需单独运行\n"
+            f"[向量模型] {embedding_hint}\n"
+        )
+
+        cancel_event = threading.Event()
+        pause_event = threading.Event()
         
         def _scan_thread():
             import logging
@@ -2113,7 +2675,7 @@ class PhotoIdentifyGUI(tk.Tk):
             ))
             root_logger.addHandler(console_handler)
 
-            log_path = os.path.splitext(self.scan_db_var.get())[0] + ".log"
+            log_path = os.path.splitext(self.scan_db_var.get())[0] + ".image_extract.log"
             file_handler = RotatingFileHandler(
                 log_path, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8"
             )
@@ -2126,11 +2688,11 @@ class PhotoIdentifyGUI(tk.Tk):
             llm_writer = TkLineWriter(self.log_text, 1)
             face_writer = TkLineWriter(self.log_text, 2)
 
-            logging.info("扫描启动 — 模型: %s, 接口: %s, 并发: %d, 视频并发: %d", model_id, base_url, current_workers, current_video_workers)
+            logging.info("图片/视频信息提取启动 — 模型: %s, 接口: %s, 并发: %d, 视频并发: %d", model_id, base_url, current_workers, current_video_workers)
 
             try:
                 # 判断当前模型是否支持视频
-                model_data = self._model_mgr.get_model_by_model_id(model_id)
+                model_data = self._resolve_model_from_selection(self.scan_model_id_var.get())
                 supports_video = False
                 if model_data:
                     caps = [c.strip() for c in model_data.get("type", "").split(",")]
@@ -2145,32 +2707,42 @@ class PhotoIdentifyGUI(tk.Tk):
                     rpm_limit=DEFAULT_RPM_LIMIT,
                     tpm_limit=DEFAULT_TPM_LIMIT,
                     workers=current_workers,
-                    cancel_event=self._scan_cancel_event,
-                    enable_face_scan=self.enable_face_scan_var.get(),
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    enable_face_scan=False,
                     progress_writers=(llm_writer, face_writer),
                     video_workers=current_video_workers,
                     model_supports_video=supports_video,
                     transcoded_video_path=self.transcoded_video_path_var.get().strip() if hasattr(self, "transcoded_video_path_var") else "",
+                    embedding_api_key=emb_api_key,
+                    embedding_base_url=emb_base_url,
+                    embedding_model=emb_model_id,
+                    embedding_backend=emb_backend,
+                    embedding_workers=emb_workers,
                 )
                 # 只有当前代际仍然有效时才更新状态
-                if current_gen == self._scan_generation:
-                    if self._scan_cancel_event and not self._scan_cancel_event.is_set():
-                        self.after(0, lambda: self.scan_status_var.set("扫描完成！可以去搜索页检索了。"))
-                        def _append_summary(stats=result_stats):
+                if current_gen == self._scan_task_generation:
+                    if cancel_event.is_set():
+                        self.after(0, lambda: self.scan_status_var.set("图片/视频信息提取已停止。"))
+                        self.after(0, lambda: self._append_task_completion_log(IMAGE_EXTRACTION_LABEL, "已结束（用户停止）。", log_path))
+                    else:
+                        self.after(0, lambda: self.scan_status_var.set("图片/视频信息提取完成，可以去检索页检索了。"))
+                        def _append_summary(stats=result_stats or {}):
                             self.log_text.configure(state=tk.NORMAL)
                             self.log_text.insert(tk.END, f"\n\n✨ 所有流水线处理完毕！\n"
-                                f"   - [信息扫描] 耗时 {stats.get('llm_cost', 0):.1f}s, 共扫描 {stats.get('total', 0)} 张图像\n"
-                                f"   - [人物识别] 耗时 {stats.get('face_cost', 0):.1f}s, 共识别出 {stats.get('face_found', 0)} 张含人脸\n"
-                                f"   - 扫描与聚类总耗时: {stats.get('total_cost', 0):.1f}s\n\n")
+                                f"   - [{IMAGE_EXTRACTION_LABEL}] 耗时 {stats.get('llm_cost', 0):.1f}s, 共扫描 {stats.get('total', 0)} 张图像\n"
+                                f"   - 跳过 {stats.get('skipped', 0)} 张，失败 {stats.get('failed', 0)} 张\n"
+                                f"   - 总耗时: {stats.get('total_cost', 0):.1f}s\n"
+                                f"   - 日志文件: {log_path}\n\n")
                             self.log_text.configure(state=tk.DISABLED)
                             self.log_text.see(tk.END)
                         self.after(0, _append_summary)
-                    else:
-                        self.after(0, lambda: self.scan_status_var.set("扫描已中止。"))
+                        self.after(0, lambda: self._append_task_completion_log(IMAGE_EXTRACTION_LABEL, "已结束（完成）。", log_path))
             except Exception as e:
-                if current_gen == self._scan_generation:
-                    self.after(0, lambda e=e: self.scan_status_var.set(f"扫描出错: {e}"))
-                    self.after(0, lambda e=e: messagebox.showerror("错误", f"扫描异常:\n{e}"))
+                if current_gen == self._scan_task_generation:
+                    self.after(0, lambda e=e: self.scan_status_var.set(f"图片/视频信息提取出错: {e}"))
+                    self.after(0, lambda e=e: self._append_task_completion_log(IMAGE_EXTRACTION_LABEL, f"已结束（异常：{e}）。"))
+                    self.after(0, lambda e=e: messagebox.showerror("错误", f"图片/视频信息提取异常:\n{e}"))
             finally:
                 root_logger.removeHandler(console_handler)
                 root_logger.removeHandler(file_handler)
@@ -2179,36 +2751,160 @@ class PhotoIdentifyGUI(tk.Tk):
                     root_logger.addHandler(h)
                 
                 # 只有当前代际仍然有效时才恢复按钮状态
-                if current_gen == self._scan_generation:
-                    self.after(0, lambda: self.scan_btn.config(state=tk.NORMAL))
-                    self.after(0, lambda: self.restart_btn.config(state=tk.DISABLED))
-                    self.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+                self.after(0, lambda: self._finalize_scan_task(current_gen))
                 
         t = threading.Thread(target=_scan_thread, daemon=True)
-        self._scan_thread_ref = t
+        current_gen = self._begin_scan_task(
+            task_kind="image_extract",
+            task_label=IMAGE_EXTRACTION_LABEL,
+            thread=t,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            restart_action=self.start_scan,
+        )
         t.start()
+
+    def start_face_scan(self):
+        """独立启动人物扫描任务。"""
+
+        if self._has_running_scan_task():
+            messagebox.showinfo("提示", "当前已有任务正在执行，请等待其结束。")
+            return
+
+        if not self.scan_paths:
+            messagebox.showwarning("警告", "请先添加要扫描的目录！")
+            return
+
+        db_path = self.scan_db_var.get().strip()
+        if not db_path:
+            messagebox.showwarning("警告", "请先指定数据库路径！")
+            return
+
+        self._save_settings()
+        model_data = self._resolve_model_from_selection(self.scan_model_id_var.get())
+        face_workers = max(1, int(model_data.get("workers", DEFAULT_WORKERS))) if model_data else max(1, DEFAULT_WORKERS)
+
+        self.scan_status_var.set("正在执行人物扫描，查看下方日志区...")
+        self._reset_scan_log(
+            f"[{FACE_SCAN_LABEL}] 准备中...\n"
+            f"[数据库] {db_path}\n"
+            f"[并发线程] {face_workers}\n"
+        )
+
+        cancel_event = threading.Event()
+        pause_event = threading.Event()
+
+        def _face_scan_thread():
+            from logging.handlers import RotatingFileHandler
+
+            root_logger = logging.getLogger()
+            root_logger.setLevel(logging.INFO)
+            old_handlers = root_logger.handlers[:]
+            for handler in old_handlers:
+                root_logger.removeHandler(handler)
+
+            console_handler = logging.StreamHandler(sys.__stdout__)
+            console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+            root_logger.addHandler(console_handler)
+
+            log_path = os.path.splitext(db_path)[0] + ".face_scan.log"
+            file_handler = RotatingFileHandler(log_path, maxBytes=1024 * 1024, backupCount=1, encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            root_logger.addHandler(file_handler)
+
+            face_writer = TkLineWriter(self.log_text, 1)
+            try:
+                logging.info("人物扫描启动 — 数据库: %s, 并发: %d", db_path, face_workers)
+                result_stats = scan_faces(
+                    paths=self.scan_paths,
+                    db_path=db_path,
+                    workers=face_workers,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    progress_writer=face_writer,
+                )
+                if current_gen == self._scan_task_generation:
+                    if cancel_event.is_set():
+                        self.after(0, lambda: self.scan_status_var.set("人物扫描已停止。"))
+                        self.after(0, lambda: self._append_task_completion_log(FACE_SCAN_LABEL, "已结束（用户停止）。", log_path))
+                    else:
+                        self.after(0, lambda: self.scan_status_var.set("人物扫描完成，可切换到人物管理查看。"))
+                        def _append_summary(stats=result_stats or {}):
+                            self.log_text.configure(state=tk.NORMAL)
+                            self.log_text.insert(tk.END, f"\n\n✨ 人物扫描处理完毕！\n"
+                                f"   - [{FACE_SCAN_LABEL}] 处理 {stats.get('processed', 0)} 张\n"
+                                f"   - 跳过 {stats.get('skipped', 0)} 张，失败 {stats.get('failed', 0)} 张\n"
+                                f"   - 含人脸图片 {stats.get('face_found', 0)} 张\n"
+                                f"   - 总耗时: {stats.get('total_cost', 0):.1f}s\n"
+                                f"   - 日志文件: {log_path}\n\n")
+                            self.log_text.configure(state=tk.DISABLED)
+                            self.log_text.see(tk.END)
+                        self.after(0, _append_summary)
+                        self.after(0, lambda: self._append_task_completion_log(FACE_SCAN_LABEL, "已结束（完成）。", log_path))
+            except Exception as exc:
+                if current_gen == self._scan_task_generation:
+                    self.after(0, lambda exc=exc: self.scan_status_var.set(f"人物扫描出错: {exc}"))
+                    self.after(0, lambda exc=exc: self._append_task_completion_log(FACE_SCAN_LABEL, f"已结束（异常：{exc}）。"))
+                    self.after(0, lambda exc=exc: messagebox.showerror("错误", f"人物扫描异常:\n{exc}"))
+            finally:
+                root_logger.removeHandler(console_handler)
+                root_logger.removeHandler(file_handler)
+                file_handler.close()
+                for handler in old_handlers:
+                    root_logger.addHandler(handler)
+                self.after(0, lambda: self._finalize_scan_task(current_gen))
+
+        task = threading.Thread(target=_face_scan_thread, daemon=True)
+        current_gen = self._begin_scan_task(
+            task_kind="face_scan",
+            task_label=FACE_SCAN_LABEL,
+            thread=task,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            restart_action=self.start_face_scan,
+        )
+        task.start()
 
     def restart_scan(self):
         """中止当前扫描并重新启动。"""
-        if self._scan_cancel_event:
-            self._scan_cancel_event.set()
-        self.scan_status_var.set("正在停止当前扫描，请稍候...")
+        if not self._has_running_scan_task() or self._active_task_cancel_event is None or self._active_task_restart_action is None:
+            return
+
+        task_label = self._active_task_label or "当前任务"
+        self._active_task_cancel_event.set()
+        if self._active_task_pause_event is not None:
+            self._active_task_pause_event.clear()
+        self.scan_status_var.set(f"正在重启{task_label}，请稍候...")
+        self._append_scan_log(f"\n[{task_label}] 正在重启，等待当前批次安全结束...\n")
+        self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停扫描")
         self.restart_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.DISABLED)
+        running_thread = self._active_task_thread_ref
+        restart_action = self._active_task_restart_action
 
         def _wait_and_restart():
-            # 等待旧线程真正结束（最多 30 秒）
-            if self._scan_thread_ref and self._scan_thread_ref.is_alive():
-                self._scan_thread_ref.join(timeout=30)
-            self.after(0, self.start_scan)
+            if running_thread and running_thread.is_alive():
+                running_thread.join(timeout=120)
+            if running_thread and running_thread.is_alive():
+                self.after(0, lambda: self.scan_status_var.set(f"{task_label}仍在安全停止中，请稍后再试。"))
+                self.after(0, lambda: messagebox.showwarning("提示", f"{task_label}尚未完全停止，暂时无法重启。"))
+                return
+            self.after(0, restart_action)
 
         threading.Thread(target=_wait_and_restart, daemon=True).start()
 
     def stop_scan(self):
         """停止当前扫描（不重启）。"""
-        if self._scan_cancel_event:
-            self._scan_cancel_event.set()
-        self.scan_status_var.set("正在停止扫描...")
+        if not self._has_running_scan_task() or self._active_task_cancel_event is None:
+            return
+
+        task_label = self._active_task_label or "当前任务"
+        self._active_task_cancel_event.set()
+        if self._active_task_pause_event is not None:
+            self._active_task_pause_event.clear()
+        self.scan_status_var.set(f"正在停止{task_label}...")
+        self._append_scan_log(f"\n[{task_label}] 正在停止，等待当前批次安全结束...\n")
+        self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停扫描")
         self.stop_btn.config(state=tk.DISABLED)
         self.restart_btn.config(state=tk.DISABLED)
 
@@ -2268,13 +2964,25 @@ class PhotoIdentifyGUI(tk.Tk):
         is_llm_mode = (self.search_mode_var.get() == "llm")
         
         if is_llm_mode:
-            # 从选中的文本模型获取 API 参数
+            # 从选中的文本处理模型获取运行参数（用于 rerank）
             api_params = self._get_search_api_params()
             if api_params is None:
                 return
             model_id, base_url, api_key, _, _ = api_params
+            
+            # 获取 Embedding 模型参数
+            emb_params = self._get_search_embedding_params()
+            if emb_params is None:
+                return
+            emb_model_id = emb_params["model_id"]
+            emb_base_url = emb_params["base_url"]
+            emb_api_key = emb_params["api_key"]
+            emb_backend = emb_params["backend"]
+            emb_workers = emb_params["workers"]
         else:
             model_id, base_url, api_key = "", "", ""
+            emb_model_id, emb_base_url, emb_api_key = "", "", ""
+            emb_backend, emb_workers = "", 1
 
         self.toggle_state(tk.DISABLED)
         if is_llm_mode:
@@ -2305,6 +3013,11 @@ class PhotoIdentifyGUI(tk.Tk):
                     base_url=base_url,
                     model=model_id,
                     rerank=is_llm_mode,
+                    embedding_model=emb_model_id,
+                    embedding_base_url=emb_base_url,
+                    embedding_api_key=emb_api_key,
+                    embedding_backend=emb_backend,
+                    embedding_workers=emb_workers,
                 )
                 elapsed = _time.perf_counter() - t0
                 self.after(0, self._on_search_done, results, None, elapsed, warnings)
@@ -2373,14 +3086,14 @@ class PhotoIdentifyGUI(tk.Tk):
                 if current_gen != self._thumbnail_gen:
                     break
                 
-                file_path = record.get("path", "")
-                actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+                file_path, actual_path = split_media_record_path(record.get("path"))
                 
                 img = None
                 try:
                     if os.path.isfile(actual_path):
                         frame_bytes = get_image_frame_bytes(file_path)
                         img = Image.open(io.BytesIO(frame_bytes))
+                        img = ImageOps.exif_transpose(img)
                         if img.mode != 'RGB':
                             img = img.convert('RGB')
                         img.thumbnail((150, 150), Image.Resampling.LANCZOS)
@@ -2582,7 +3295,7 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _load_and_draw_image(self, file_path: str):
         # 处理带有 "#t=" 等后缀的视频文件路径
-        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+        file_path, actual_path = split_media_record_path(file_path)
 
         if not os.path.isfile(actual_path):
             self.canvas.delete("all")
@@ -2749,7 +3462,7 @@ class PhotoIdentifyGUI(tk.Tk):
             
             record["is_favorite"] = 1 if new_fav else 0
             
-            # 更新视觉
+            # 更新图片
             if new_fav:
                 self.canvas.itemconfigure(shadow_id, text="★", state="normal")
                 self.canvas.itemconfigure(star_id, text="★", fill="#e3b341", state="normal")
@@ -2783,7 +3496,7 @@ class PhotoIdentifyGUI(tk.Tk):
         if not file_path:
             return
             
-        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+        _, actual_path = split_media_record_path(file_path)
         if not os.path.exists(actual_path):
             messagebox.showerror("错误", "文件不存在！")
             return
@@ -2809,7 +3522,7 @@ class PhotoIdentifyGUI(tk.Tk):
             return
             
         # 处理带有 "#t=" 等后缀的视频文件路径
-        actual_path = file_path.split("#t=")[0] if "#t=" in file_path else file_path
+        _, actual_path = split_media_record_path(file_path)
         
         if not os.path.exists(actual_path):
             messagebox.showerror("错误", "文件不存在！")

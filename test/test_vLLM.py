@@ -42,7 +42,7 @@ async def process_task(sem, session, filename, results):
             img_bytes = f.read()
         
         start = time.perf_counter()
-        # 调用你项目中的多模态解析逻辑
+        # 调用项目中的图片分析逻辑
         res = await async_call_image_model(
             image_bytes=img_bytes, 
             session=session,
