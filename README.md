@@ -90,18 +90,20 @@ export SILICONFLOW_API_KEY="您的_API_KEY"
 uv run python -m photo_identify gui
 ```
 
+- ****所有交互都可以在GUI界面完成，以下非开发需求无需再看****
+
 ### 2. 使用命令行 (CLI) 扫描图片/视频目录
 
 将指定路径（支持多个目录）下的所有图片和视频扫描入库：
 
 > **💡 提示：扫描视频前建议执行视频压缩**
 > 如果您的目录中包含大量原画质视频，建议在扫描前先使用压缩工具对视频进行压缩或转码。因为大模型对视频的理解分析存在大小限制，提前压缩不仅能大幅减少传输时间和 Token 消耗，还能避免扫描大视频时遇到 API 限制或由于读取过大文件导致的内存和性能瓶颈。
-> 
+>
 > 您可以执行以下命令使用项目中附带的压缩工具（自动遍历处理您的视频目录）：
+>
 > ```bash
 > uv run python src/video_edit/video_compression.py
 > ```
-
 
 ```bash
 uv run python -m photo_identify scan --path "D:\Pictures" "E:\Downloads\Images"
@@ -153,12 +155,3 @@ uv run python -m photo_identify import-json --input photo_analysis.json
 ## 数据存储
 
 默认在项目根目录生成持久化的 `photo_identify.db` SQLite 数据库文件。你可以通过 `--db` 参数将数据库放置到其他存储路径。
-
-### 隐私与开源注意事项
-
-- 本地数据库（`*.db/*.sqlite*`）、运行日志（`*.log`）、GUI 配置文件（`photo_identify_gui.ini`）不应上传到公开仓库。
-- 如果你有自定义的内部需求文档或图片样本，请确保它们未被 Git 跟踪后再发布。
-
-GPU加速人物扫描：
-安装cuda_12.8.0_571.96_windows.exe，程序会自动添加系统变量
-安装cudnn_9.19.1_windows_x86_64.exe，并将C:\Program Files\NVIDIA\CUDNN\v9.19\bin\12.9\x64添加到系统环境变量的路径中
