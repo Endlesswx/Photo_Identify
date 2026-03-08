@@ -1,8 +1,10 @@
 import configparser
-from collections import Counter
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import math
 import logging
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -10,11 +12,22 @@ import time
 import io
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import scrolledtext
-
 from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
 
+from photo_identify.cache_manager import (
+    DEFAULT_CACHE_DIR,
+    DEFAULT_CACHE_MAX_SIZE_MB,
+    build_thumbnail_jpeg_bytes_from_frame_bytes,
+    configure_thumbnail_cache,
+    format_bytes,
+    get_thumbnail_cache,
+    has_cached_thumbnail,
+    load_cached_face_avatar_image,
+    load_cached_thumbnail_image,
+    warm_cached_thumbnail_encoded_bytes,
+)
 from photo_identify.image_utils import get_image_frame_bytes, get_video_duration
 from photo_identify.config import (
     DEFAULT_DB_PATH,
@@ -392,6 +405,27 @@ class PhotoIdentifyGUI(tk.Tk):
         self.enable_face_scan_var = tk.BooleanVar(value=True)
         self._saved_tab_index = 0
 
+        # 缓存管理
+        self.cache_dir_var = tk.StringVar(value=str(DEFAULT_CACHE_DIR))
+        self.cache_max_size_value_var = tk.StringVar(value="1")
+        self.cache_max_size_unit_var = tk.StringVar(value="GB")
+        self.cache_rebuild_workers_var = tk.StringVar(value=str(max(2, min((os.cpu_count() or 8), 8))))
+        self.cache_usage_var = tk.StringVar(value=f"已用: 0B / {format_bytes(DEFAULT_CACHE_MAX_SIZE_MB * 1024 * 1024)}")
+        self.cache_rebuild_var = tk.StringVar(value="等待继续")
+        self.cache_eta_var = tk.StringVar(value="预计剩余: --")
+        self.cache_action_status_var = tk.StringVar(value="缓存设置已就绪")
+        self._cache_usage_refresh_gen = 0
+        self._cache_rebuild_running = False
+        self._cache_rebuild_pause_event = threading.Event()
+        self._cache_rebuild_pause_started_at: float | None = None
+        self._cache_rebuild_paused_seconds = 0.0
+        self._cache_rebuild_started_at = 0.0
+        self._cache_rebuild_initial_completed = 0
+        self._cache_rebuild_completed = 0
+        self._cache_rebuild_total = 0
+        self._cache_limit_bytes = DEFAULT_CACHE_MAX_SIZE_MB * 1024 * 1024
+        self._apply_cache_settings_from_values(save=False, refresh_usage=False)
+
         # Notebook (Tab) Container
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -420,6 +454,11 @@ class PhotoIdentifyGUI(tk.Tk):
         self.model_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.model_tab, text="模型管理")
         self._init_model_tab()
+
+        # Tab 5: 缓存管理
+        self.cache_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.cache_tab, text="缓存管理")
+        self._init_cache_tab()
 
         # 绑定 Tab 切换事件
         self._person_tab_loaded = False
@@ -459,6 +498,8 @@ class PhotoIdentifyGUI(tk.Tk):
                 self._favorite_tab_loaded = True
             else:
                 self._refresh_favorites()
+        elif tab_name == "缓存管理":
+            self._refresh_cache_usage_async()
         try:
             self._saved_tab_index = self.notebook.index(selected_tab)
             self._save_settings()
@@ -487,10 +528,12 @@ class PhotoIdentifyGUI(tk.Tk):
         """从 INI 文件加载上次保存的界面参数。"""
         cfg = configparser.ConfigParser()
         if not os.path.exists(self._settings_path):
+            self._apply_cache_settings_from_values(save=True, refresh_usage=False)
             return
         try:
             cfg.read(self._settings_path, encoding="utf-8")
         except Exception:
+            self._apply_cache_settings_from_values(save=True, refresh_usage=False)
             return
 
         if cfg.has_option("ui", "selected_tab"):
@@ -565,6 +608,17 @@ class PhotoIdentifyGUI(tk.Tk):
         if cfg.has_option("scan", "enable_face_scan"):
             self.enable_face_scan_var.set(cfg.getboolean("scan", "enable_face_scan"))
 
+        if cfg.has_option("cache", "path"):
+            self.cache_dir_var.set(cfg.get("cache", "path"))
+        if cfg.has_option("cache", "max_size_value"):
+            self.cache_max_size_value_var.set(cfg.get("cache", "max_size_value"))
+        if cfg.has_option("cache", "max_size_unit"):
+            self.cache_max_size_unit_var.set(cfg.get("cache", "max_size_unit"))
+        if cfg.has_option("cache", "rebuild_workers"):
+            self.cache_rebuild_workers_var.set(cfg.get("cache", "rebuild_workers"))
+
+        self._apply_cache_settings_from_values(save=False, refresh_usage=False)
+
     def _save_settings(self):
         """将当前界面参数保存到 INI 文件。"""
         cfg = configparser.ConfigParser()
@@ -603,6 +657,12 @@ class PhotoIdentifyGUI(tk.Tk):
             "transcoded_video_path": self.transcoded_video_path_var.get() if hasattr(self, "transcoded_video_path_var") else "",
             "paths": "|".join(self.scan_paths),
             "enable_face_scan": str(self.enable_face_scan_var.get()),
+        }
+        cfg["cache"] = {
+            "path": self.cache_dir_var.get(),
+            "max_size_value": self.cache_max_size_value_var.get(),
+            "max_size_unit": self.cache_max_size_unit_var.get(),
+            "rebuild_workers": self.cache_rebuild_workers_var.get(),
         }
 
         try:
@@ -1329,87 +1389,138 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _init_person_tab(self):
         """初始化人物管理标签页。"""
-        # 顶部工具栏
         toolbar = ttk.Frame(self.person_tab, padding=(10, 8, 10, 4))
         toolbar.pack(fill=tk.X)
 
         ttk.Button(toolbar, text="🔄 刷新列表", command=self._refresh_persons).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="🔀 人物合并", command=self._open_merge_person_dialog).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="🗑 人物回收站", command=self._show_trash_bin).pack(side=tk.LEFT, padx=4)
-        
+
         self.person_status_var = tk.StringVar(value="准备就绪")
         ttk.Label(toolbar, textvariable=self.person_status_var, foreground="blue").pack(side=tk.LEFT, padx=20)
-        
-        # 左右分割面板
+
         paned = ttk.PanedWindow(self.person_tab, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # 左侧：人物列表视图 (使用 Canvas 实现可滚动的 Frame 列表)
+
         left_container = ttk.Frame(paned)
-        paned.add(left_container, weight=0) # weight=0 意味着保持请求的宽度不被拉伸
-        
-        self.person_canvas = tk.Canvas(left_container, bg=getattr(self, "_bg_color", "#f0f0f0"), highlightthickness=0, width=190)
-        vsb_left = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=self.person_canvas.yview)
-        self.person_canvas.configure(yscrollcommand=vsb_left.set)
-        
-        self.person_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb_left.pack(side=tk.RIGHT, fill=tk.Y)
-        
+        paned.add(left_container, weight=0)
+
+        left_list_body = ttk.Frame(left_container)
+        left_list_body.pack(fill=tk.BOTH, expand=True)
+
+        self.person_canvas = tk.Canvas(left_list_body, bg=getattr(self, "_bg_color", "#f0f0f0"), highlightthickness=0, width=240)
+        self.person_canvas.pack(fill=tk.BOTH, expand=True)
+
+        person_list_pager = ttk.Frame(left_container, padding=(4, 6, 4, 0))
+        person_list_pager.pack(side=tk.BOTTOM, fill=tk.X)
+        self.person_first_page_btn = ttk.Button(person_list_pager, text="<<", width=3, command=self._first_person_page)
+        self.person_first_page_btn.pack(side=tk.LEFT)
+        self.person_prev_page_btn = ttk.Button(person_list_pager, text="<", width=3, command=self._prev_person_page)
+        self.person_prev_page_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.person_page_var = tk.StringVar(value="1")
+        self.person_page_entry = ttk.Entry(person_list_pager, textvariable=self.person_page_var, width=6, justify="center")
+        self.person_page_entry.pack(side=tk.LEFT, padx=4)
+        self.person_page_entry.bind("<Return>", self._go_to_person_page_from_entry)
+        self.person_page_total_var = tk.StringVar(value="/ 1")
+        ttk.Label(person_list_pager, textvariable=self.person_page_total_var).pack(side=tk.LEFT)
+        self.person_next_page_btn = ttk.Button(person_list_pager, text=">", width=3, command=self._next_person_page)
+        self.person_next_page_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.person_last_page_btn = ttk.Button(person_list_pager, text=">>", width=3, command=self._last_person_page)
+        self.person_last_page_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         self.person_list_inner_frame = tk.Frame(self.person_canvas, bg=getattr(self, "_bg_color", "#f0f0f0"))
         self._person_canvas_window = self.person_canvas.create_window((0, 0), window=self.person_list_inner_frame, anchor="nw")
-        
+
         def _on_canvas_configure(event):
             self.person_canvas.itemconfig(self._person_canvas_window, width=event.width)
-            
+            self._schedule_person_page_size_refresh()
+
         def _on_frame_configure(event):
             self.person_canvas.configure(scrollregion=self.person_canvas.bbox("all"))
-            
+
         self.person_canvas.bind('<Configure>', _on_canvas_configure)
         self.person_list_inner_frame.bind('<Configure>', _on_frame_configure)
-        
-        # 绑定鼠标滚轮
-        def _on_mousewheel(event):
-            if str(self.person_canvas.cget("state")) != tk.DISABLED:
-                self.person_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-                
-        # Windows / macOS binding
-        self.person_canvas.bind_all("<MouseWheel>", lambda e: _on_mousewheel(e) if self._is_in_widget(e, self.person_canvas) else None)
-        
-        # 绑定事件相关的状态
-        self.person_thumbnail_images = [] # 保存列表里的头像防止被回收
-        self.gallery_thumbnail_images = [] # 保存右侧画廊的头像
+
+        self.person_thumbnail_images = []
+        self.gallery_thumbnail_images = []
         self._person_list_gen = 0
         self._gallery_gen = 0
         self.person_list = []
         self._selected_person_id = None
-        self._person_frames = {} # {person_id: tk.Frame}
-        
-        # 右侧：选中人物包含的图片画廊
+        self._person_frames = {}
+        self._person_data_by_id = {}
+        self._person_page_size = 1
+        self._person_current_page = 1
+        self._person_page_resize_after_id = None
+        self._person_list_item_height = 58
+        self._person_gallery_page_size = 24
+        self._person_gallery_current_page = 1
+        self._current_person_gallery_records = []
+        self._current_person_gallery_person_data = None
+
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=1)
-        
+
         right_toolbar = ttk.Frame(right_frame, padding=(0, 0, 0, 5))
         right_toolbar.pack(fill=tk.X)
         self.person_image_count_var = tk.StringVar(value="")
+        self.person_source_db_var = tk.StringVar(value="")
         ttk.Label(right_toolbar, textvariable=self.person_image_count_var).pack(side=tk.LEFT)
-        
+        ttk.Label(right_toolbar, textvariable=self.person_source_db_var, foreground="gray").pack(side=tk.RIGHT)
+
+        gallery_body = ttk.Frame(right_frame)
+        gallery_body.pack(fill=tk.BOTH, expand=True)
+
         self.person_gallery_text = tk.Text(
-            right_frame, 
+            gallery_body,
             wrap="char",
-            state="disabled", 
-            cursor="arrow", 
+            state="disabled",
+            cursor="arrow",
             bg=getattr(self, "_bg_color", "#f0f0f0"),
             bd=0,
             highlightthickness=0,
         )
-        vsb_right = ttk.Scrollbar(right_frame, orient="vertical", command=self.person_gallery_text.yview)
+        vsb_right = ttk.Scrollbar(gallery_body, orient="vertical", command=self.person_gallery_text.yview)
         self.person_gallery_text.configure(yscrollcommand=vsb_right.set)
-        
+
         self.person_gallery_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb_right.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
+        gallery_footer = ttk.Frame(right_frame, padding=(0, 5, 0, 0))
+        gallery_footer.pack(fill=tk.X)
+
+        gallery_search_bar = ttk.Frame(gallery_footer)
+        gallery_search_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(gallery_search_bar, text="文件名搜索").pack(side=tk.LEFT)
+        self.person_gallery_search_var = tk.StringVar(value="")
+        self.person_gallery_search_entry = ttk.Entry(gallery_search_bar, textvariable=self.person_gallery_search_var, width=24)
+        self.person_gallery_search_entry.pack(side=tk.LEFT, padx=(6, 4))
+        self.person_gallery_search_entry.bind("<Return>", self._search_person_gallery_by_filename)
+        ttk.Button(gallery_search_bar, text="搜索", command=self._search_person_gallery_by_filename).pack(side=tk.LEFT)
+        ttk.Button(gallery_search_bar, text="清空", command=self._clear_person_gallery_search).pack(side=tk.LEFT, padx=(4, 0))
+
+        gallery_pager = ttk.Frame(gallery_footer)
+        gallery_pager.pack(side=tk.RIGHT)
+        self.person_gallery_first_page_btn = ttk.Button(gallery_pager, text="<<", width=3, command=self._first_person_gallery_page)
+        self.person_gallery_first_page_btn.pack(side=tk.LEFT)
+        self.person_gallery_prev_page_btn = ttk.Button(gallery_pager, text="<", width=3, command=self._prev_person_gallery_page)
+        self.person_gallery_prev_page_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.person_gallery_page_var = tk.StringVar(value="1")
+        self.person_gallery_page_entry = ttk.Entry(gallery_pager, textvariable=self.person_gallery_page_var, width=6, justify="center")
+        self.person_gallery_page_entry.pack(side=tk.LEFT, padx=4)
+        self.person_gallery_page_entry.bind("<Return>", self._go_to_person_gallery_page_from_entry)
+        self.person_gallery_page_total_var = tk.StringVar(value="/ 1")
+        ttk.Label(gallery_pager, textvariable=self.person_gallery_page_total_var).pack(side=tk.LEFT)
+        self.person_gallery_next_page_btn = ttk.Button(gallery_pager, text=">", width=3, command=self._next_person_gallery_page)
+        self.person_gallery_next_page_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.person_gallery_last_page_btn = ttk.Button(gallery_pager, text=">>", width=3, command=self._last_person_gallery_page)
+        self.person_gallery_last_page_btn.pack(side=tk.LEFT, padx=(4, 0))
+
         self.person_thumbnail_images = []
         self._person_thumbnail_gen = 0
         self.person_list = []
+        self._all_person_gallery_records = []
+        self._person_gallery_search_query = ""
         
     def _is_in_widget(self, event, widget):
         if not widget.winfo_exists():
@@ -1419,57 +1530,418 @@ class PhotoIdentifyGUI(tk.Tk):
         widget_w, widget_h = widget.winfo_width(), widget.winfo_height()
         return (widget_x <= x <= widget_x + widget_w) and (widget_y <= y <= widget_y + widget_h)
 
+    def _calc_total_pages(self, total_count: int, page_size: int) -> int:
+        return max(1, math.ceil(max(0, total_count) / max(1, page_size)))
+
+    def _format_person_source_db_text(self, person_data) -> str:
+        if not person_data:
+            return ""
+        db_paths = list(person_data.get("source_dbs") or [])
+        if not db_paths:
+            db_paths = [source.get("db_path") for source in person_data.get("sources", []) if source.get("db_path")]
+        db_names = []
+        seen = set()
+        for db_path in db_paths:
+            name = os.path.basename(str(db_path or "").strip()) or str(db_path or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            db_names.append(name)
+        return ", ".join(db_names) if db_names else ""
+
+    def _update_person_detail_meta(self, person_data=None):
+        if hasattr(self, "person_source_db_var"):
+            self.person_source_db_var.set(self._format_person_source_db_text(person_data))
+
+    def _estimate_person_page_size(self) -> int:
+        canvas = getattr(self, "person_canvas", None)
+        if not canvas or not canvas.winfo_exists():
+            return max(1, int(getattr(self, "_person_page_size", 1) or 1))
+        available_height = int(canvas.winfo_height() or 0)
+        if available_height <= 1:
+            available_height = int(canvas.winfo_reqheight() or 0)
+        item_height = max(1, int(getattr(self, "_person_list_item_height", 58) or 58))
+        estimated_count = available_height // item_height if available_height > 0 else 0
+        return max(1, estimated_count or int(getattr(self, "_person_page_size", 1) or 1))
+
+    def _schedule_person_page_size_refresh(self):
+        if not hasattr(self, "person_canvas"):
+            return
+        after_id = getattr(self, "_person_page_resize_after_id", None)
+        if after_id:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        self._person_page_resize_after_id = self.after(80, self._refresh_person_page_size)
+
+    def _refresh_person_page_size(self):
+        self._person_page_resize_after_id = None
+        new_page_size = self._estimate_person_page_size()
+        current_page_size = max(1, int(getattr(self, "_person_page_size", 1) or 1))
+        if new_page_size == current_page_size:
+            return
+        self._person_page_size = new_page_size
+        if not getattr(self, "person_list", None):
+            self._update_person_list_pagination_state()
+            return
+        selected_id = str(self._selected_person_id or "")
+        if selected_id:
+            for index, person in enumerate(self.person_list):
+                if str(person.get("id")) == selected_id:
+                    self._go_to_person_page(index // self._person_page_size + 1, auto_select_id=selected_id, refresh_gallery=False)
+                    return
+        self._go_to_person_page(
+            min(
+                int(getattr(self, "_person_current_page", 1)),
+                self._calc_total_pages(len(self.person_list), self._person_page_size),
+            ),
+            refresh_gallery=False,
+        )
+
+    def _update_person_list_item_height(self, frame):
+        if not frame or not frame.winfo_exists():
+            return
+        measured_height = max(int(frame.winfo_height() or 0), int(frame.winfo_reqheight() or 0))
+        if measured_height <= 0:
+            return
+        current_height = int(getattr(self, "_person_list_item_height", measured_height) or measured_height)
+        if abs(measured_height - current_height) < 3:
+            return
+        self._person_list_item_height = measured_height
+        self._schedule_person_page_size_refresh()
+
+    def _update_person_list_pagination_state(self):
+        total_count = len(getattr(self, "person_list", []))
+        total_pages = self._calc_total_pages(total_count, self._person_page_size)
+        current_page = min(max(1, int(getattr(self, "_person_current_page", 1))), total_pages)
+        self._person_current_page = current_page
+        self.person_page_var.set(str(current_page))
+        self.person_page_total_var.set(f"/ {total_pages}")
+        self.person_first_page_btn.configure(state=tk.NORMAL if current_page > 1 else tk.DISABLED)
+        self.person_prev_page_btn.configure(state=tk.NORMAL if current_page > 1 else tk.DISABLED)
+        self.person_next_page_btn.configure(state=tk.NORMAL if current_page < total_pages else tk.DISABLED)
+        self.person_last_page_btn.configure(state=tk.NORMAL if current_page < total_pages else tk.DISABLED)
+
+    def _update_person_gallery_pagination_state(self):
+        records = list(getattr(self, "_current_person_gallery_records", []))
+        total_count = len(records)
+        total_pages = self._calc_total_pages(total_count, self._person_gallery_page_size)
+        current_page = min(max(1, int(getattr(self, "_person_gallery_current_page", 1))), total_pages)
+        self._person_gallery_current_page = current_page
+        self.person_gallery_page_var.set(str(current_page))
+        self.person_gallery_page_total_var.set(f"/ {total_pages}")
+        self.person_gallery_first_page_btn.configure(state=tk.NORMAL if current_page > 1 else tk.DISABLED)
+        self.person_gallery_prev_page_btn.configure(state=tk.NORMAL if current_page > 1 else tk.DISABLED)
+        self.person_gallery_next_page_btn.configure(state=tk.NORMAL if current_page < total_pages else tk.DISABLED)
+        self.person_gallery_last_page_btn.configure(state=tk.NORMAL if current_page < total_pages else tk.DISABLED)
+
+        source_total = len(getattr(self, "_all_person_gallery_records", []))
+        search_query = str(getattr(self, "_person_gallery_search_query", "") or "").strip()
+        if total_count:
+            start_no = (current_page - 1) * self._person_gallery_page_size + 1
+            end_no = min(total_count, start_no + self._person_gallery_page_size - 1)
+            if search_query:
+                self.person_image_count_var.set(
+                    f"包含此人的照片总数: {source_total}，搜索结果: {total_count}（第 {current_page}/{total_pages} 页，显示 {start_no}-{end_no}）"
+                )
+            else:
+                self.person_image_count_var.set(
+                    f"包含此人的照片总数: {total_count}（第 {current_page}/{total_pages} 页，显示 {start_no}-{end_no}）"
+                )
+        elif self._current_person_gallery_person_data is not None:
+            if search_query:
+                self.person_image_count_var.set(f"包含此人的照片总数: {source_total}，搜索结果: 0")
+            else:
+                self.person_image_count_var.set("包含此人的照片总数: 0")
+        else:
+            self.person_image_count_var.set("")
+
+    def _apply_person_gallery_filter(self, query=None, *, preserve_page=False):
+        search_var = getattr(self, "person_gallery_search_var", None)
+        if query is None and search_var is not None:
+            query = search_var.get()
+        query_text = str(query or "").strip()
+        self._person_gallery_search_query = query_text
+
+        records = list(getattr(self, "_all_person_gallery_records", []))
+        if query_text:
+            normalized_query = query_text.casefold()
+            exact_matches = []
+            partial_matches = []
+            for record in records:
+                file_name = str(record.get("file_name") or os.path.basename(record.get("path", "")))
+                normalized_name = file_name.casefold()
+                if normalized_name == normalized_query:
+                    exact_matches.append(record)
+                elif normalized_query in normalized_name:
+                    partial_matches.append(record)
+            records = (exact_matches or partial_matches)[:1]
+
+        self._current_person_gallery_records = records
+        target_page = int(getattr(self, "_person_gallery_current_page", 1)) if preserve_page else 1
+        target_page = min(max(1, target_page), self._calc_total_pages(len(records), self._person_gallery_page_size))
+        self._person_gallery_current_page = target_page
+        self._go_to_person_gallery_page(target_page)
+
+    def _search_person_gallery_by_filename(self, event=None):
+        self._apply_person_gallery_filter(preserve_page=False)
+
+    def _clear_person_gallery_search(self):
+        if hasattr(self, "person_gallery_search_var"):
+            self.person_gallery_search_var.set("")
+        self._apply_person_gallery_filter(query="", preserve_page=False)
+
+    def _append_person_list_batch(self, start_idx, stop_idx, gen, *, auto_select_id=None, refresh_gallery=True):
+        visible_persons = self.person_list[start_idx:stop_idx]
+
+        def _thread_load():
+            for idx, p in enumerate(visible_persons, start=start_idx):
+                if gen != self._person_list_gen:
+                    return
+
+                img = None
+                try:
+                    file_path, actual_path = split_media_record_path(p.get("path"))
+                    if actual_path and os.path.isfile(actual_path):
+                        img = load_cached_face_avatar_image(file_path, p.get("bbox") or "[]", size=40)
+                except Exception as e:
+                    print(f"Error loading face for {p.get('name')}: {e}")
+
+                self.after(0, self._add_person_list_item, idx, p, img, gen)
+
+            if auto_select_id and gen == self._person_list_gen:
+                self.after(
+                    100,
+                    lambda pid=str(auto_select_id), rg=refresh_gallery, expected_gen=gen: (
+                        self._select_person(pid, refresh_gallery=rg)
+                        if expected_gen == self._person_list_gen
+                        else None
+                    ),
+                )
+
+        threading.Thread(target=_thread_load, daemon=True).start()
+
+    def _append_person_gallery_batch(self, start_idx, stop_idx, gen, person_data, *, include_cover=False):
+        records = list(self._current_person_gallery_records[start_idx:stop_idx])
+
+        def _thread():
+            if include_cover and gen == self._gallery_gen:
+                img = None
+                try:
+                    file_path, actual_path = split_media_record_path(person_data.get("path"))
+                    if actual_path and os.path.isfile(actual_path):
+                        img = load_cached_face_avatar_image(file_path, person_data.get("bbox", "[]"), size=150)
+                except Exception:
+                    pass
+                self.after(
+                    0,
+                    lambda image=img, expected_gen=gen, current_person=person_data: (
+                        self._add_gallery_item(
+                            None,
+                            "【当前头像】",
+                            image,
+                            expected_gen,
+                            is_cover=True,
+                            p_data=current_person,
+                        )
+                        if expected_gen == self._gallery_gen
+                        else None
+                    ),
+                )
+
+            for record in records:
+                if gen != self._gallery_gen:
+                    return
+
+                file_path, actual_path = split_media_record_path(record.get("path"))
+                img = None
+                try:
+                    if os.path.isfile(actual_path):
+                        img = load_cached_thumbnail_image(file_path)
+                except Exception:
+                    pass
+
+                self.after(
+                    0,
+                    lambda r=record, image=img, expected_gen=gen, current_person=person_data: (
+                        self._add_gallery_item(r, None, image, expected_gen, is_cover=False, p_data=current_person)
+                        if expected_gen == self._gallery_gen
+                        else None
+                    ),
+                )
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _go_to_person_page(self, page, *, auto_select_id=None, refresh_gallery=False):
+        self._person_page_size = self._estimate_person_page_size()
+        total_count = len(getattr(self, "person_list", []))
+        total_pages = self._calc_total_pages(total_count, self._person_page_size)
+        target_page = min(max(1, int(page)), total_pages)
+        self._person_current_page = target_page
+        self._person_list_gen += 1
+        current_gen = self._person_list_gen
+
+        for widget in self.person_list_inner_frame.winfo_children():
+            widget.destroy()
+        self.person_thumbnail_images.clear()
+        self._person_frames.clear()
+
+        self._update_person_list_pagination_state()
+        if not total_count:
+            self.person_status_var.set("当前没有可显示的人物。")
+            return
+
+        start_idx = (target_page - 1) * self._person_page_size
+        stop_idx = min(total_count, start_idx + self._person_page_size)
+        page_items = self.person_list[start_idx:stop_idx]
+        page_person_ids = {str(item["id"]) for item in page_items}
+        effective_select_id = None
+        if auto_select_id is not None:
+            candidate_id = str(auto_select_id)
+            if candidate_id in page_person_ids:
+                effective_select_id = candidate_id
+        elif page_items:
+            effective_select_id = str(page_items[0]["id"])
+            refresh_gallery = True
+
+        self._append_person_list_batch(
+            start_idx,
+            stop_idx,
+            current_gen,
+            auto_select_id=effective_select_id,
+            refresh_gallery=refresh_gallery,
+        )
+
+        status_text = f"共 {total_count} 个人物，第 {target_page}/{total_pages} 页，本页显示 {len(page_items)} 人。"
+        if effective_select_id:
+            status_text += " 已自动展开本页第一个人物。"
+        self.person_status_var.set(status_text)
+
+    def _go_to_person_page_from_entry(self, event=None):
+        try:
+            requested_page = int(str(self.person_page_var.get()).strip())
+        except Exception:
+            requested_page = int(getattr(self, "_person_current_page", 1))
+        self._go_to_person_page(requested_page)
+
+    def _first_person_page(self):
+        self._go_to_person_page(1)
+
+    def _prev_person_page(self):
+        self._go_to_person_page(int(getattr(self, "_person_current_page", 1)) - 1)
+
+    def _next_person_page(self):
+        self._go_to_person_page(int(getattr(self, "_person_current_page", 1)) + 1)
+
+    def _last_person_page(self):
+        self._go_to_person_page(self._calc_total_pages(len(getattr(self, "person_list", [])), self._person_page_size))
+
+    def _go_to_person_gallery_page(self, page):
+        total_count = len(getattr(self, "_current_person_gallery_records", []))
+        total_pages = self._calc_total_pages(total_count, self._person_gallery_page_size)
+        target_page = min(max(1, int(page)), total_pages)
+        self._person_gallery_current_page = target_page
+        self._gallery_gen += 1
+        current_gen = self._gallery_gen
+
+        self.person_gallery_text.configure(state="normal")
+        self.person_gallery_text.delete(1.0, tk.END)
+        self.person_gallery_text.configure(state="disabled")
+        self.gallery_thumbnail_images.clear()
+        self._update_person_gallery_pagination_state()
+
+        person_data = self._current_person_gallery_person_data
+        if person_data is None:
+            return
+
+        start_idx = (target_page - 1) * self._person_gallery_page_size
+        stop_idx = min(total_count, start_idx + self._person_gallery_page_size)
+        self._append_person_gallery_batch(
+            start_idx,
+            stop_idx,
+            current_gen,
+            person_data,
+            include_cover=True,
+        )
+
+    def _go_to_person_gallery_page_from_entry(self, event=None):
+        try:
+            requested_page = int(str(self.person_gallery_page_var.get()).strip())
+        except Exception:
+            requested_page = int(getattr(self, "_person_gallery_current_page", 1))
+        self._go_to_person_gallery_page(requested_page)
+
+    def _first_person_gallery_page(self):
+        self._go_to_person_gallery_page(1)
+
+    def _prev_person_gallery_page(self):
+        self._go_to_person_gallery_page(int(getattr(self, "_person_gallery_current_page", 1)) - 1)
+
+    def _next_person_gallery_page(self):
+        self._go_to_person_gallery_page(int(getattr(self, "_person_gallery_current_page", 1)) + 1)
+
+    def _last_person_gallery_page(self):
+        self._go_to_person_gallery_page(
+            self._calc_total_pages(len(getattr(self, "_current_person_gallery_records", [])), self._person_gallery_page_size)
+        )
+
     def _refresh_persons(self, keep_selected_id=None, refresh_gallery=False):
         for widget in self.person_list_inner_frame.winfo_children():
             widget.destroy()
         self.person_thumbnail_images.clear()
         self._person_frames.clear()
+        self._person_data_by_id.clear()
         self._selected_person_id = None
-        self._person_frame_order = None  # 重置显示顺序跟踪
-        
-        # 只有当没有要求保留选择，或者右侧还没有被渲染时，才清空右侧画廊
+
+        self._all_person_gallery_records = []
+        self._current_person_gallery_records = []
+        self._current_person_gallery_person_data = None
+        self._person_gallery_current_page = 1
+        self._person_gallery_search_query = ""
+        self._update_person_detail_meta(None)
+        if hasattr(self, "person_gallery_search_var"):
+            self.person_gallery_search_var.set("")
+
         if keep_selected_id is None:
             self.person_gallery_text.configure(state="normal")
             self.person_gallery_text.delete(1.0, tk.END)
             self.person_gallery_text.configure(state="disabled")
-            self.person_image_count_var.set("")
-        
+        self._update_person_gallery_pagination_state()
+
+        db_paths = list(self.search_dbs)
+        if not db_paths:
+            self.person_list = []
+            self._person_current_page = 1
+            self._update_person_list_pagination_state()
+            self.person_status_var.set("请先在图片检索页添加数据库。")
+            return
+
         try:
-            from photo_identify.storage import Storage
-            storage = Storage(self.scan_db_var.get())
-            self.person_list = storage.get_all_persons(include_deleted=False)
-            storage.close()
-            
-            self._person_list_gen += 1
-            current_gen = self._person_list_gen
-            
-            def _thread_load():
-                for idx, p in enumerate(self.person_list):
-                    if current_gen != self._person_list_gen:
+            from photo_identify.person_merge import load_combined_persons
+
+            self.person_list = load_combined_persons(db_paths, include_deleted=False)
+            self._person_data_by_id = {str(p["id"]): p for p in self.person_list}
+            self._person_page_size = self._estimate_person_page_size()
+
+            keep_selected_key = str(keep_selected_id) if keep_selected_id is not None else ""
+            total_pages = self._calc_total_pages(len(self.person_list), self._person_page_size)
+            target_page = min(max(1, int(getattr(self, "_person_current_page", 1))), total_pages)
+            auto_select_id = None
+            auto_select_gallery = False
+            if keep_selected_key and keep_selected_key in self._person_data_by_id:
+                auto_select_id = keep_selected_key
+                auto_select_gallery = refresh_gallery
+                for index, person in enumerate(self.person_list):
+                    if str(person["id"]) == keep_selected_key:
+                        target_page = index // self._person_page_size + 1
                         break
-                        
-                    img = None
-                    try:
-                        file_path, actual_path = split_media_record_path(p.get("path"))
-                        if actual_path and os.path.isfile(actual_path):
-                            frame_bytes = get_image_frame_bytes(file_path)
-                            pil_img = Image.open(io.BytesIO(frame_bytes))
-                            img = crop_and_circle_face(pil_img, p.get("bbox") or "[]", size=40)
-                    except Exception as e:
-                        print(f"Error loading face for {p.get('name')}: {e}")
-                        
-                    self.after(0, self._add_person_list_item, idx, p, img, current_gen)
-                    
-                # 加载完毕后，恢复选中状态或默认选中第一个人物
-                if keep_selected_id is not None:
-                    self.after(100, lambda: self._select_person(keep_selected_id, refresh_gallery=refresh_gallery))
-                elif self.person_list:
-                    first_id = self.person_list[0]["id"]
-                    self.after(100, lambda pid=first_id: self._select_person(pid))
-                    
-            threading.Thread(target=_thread_load, daemon=True).start()
-            
-            self.person_status_var.set(f"共显示 {len(self.person_list)} 个人物。")
+            elif self.person_list:
+                auto_select_id = str(self.person_list[0]["id"])
+                auto_select_gallery = True
+                target_page = 1
+
+            self._go_to_person_page(target_page, auto_select_id=auto_select_id, refresh_gallery=auto_select_gallery)
         except Exception as e:
             self.person_status_var.set(f"加载人物失败: {e}")
 
@@ -1492,12 +1964,12 @@ class PhotoIdentifyGUI(tk.Tk):
             img_lbl = tk.Label(item_frame, text="无头像", bg=bg_color, width=5, height=2)
             
         img_lbl.pack(side=tk.LEFT, padx=(0, 10))
-        item_frame.img_lbl = img_lbl
+        setattr(item_frame, "img_lbl", img_lbl)
         
         mid_frame = tk.Frame(item_frame, bg=bg_color)
         mid_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        name_var = tk.StringVar(value=p_data["name"])
+        name_var = tk.StringVar(value=p_data.get("display_name", p_data["name"]))
         name_lbl = tk.Label(mid_frame, textvariable=name_var, bg=bg_color, anchor="sw", font=("Arial", 10))
         name_lbl.pack(side=tk.TOP, fill=tk.X, expand=True)
         
@@ -1505,32 +1977,27 @@ class PhotoIdentifyGUI(tk.Tk):
         count_lbl.pack(side=tk.TOP, fill=tk.X, expand=True)
         
         # 保存 name_var 到 frame 上方便后续双击修改
-        item_frame.name_var = name_var
-        item_frame.person_data = p_data
+        setattr(item_frame, "name_var", name_var)
+        setattr(item_frame, "person_data", p_data)
         
         # 控制按钮
         btn_frame = tk.Frame(item_frame, bg=bg_color)
         btn_frame.pack(side=tk.RIGHT)
-        
-        def move_up(e, pid=person_id):
+
+        def toggle_pin(e, pid=person_id):
             e.stopPropagation = True
-            self._move_person(pid, -1)
-            
-        def move_down(e, pid=person_id):
-            e.stopPropagation = True
-            self._move_person(pid, 1)
-            
-        btn_up = tk.Label(btn_frame, text="▲", bg=bg_color, cursor="hand2")
-        btn_up.pack(side=tk.LEFT, padx=2)
-        btn_up.bind("<Button-1>", move_up)
-        
-        btn_down = tk.Label(btn_frame, text="▼", bg=bg_color, cursor="hand2")
-        btn_down.pack(side=tk.LEFT, padx=2)
-        btn_down.bind("<Button-1>", move_down)
+            self._toggle_person_pin(pid)
+
+        pin_text = "取消置顶" if p_data.get("is_pinned") else "置顶"
+        pin_fg = "#b45309" if p_data.get("is_pinned") else "#2563eb"
+        pin_btn = tk.Label(btn_frame, text=pin_text, bg=bg_color, fg=pin_fg, cursor="hand2", font=("Arial", 9))
+        pin_btn.pack(side=tk.LEFT, padx=2)
+        pin_btn.bind("<Button-1>", toggle_pin)
         
         # 右键菜单
         menu = tk.Menu(item_frame, tearoff=0)
         menu.add_command(label="重命名", command=lambda pid=person_id: self._rename_person(pid))
+        menu.add_command(label="人物合并", command=lambda pid=person_id: (self._select_person(pid, refresh_gallery=False), self._open_merge_person_dialog()))
         menu.add_command(label="移入回收站", command=lambda pid=person_id: self._delete_person(pid))
         if p_data.get("path"):
             def _open_loc_person():
@@ -1542,7 +2009,10 @@ class PhotoIdentifyGUI(tk.Tk):
             
         item_frame.bind("<Button-3>", show_menu)
         img_lbl.bind("<Button-3>", show_menu)
+        mid_frame.bind("<Button-3>", show_menu)
         name_lbl.bind("<Button-3>", show_menu)
+        count_lbl.bind("<Button-3>", show_menu)
+        btn_frame.bind("<Button-3>", show_menu)
         
         def on_click(e, pid=person_id):
             if hasattr(e, 'stopPropagation') and e.stopPropagation:
@@ -1551,17 +2021,56 @@ class PhotoIdentifyGUI(tk.Tk):
             
         item_frame.bind("<Button-1>", on_click)
         img_lbl.bind("<Button-1>", on_click)
+        mid_frame.bind("<Button-1>", on_click)
         name_lbl.bind("<Button-1>", on_click)
+        count_lbl.bind("<Button-1>", on_click)
+        btn_frame.bind("<Button-1>", on_click)
         
         # 双击重命名
         def on_double_click(e, pid=person_id):
             self._rename_person(pid)
             
         item_frame.bind("<Double-1>", on_double_click)
+        mid_frame.bind("<Double-1>", on_double_click)
         name_lbl.bind("<Double-1>", on_double_click)
+        count_lbl.bind("<Double-1>", on_double_click)
+        self.after_idle(lambda frame=item_frame: self._update_person_list_item_height(frame))
 
-    def _select_person(self, person_id, refresh_gallery=True):
-        # 恢复旧的选中状态
+    def _scroll_person_frame_into_view(self, frame):
+        if not frame or not frame.winfo_exists() or not self.person_canvas.winfo_exists():
+            return
+
+        try:
+            self.update_idletasks()
+            bbox = self.person_canvas.bbox("all")
+            if not bbox:
+                return
+
+            canvas_height = max(1, self.person_canvas.winfo_height())
+            total_height = max(1, bbox[3] - bbox[1])
+            max_scroll = max(0, total_height - canvas_height)
+            if max_scroll <= 0:
+                return
+
+            frame_top = max(0, frame.winfo_y())
+            frame_bottom = frame_top + max(1, frame.winfo_height())
+            visible_top = max(0, int(self.person_canvas.canvasy(0)))
+            visible_bottom = visible_top + canvas_height
+
+            if frame_top < visible_top:
+                target_top = frame_top
+            elif frame_bottom > visible_bottom:
+                target_top = frame_bottom - canvas_height
+            else:
+                return
+
+            target_top = min(max_scroll, max(0, target_top))
+            self.person_canvas.yview_moveto(target_top / max_scroll)
+        except Exception:
+            return
+
+    def _select_person(self, person_id, refresh_gallery=True, preserve_gallery_page=False, preserve_gallery_search=False):
+        person_id = str(person_id)
         if self._selected_person_id in self._person_frames:
             old_frame = self._person_frames[self._selected_person_id]
             old_frame.configure(bg=getattr(self, "_bg_color", "#f0f0f0"))
@@ -1570,7 +2079,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 if hasattr(child, "winfo_children"):
                     for subchild in child.winfo_children():
                         subchild.configure(bg=getattr(self, "_bg_color", "#f0f0f0"))
-                
+
         self._selected_person_id = person_id
         if person_id in self._person_frames:
             new_frame = self._person_frames[person_id]
@@ -1581,151 +2090,1087 @@ class PhotoIdentifyGUI(tk.Tk):
                 if hasattr(child, "winfo_children"):
                     for subchild in child.winfo_children():
                         subchild.configure(bg=sel_color)
-                
-            p_data = new_frame.person_data
-            if refresh_gallery:
+
+            self.after_idle(lambda frame=new_frame: self._scroll_person_frame_into_view(frame))
+
+            p_data = getattr(new_frame, "person_data", None)
+            self._update_person_detail_meta(p_data)
+            if refresh_gallery and p_data:
                 try:
                     from photo_identify.storage import Storage
-                    storage = Storage(self.scan_db_var.get())
-                    images = storage.get_images_by_person(p_data["cluster_id"])
-                    for img in images:
-                        img["db_path"] = self.scan_db_var.get()
-                    storage.close()
-                    
+
+                    images = []
+                    for source in p_data.get("sources", []):
+                        db_path = source.get("db_path")
+                        if not db_path:
+                            continue
+                        storage = Storage(db_path)
+                        try:
+                            db_images = storage.get_images_by_person(str(source.get("person_id") or p_data["id"]))
+                            for img in db_images:
+                                img["db_path"] = db_path
+                            images.extend(db_images)
+                        finally:
+                            storage.close()
+
+                    images.sort(key=lambda row: (str(row.get("modified_time") or ""), int(row.get("id") or 0)), reverse=True)
                     self.person_image_count_var.set(f"包含此人的照片总数: {len(images)}")
-                    self._load_person_thumbnails(images, p_data)
-                    
+                    self._load_person_thumbnails(
+                        images,
+                        p_data,
+                        preserve_page=preserve_gallery_page,
+                        preserve_search=preserve_gallery_search,
+                    )
                 except Exception as e:
                     self.person_status_var.set(f"加载照片失败: {e}")
 
-    def _show_trash_bin(self):
-        dlg = tk.Toplevel(self)
-        dlg.title("人物回收站")
-        dlg.geometry("400x500")
-        dlg.grab_set()
-        
-        try:
-            from photo_identify.storage import Storage
-            storage = Storage(self.scan_db_var.get())
-            deleted_list = storage.get_deleted_persons()
-            storage.close()
-        except Exception as e:
-            messagebox.showerror("错误", f"加载回收站失败: {e}", parent=dlg)
+    def _open_merge_person_dialog(self):
+        if len(self.person_list) < 2:
+            messagebox.showinfo("提示", "至少需要两个可见人物才能执行合并。")
             return
 
-        lbl = ttk.Label(dlg, text="在列表右键点击或双击可以恢复人物:", padding=10)
-        lbl.pack(side=tk.TOP, fill=tk.X)
-        
-        list_container = ttk.Frame(dlg)
-        list_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        
-        canvas = tk.Canvas(list_container, bg=getattr(self, "_bg_color", "#f0f0f0"), highlightthickness=0)
-        vsb = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        inner_frame = tk.Frame(canvas, bg=getattr(self, "_bg_color", "#f0f0f0"))
-        canvas_window = canvas.create_window((0, 0), window=inner_frame, anchor="nw")
-        
-        def _on_canvas_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-            
-        def _on_frame_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            
-        canvas.bind('<Configure>', _on_canvas_configure)
-        inner_frame.bind('<Configure>', _on_frame_configure)
-        
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind_all("<MouseWheel>", lambda e: _on_mousewheel(e) if self._is_in_widget(e, canvas) else None)
-        
-        # 保持引用
-        dlg.thumbnails = []
-        
-        def _restore_person(person_id, name, item_frame):
-            if messagebox.askyesno("恢复", f"确定要恢复人物 {name} 吗？", parent=dlg):
-                try:
-                    from photo_identify.storage import Storage
-                    storage = Storage(self.scan_db_var.get())
-                    storage.set_person_deleted(person_id, 0)
-                    storage.close()
-                    item_frame.destroy()
-                    self._refresh_persons()
-                except Exception as e:
-                    messagebox.showerror("错误", f"恢复失败: {e}", parent=dlg)
-                    
-        def _load_trash_items():
-            for p in deleted_list:
-                img = None
-                try:
-                    file_path, actual_path = split_media_record_path(p.get("path"))
-                    if actual_path and os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(file_path)
-                        pil_img = Image.open(io.BytesIO(frame_bytes))
-                        img = crop_and_circle_face(pil_img, p.get("bbox") or "[]", size=40)
-                except Exception:
-                    pass
-                    
-                self.after(0, _add_trash_item, p, img)
-                
-        def _add_trash_item(p_data, img):
-            bg_color = getattr(self, "_bg_color", "#f0f0f0")
-            item_frame = tk.Frame(inner_frame, bg=bg_color, cursor="hand2", pady=2, padx=5)
-            item_frame.pack(side=tk.TOP, fill=tk.X, expand=True)
-            
-            if img:
-                photo = ImageTk.PhotoImage(img)
-                dlg.thumbnails.append(photo)
-                img_lbl = tk.Label(item_frame, image=photo, bg=bg_color)
+        current_id = str(self._selected_person_id or "")
+        current_person = self._person_data_by_id.get(current_id)
+        if not current_person:
+            messagebox.showinfo("提示", "请先在人物列表中选择目标人物。")
+            return
+
+        try:
+            from photo_identify.person_merge import build_merge_candidates_for_target
+
+            raw_candidates = build_merge_candidates_for_target(self.search_dbs, current_id)
+        except Exception as e:
+            messagebox.showerror("人物合并失败", f"加载相似人物候选失败：\n{e}", parent=self)
+            return
+
+        candidates = []
+        for item in raw_candidates:
+            person_id = str(item.get("id") or "")
+            person_data = self._person_data_by_id.get(person_id)
+            if not person_data:
+                continue
+            candidates.append({**person_data, "similarity": float(item.get("similarity") or 0.0)})
+
+        if not candidates:
+            messagebox.showinfo("提示", "没有可供合并的其他人物。", parent=self)
+            return
+
+        bg_color = getattr(self, "_bg_color", "#f0f0f0")
+        target_id = str(current_person["id"])
+        target_name = current_person.get("display_name", current_person.get("name", "未命名人物"))
+        merge_avatar_size = 60
+        panel_padding = 4
+        target_avatar_size = merge_avatar_size
+        selected_avatar_size = merge_avatar_size
+        candidate_avatar_size = merge_avatar_size
+        selected_tile_step = selected_avatar_size + 10
+        candidate_tile_step = candidate_avatar_size + 18
+        candidate_page_size = 120
+        candidate_by_id = {str(item["id"]): item for item in candidates}
+
+        dlg = tk.Toplevel(self)
+        dlg.title("人物合并")
+        dlg.geometry("980x700")
+        dlg.minsize(860, 560)
+        dlg.configure(bg=bg_color)
+        dlg.transient(self)
+        dlg.lift()
+        dlg.focus_force()
+
+        state = {
+            "selected_ids": [],
+            "candidate_images": {},
+            "candidate_photo_refs": [],
+            "selected_photo_refs": [],
+            "target_photo": None,
+            "candidate_current_page": 1,
+            "candidate_render_scheduled": False,
+        }
+
+        def _load_avatar(person_data, size):
+            try:
+                file_path, actual_path = split_media_record_path(person_data.get("path"))
+                if actual_path and os.path.isfile(actual_path):
+                    return load_cached_face_avatar_image(file_path, person_data.get("bbox") or "[]", size=size)
+            except Exception:
+                return None
+            return None
+
+        def _bind_left_click(person_id, *widgets, remove=False):
+            def _handler(event, pid=person_id, is_remove=remove):
+                if is_remove:
+                    _deselect_candidate(pid)
+                else:
+                    _select_candidate(pid)
+
+            for widget in widgets:
+                widget.bind("<Button-1>", _handler)
+
+        def _show_person_details_from_merge(person_id):
+            target_person_id = str(person_id or "")
+            if not target_person_id:
+                return
+            self.notebook.select(self.person_tab)
+            for index, person in enumerate(self.person_list):
+                if str(person.get("id")) == target_person_id:
+                    self._go_to_person_page(index // self._person_page_size + 1, auto_select_id=target_person_id, refresh_gallery=True)
+                    return
+
+        def _bind_right_click_for_details(person_id, *widgets):
+            def _handler(event, pid=person_id):
+                _show_person_details_from_merge(pid)
+
+            for widget in widgets:
+                widget.bind("<Button-3>", _handler)
+
+        def _get_unselected_candidates():
+            return [item for item in candidates if str(item["id"]) not in state["selected_ids"]]
+
+        def _get_candidate_total_pages() -> int:
+            return max(1, math.ceil(len(_get_unselected_candidates()) / max(1, candidate_page_size)))
+
+        def _normalize_candidate_page() -> int:
+            current_page = max(1, int(state.get("candidate_current_page", 1)))
+            total_pages = _get_candidate_total_pages()
+            normalized_page = min(current_page, total_pages)
+            state["candidate_current_page"] = normalized_page
+            return normalized_page
+
+        def _get_visible_candidates():
+            visible_candidates = _get_unselected_candidates()
+            current_page = _normalize_candidate_page()
+            start_idx = (current_page - 1) * candidate_page_size
+            stop_idx = start_idx + candidate_page_size
+            return visible_candidates[start_idx:stop_idx]
+
+        def _schedule_candidate_pool_render():
+            if state["candidate_render_scheduled"]:
+                return
+            state["candidate_render_scheduled"] = True
+
+            def _run_render():
+                state["candidate_render_scheduled"] = False
+                if dlg.winfo_exists():
+                    _render_candidate_pool()
+
+            self.after_idle(_run_render)
+
+        def _refresh_merge_views():
+            _render_selected_pool()
+            _schedule_candidate_pool_render()
+            _update_merge_status()
+
+        def _update_preview_height(selected_columns: int, selected_count: int):
+            selected_rows = max(1, math.ceil(selected_count / max(1, selected_columns)))
+            base_height = merge_avatar_size + panel_padding * 2 + 12
+            selected_height = selected_rows * selected_tile_step + panel_padding * 2 + 6
+            preview_height = max(base_height, selected_height)
+            target_panel.configure(width=merge_avatar_size + panel_padding * 2 + 10, height=preview_height)
+            selected_panel.configure(height=preview_height)
+            selected_inner.configure(height=max(merge_avatar_size + 4, preview_height - panel_padding * 2))
+
+        def _go_to_candidate_page(page: int):
+            total_pages = _get_candidate_total_pages()
+            state["candidate_current_page"] = min(max(1, int(page)), total_pages)
+            candidate_page_var.set(str(state["candidate_current_page"]))
+            _schedule_candidate_pool_render()
+            _update_merge_status()
+
+        def _go_to_candidate_page_from_entry(event=None):
+            try:
+                requested_page = int(str(candidate_page_var.get()).strip())
+            except Exception:
+                requested_page = int(state.get("candidate_current_page", 1))
+            _go_to_candidate_page(requested_page)
+
+        def _prev_candidate_page():
+            _go_to_candidate_page(int(state.get("candidate_current_page", 1)) - 1)
+
+        def _next_candidate_page():
+            _go_to_candidate_page(int(state.get("candidate_current_page", 1)) + 1)
+
+        def _update_merge_status():
+            selected_count = len(state["selected_ids"])
+            remaining_candidates = _get_unselected_candidates()
+            remaining_count = len(remaining_candidates)
+            current_page = _normalize_candidate_page()
+            total_pages = _get_candidate_total_pages()
+            visible_candidates = _get_visible_candidates()
+            recommended_count = sum(
+                1
+                for item in remaining_candidates
+                if float(item.get("similarity") or 0.0) >= 0.9
+            )
+            start_no = ((current_page - 1) * candidate_page_size + 1) if remaining_count else 0
+            end_no = ((current_page - 1) * candidate_page_size + len(visible_candidates)) if remaining_count else 0
+            status_text = (
+                f"候选共 {len(candidates)} 人，已选 {selected_count} 人，剩余 {remaining_count} 人，"
+                f"待处理高相似推荐 {recommended_count} 人。"
+            )
+            if remaining_count:
+                status_text += f" 当前为第 {current_page}/{total_pages} 页，显示 {start_no}-{end_no}。"
             else:
-                img_lbl = tk.Label(item_frame, text="无头像", bg=bg_color, width=5, height=2)
-                
-            img_lbl.pack(side=tk.LEFT, padx=(0, 10))
-            
-            mid_frame = tk.Frame(item_frame, bg=bg_color)
-            mid_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            
-            name_lbl = tk.Label(mid_frame, text=p_data["name"], bg=bg_color, anchor="sw", font=("Arial", 10))
-            name_lbl.pack(side=tk.TOP, fill=tk.X, expand=True)
-            
-            count_lbl = tk.Label(mid_frame, text=f"{p_data.get('face_count', 0)} 张照片", bg=bg_color, anchor="nw", font=("Arial", 8), fg="gray")
-            count_lbl.pack(side=tk.TOP, fill=tk.X, expand=True)
-            
-            # 绑定事件
-            person_id = p_data["id"]
-            name = p_data["name"]
-            
-            menu = tk.Menu(item_frame, tearoff=0)
-            menu.add_command(label="恢复显示", command=lambda pid=person_id, n=name, f=item_frame: _restore_person(pid, n, f))
-            
-            def show_menu(e):
-                menu.tk_popup(e.x_root, e.y_root)
-                
-            item_frame.bind("<Button-3>", show_menu)
-            img_lbl.bind("<Button-3>", show_menu)
-            name_lbl.bind("<Button-3>", show_menu)
-            
-            def on_double_click(e, pid=person_id, n=name, f=item_frame):
-                _restore_person(pid, n, f)
-                
-            item_frame.bind("<Double-1>", on_double_click)
-            name_lbl.bind("<Double-1>", on_double_click)
-            
-        threading.Thread(target=_load_trash_items, daemon=True).start()
-        
-        btn_frame = ttk.Frame(dlg, padding=10)
-        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT)
-        
+                status_text += " 当前无剩余候选。"
+            merge_status_var.set(status_text)
+            candidate_page_var.set(str(current_page))
+            candidate_page_total_var.set(f"/ {total_pages}")
+            first_candidate_btn.configure(state=tk.NORMAL if current_page > 1 else tk.DISABLED)
+            prev_candidate_btn.configure(state=tk.NORMAL if current_page > 1 else tk.DISABLED)
+            next_candidate_btn.configure(state=tk.NORMAL if current_page < total_pages else tk.DISABLED)
+            last_candidate_btn.configure(state=tk.NORMAL if current_page < total_pages else tk.DISABLED)
+            confirm_btn.configure(state=tk.NORMAL if selected_count else tk.DISABLED)
+
+        def _create_avatar_tile(parent, person, size, refs_key, *, remove=False):
+            person_id = str(person["id"])
+            similarity = float(person.get("similarity") or 0.0)
+            similarity_pct = int(round(similarity * 100))
+            is_recommended = similarity >= 0.9
+            tile_bg = parent.cget("bg")
+            ring_color = "#16a34a" if is_recommended and not remove else ("#fb923c" if remove else "#94a3b8")
+            badge_bg = "#16a34a" if is_recommended else "#334155"
+
+            tile = tk.Frame(parent, bg=tile_bg, cursor="hand2", padx=2, pady=2)
+            canvas_size = size + 6
+            avatar_canvas = tk.Canvas(
+                tile,
+                width=canvas_size,
+                height=canvas_size,
+                bg=tile_bg,
+                bd=0,
+                highlightthickness=0,
+            )
+            avatar_canvas.pack(side=tk.TOP)
+            avatar_canvas.create_oval(3, 3, canvas_size - 3, canvas_size - 3, outline=ring_color, width=2)
+
+            photo = None
+            avatar = state["candidate_images"].get(person_id)
+            if avatar is not None:
+                try:
+                    photo = ImageTk.PhotoImage(avatar)
+                except Exception:
+                    photo = None
+            if photo is not None:
+                state[refs_key].append(photo)
+                avatar_canvas.create_image(canvas_size // 2, canvas_size // 2, image=photo)
+            else:
+                avatar_canvas.create_text(
+                    canvas_size // 2,
+                    canvas_size // 2,
+                    text="…",
+                    fill="#94a3b8",
+                    font=("Microsoft YaHei UI", max(8, size // 2), "bold"),
+                )
+
+            badge = tk.Label(
+                tile,
+                text=f"{similarity_pct}%",
+                bg=badge_bg,
+                fg="white",
+                font=("Microsoft YaHei UI", 7 if size <= 20 else 9, "bold"),
+                padx=3,
+                pady=0,
+            )
+            badge.place(in_=avatar_canvas, relx=1.0, x=-1, y=1, anchor="ne")
+
+            _bind_left_click(person_id, tile, avatar_canvas, badge, remove=remove)
+            _bind_right_click_for_details(person_id, tile, avatar_canvas, badge)
+            return tile
+
+        def _render_selected_pool():
+            for child in selected_inner.winfo_children():
+                child.destroy()
+            state["selected_photo_refs"].clear()
+
+            if not state["selected_ids"]:
+                _update_preview_height(1, 0)
+                placeholder = tk.Label(
+                    selected_inner,
+                    text="点击下方候选头像，将其加入待合并区。",
+                    bg="#fffaf5",
+                    fg="#64748b",
+                    font=("Microsoft YaHei UI", 9),
+                    anchor="w",
+                    padx=10,
+                    pady=8,
+                )
+                placeholder.place(relx=0.0, rely=0.5, anchor="w")
+                return
+
+            available_width = max(selected_panel.winfo_width(), 260)
+            columns = max(1, available_width // max(1, selected_tile_step + 6))
+            _update_preview_height(columns, len(state["selected_ids"]))
+            for idx, person_id in enumerate(state["selected_ids"]):
+                person = candidate_by_id.get(person_id)
+                if not person:
+                    continue
+                tile = _create_avatar_tile(
+                    selected_inner,
+                    person,
+                    selected_avatar_size,
+                    "selected_photo_refs",
+                    remove=True,
+                )
+                tile.grid(row=idx // columns, column=idx % columns, padx=2, pady=2, sticky="n")
+
+        def _render_candidate_pool():
+            for child in candidate_inner.winfo_children():
+                child.destroy()
+            state["candidate_photo_refs"].clear()
+
+            visible_candidates = _get_visible_candidates()
+            if not visible_candidates:
+                tk.Label(
+                    candidate_inner,
+                    text="所有候选人物都已加入待合并区。",
+                    bg=bg_color,
+                    fg="#64748b",
+                    font=("Microsoft YaHei UI", 10),
+                    pady=16,
+                ).grid(row=0, column=0, sticky="w")
+                return
+
+            available_width = max(candidate_canvas.winfo_width(), 720)
+            columns = max(1, available_width // max(1, candidate_tile_step))
+
+            tk.Label(
+                candidate_inner,
+                text=f"候选分页显示：第 {_normalize_candidate_page()}/{_get_candidate_total_pages()} 页，每页 {candidate_page_size} 人。",
+                bg=bg_color,
+                fg="#64748b",
+                font=("Microsoft YaHei UI", 9),
+                anchor="w",
+                pady=4,
+            ).grid(row=0, column=0, columnspan=columns, sticky="ew")
+            row_offset = 1
+
+            for col in range(columns):
+                candidate_inner.grid_columnconfigure(col, weight=1, uniform="merge_candidates")
+            for idx, person in enumerate(visible_candidates):
+                tile = _create_avatar_tile(
+                    candidate_inner,
+                    person,
+                    candidate_avatar_size,
+                    "candidate_photo_refs",
+                    remove=False,
+                )
+                tile.grid(row=(idx // columns) + row_offset, column=idx % columns, padx=2, pady=8, sticky="n")
+
+        def _select_candidate(person_id):
+            pid = str(person_id)
+            if pid in state["selected_ids"]:
+                return
+            state["selected_ids"].append(pid)
+            _refresh_merge_views()
+
+        def _deselect_candidate(person_id):
+            pid = str(person_id)
+            if pid not in state["selected_ids"]:
+                return
+            state["selected_ids"].remove(pid)
+            _refresh_merge_views()
+
+        def _confirm_merge():
+            selected_people = [candidate_by_id[pid] for pid in state["selected_ids"] if pid in candidate_by_id]
+            if not selected_people:
+                return
+
+            preview_names = [
+                person.get("display_name", person.get("name", "未命名人物")) for person in selected_people[:8]
+            ]
+            preview_text = "\n".join(f"• {name}" for name in preview_names)
+            if len(selected_people) > 8:
+                preview_text += f"\n• 其余 {len(selected_people) - 8} 人"
+            if not messagebox.askyesno(
+                "确认合并",
+                f"目标人物（保留 ID）：\n{target_name}\n\n将合并以下人物：\n{preview_text}\n\n确认后将统一数据库中的人物 ID。",
+                parent=dlg,
+            ):
+                return
+
+            try:
+                from photo_identify.storage import Storage
+
+                for person in selected_people:
+                    for source in person.get("sources", []):
+                        db_path = source.get("db_path")
+                        source_id = str(source.get("person_id") or person["id"])
+                        if not db_path:
+                            continue
+                        storage = Storage(db_path)
+                        try:
+                            storage.merge_persons(target_id, source_id)
+                        finally:
+                            storage.close()
+
+                self.person_status_var.set(
+                    f"已将 {len(selected_people)} 个人物合并到 {target_name}，UUID 保留为 {target_id}。"
+                )
+                dlg.destroy()
+                self._refresh_persons(keep_selected_id=target_id, refresh_gallery=True)
+            except Exception as e:
+                messagebox.showerror("人物合并失败", f"执行人物合并时发生错误：\n{e}", parent=dlg)
+
+        title_frame = ttk.Frame(dlg, padding=(12, 12, 12, 4))
+        title_frame.pack(fill=tk.X)
+        ttk.Label(title_frame, text="基于人脸相似度的可视化人物合并", font=("Microsoft YaHei UI", 13, "bold")).pack(side=tk.LEFT)
+
+        merge_status_var = tk.StringVar(value="")
+        ttk.Label(
+            dlg,
+            text="上方为合并预览，下方为候选头像池。点击下方加入，点击上方撤销。",
+            padding=(12, 0, 12, 6),
+            foreground="#475569",
+        ).pack(fill=tk.X)
+
+        main_frame = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        preview_frame = ttk.LabelFrame(main_frame, text="合并预览区", padding=4)
+        preview_frame.pack(fill=tk.X, pady=(0, 8))
+
+        target_panel = tk.Frame(
+            preview_frame,
+            bg="#eef6ff",
+            bd=1,
+            relief="solid",
+            highlightthickness=2,
+            highlightbackground="#2563eb",
+            padx=4,
+            pady=4,
+        )
+        target_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        target_panel.pack_propagate(False)
+
+        target_avatar = _load_avatar(current_person, target_avatar_size)
+        if target_avatar is not None:
+            state["target_photo"] = ImageTk.PhotoImage(target_avatar)
+            target_canvas = tk.Canvas(
+                target_panel,
+                width=target_avatar_size + 6,
+                height=target_avatar_size + 6,
+                bg="#eef6ff",
+                bd=0,
+                highlightthickness=0,
+            )
+            target_canvas.pack(side=tk.TOP)
+            target_canvas.create_oval(3, 3, target_avatar_size + 3, target_avatar_size + 3, outline="#2563eb", width=2)
+            target_canvas.create_image((target_avatar_size + 6) // 2, (target_avatar_size + 6) // 2, image=state["target_photo"])
+        else:
+            target_canvas = tk.Label(target_panel, text="无头像", width=4, height=1, bg="#eef6ff")
+            target_canvas.pack(side=tk.TOP)
+        _bind_right_click_for_details(target_id, target_panel, target_canvas)
+
+        selected_panel = tk.Frame(
+            preview_frame,
+            bg="#fffaf5",
+            bd=1,
+            relief="solid",
+            highlightthickness=1,
+            highlightbackground="#fdba74",
+            padx=4,
+            pady=4,
+        )
+        selected_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        selected_panel.pack_propagate(False)
+        selected_inner = tk.Frame(selected_panel, bg="#fffaf5")
+        selected_inner.pack(fill=tk.BOTH, expand=True)
+        selected_inner.pack_propagate(False)
+
+        candidate_frame = ttk.LabelFrame(main_frame, text="候选池", padding=8)
+        candidate_frame.pack(fill=tk.BOTH, expand=True)
+
+        candidate_canvas = tk.Canvas(candidate_frame, bg=bg_color, highlightthickness=0)
+        candidate_scrollbar = ttk.Scrollbar(candidate_frame, orient=tk.VERTICAL, command=candidate_canvas.yview)
+        candidate_canvas.configure(yscrollcommand=candidate_scrollbar.set)
+        candidate_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        candidate_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        candidate_inner = tk.Frame(candidate_canvas, bg=bg_color)
+        candidate_window = candidate_canvas.create_window((0, 0), window=candidate_inner, anchor="nw")
+
+        def _on_candidate_canvas_configure(event):
+            candidate_canvas.itemconfig(candidate_window, width=event.width)
+            if dlg.winfo_exists():
+                _schedule_candidate_pool_render()
+
+        def _on_candidate_frame_configure(event):
+            candidate_canvas.configure(scrollregion=candidate_canvas.bbox("all"))
+
+        candidate_canvas.bind("<Configure>", _on_candidate_canvas_configure)
+        candidate_inner.bind("<Configure>", _on_candidate_frame_configure)
+        candidate_canvas.bind_all(
+            "<MouseWheel>",
+            lambda e: candidate_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units") if self._is_in_widget(e, candidate_canvas) else None,
+        )
+
+        footer = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        footer.pack(fill=tk.X)
+        ttk.Label(footer, textvariable=merge_status_var, foreground="#2563eb").pack(side=tk.LEFT)
+
+        candidate_pager = ttk.Frame(footer)
+        candidate_pager.pack(side=tk.RIGHT, padx=(0, 8))
+        first_candidate_btn = ttk.Button(candidate_pager, text="<<", width=3, command=lambda: _go_to_candidate_page(1))
+        first_candidate_btn.pack(side=tk.LEFT)
+        prev_candidate_btn = ttk.Button(candidate_pager, text="<", width=3, command=_prev_candidate_page)
+        prev_candidate_btn.pack(side=tk.LEFT, padx=(4, 0))
+        candidate_page_var = tk.StringVar(value="1")
+        candidate_page_entry = ttk.Entry(candidate_pager, textvariable=candidate_page_var, width=6, justify="center")
+        candidate_page_entry.pack(side=tk.LEFT, padx=4)
+        candidate_page_entry.bind("<Return>", _go_to_candidate_page_from_entry)
+        candidate_page_total_var = tk.StringVar(value="/ 1")
+        ttk.Label(candidate_pager, textvariable=candidate_page_total_var).pack(side=tk.LEFT)
+        next_candidate_btn = ttk.Button(candidate_pager, text=">", width=3, command=_next_candidate_page)
+        next_candidate_btn.pack(side=tk.LEFT, padx=(4, 0))
+        last_candidate_btn = ttk.Button(candidate_pager, text=">>", width=3, command=lambda: _go_to_candidate_page(_get_candidate_total_pages()))
+        last_candidate_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Button(footer, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
+        confirm_btn = ttk.Button(footer, text="确认合并", command=_confirm_merge, state=tk.DISABLED)
+        confirm_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
+        _refresh_merge_views()
+
+        def _load_candidate_images():
+            for person in candidates:
+                if not dlg.winfo_exists():
+                    return
+                person_id = str(person["id"])
+                state["candidate_images"][person_id] = _load_avatar(person, candidate_avatar_size)
+            if dlg.winfo_exists():
+                self.after(0, lambda: dlg.winfo_exists() and _refresh_merge_views())
+
+        threading.Thread(target=_load_candidate_images, daemon=True).start()
+
+        dlg.update_idletasks()
+        pw = self.winfo_rootx() + self.winfo_width() // 2
+        ph = self.winfo_rooty() + self.winfo_height() // 2
+        w, h = dlg.winfo_width(), dlg.winfo_height()
+        dlg.geometry(f"+{pw - w // 2}+{ph - h // 2}")
+
+    def _find_similar_persons(self):
+        if not self.search_dbs:
+            messagebox.showinfo("提示", "请先在图片检索页添加数据库。")
+            return
+
+        try:
+            from photo_identify.person_merge import build_similarity_candidates
+
+            candidates = build_similarity_candidates(self.search_dbs, threshold=0.9)
+        except Exception as e:
+            messagebox.showerror("查找失败", f"计算相似人物失败：\n{e}", parent=self)
+            return
+
+        if not candidates:
+            messagebox.showinfo("查找相似人物", "未找到相似度大于 0.9 的人物候选。", parent=self)
+            return
+
+        preview_lines = []
+        for idx, item in enumerate(candidates[:20], start=1):
+            preview_lines.append(
+                f"{idx}. {item['left_display_name']} ↔ {item['right_display_name']}  相似度={item['similarity']:.4f}"
+            )
+        self.person_status_var.set(f"发现 {len(candidates)} 组相似人物候选。")
+        messagebox.showinfo("查找相似人物", "\n".join(preview_lines), parent=self)
+
+    def _show_trash_bin(self):
+        if not self.search_dbs:
+            messagebox.showinfo("提示", "请先在图片检索页添加数据库。")
+            return
+
+        try:
+            from photo_identify.person_merge import load_combined_persons
+            from photo_identify.storage import Storage
+        except Exception as e:
+            messagebox.showerror("错误", f"加载回收站失败: {e}", parent=self)
+            return
+
+        bg_color = getattr(self, "_bg_color", "#f0f0f0")
+        avatar_size = 60
+        tile_step = avatar_size + 18
+        page_size = 120
+
+        try:
+            all_people = load_combined_persons(self.search_dbs, include_deleted=True)
+        except Exception as e:
+            messagebox.showerror("错误", f"加载回收站失败: {e}", parent=self)
+            return
+
+        deleted_people = []
+        active_people = []
+        for person in all_people:
+            sources = list(person.get("sources", []))
+            is_deleted = any(int(source.get("is_deleted") or 0) for source in sources)
+            normalized_person = dict(person)
+            normalized_person["id"] = str(person.get("id") or "")
+            if is_deleted:
+                deleted_people.append(normalized_person)
+            else:
+                active_people.append(normalized_person)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("人物回收站")
+        dlg.geometry("1080x840")
+        dlg.minsize(960, 720)
+        dlg.configure(bg=bg_color)
+        dlg.transient(self)
+        dlg.lift()
+        dlg.focus_force()
+
+        state = {
+            "deleted_people": deleted_people,
+            "active_people": active_people,
+            "image_cache": {},
+            "photo_refs": {"deleted": [], "active": []},
+            "deleted_current_page": 1,
+            "active_current_page": 1,
+            "deleted_render_scheduled": False,
+            "active_render_scheduled": False,
+            "busy": False,
+        }
+
+        def _load_avatar(person_data, size):
+            try:
+                file_path, actual_path = split_media_record_path(person_data.get("path"))
+                if actual_path and os.path.isfile(actual_path):
+                    return load_cached_face_avatar_image(file_path, person_data.get("bbox") or "[]", size=size)
+            except Exception:
+                return None
+            return None
+
+        def _sort_people(items):
+            items.sort(
+                key=lambda row: (
+                    -int(row.get("face_count") or 0),
+                    str(row.get("display_name") or row.get("name") or "").lower(),
+                    str(row.get("id") or ""),
+                )
+            )
+
+        def _persist_deleted_state(person_data, is_deleted):
+            for source in person_data.get("sources", []):
+                db_path = source.get("db_path")
+                source_person_id = str(source.get("person_id") or person_data.get("id") or "")
+                if not db_path or not source_person_id:
+                    continue
+                storage = Storage(db_path)
+                try:
+                    storage.set_person_deleted(source_person_id, 1 if is_deleted else 0)
+                finally:
+                    storage.close()
+                source["is_deleted"] = 1 if is_deleted else 0
+
+        def _get_people(list_key):
+            return state["deleted_people"] if list_key == "deleted" else state["active_people"]
+
+        def _get_page_layout(list_key):
+            canvas = deleted_canvas if list_key == "deleted" else active_canvas
+            available_width = max(720, int(canvas.winfo_width() or 0))
+            available_height = max(220, int(canvas.winfo_height() or 0))
+            columns = max(1, available_width // max(1, tile_step))
+            row_height = avatar_size + 48
+            rows = max(1, available_height // max(1, row_height))
+            return columns, rows, max(1, columns * rows)
+
+        def _get_total_pages(list_key):
+            _, _, visible_page_size = _get_page_layout(list_key)
+            return max(1, math.ceil(len(_get_people(list_key)) / max(1, visible_page_size)))
+
+        def _normalize_page(list_key):
+            page_key = f"{list_key}_current_page"
+            current_page = max(1, int(state.get(page_key, 1)))
+            total_pages = _get_total_pages(list_key)
+            normalized_page = min(current_page, total_pages)
+            state[page_key] = normalized_page
+            return normalized_page
+
+        def _get_visible_people(list_key):
+            people = _get_people(list_key)
+            current_page = _normalize_page(list_key)
+            _, _, visible_page_size = _get_page_layout(list_key)
+            start_idx = (current_page - 1) * visible_page_size
+            stop_idx = start_idx + visible_page_size
+            return people[start_idx:stop_idx]
+
+        def _update_status():
+            deleted_total = len(state["deleted_people"])
+            active_total = len(state["active_people"])
+            deleted_page = _normalize_page("deleted")
+            active_page = _normalize_page("active")
+            deleted_total_pages = _get_total_pages("deleted")
+            active_total_pages = _get_total_pages("active")
+            deleted_visible = _get_visible_people("deleted")
+            active_visible = _get_visible_people("active")
+            _, _, deleted_page_size = _get_page_layout("deleted")
+            _, _, active_page_size = _get_page_layout("active")
+            deleted_start = ((deleted_page - 1) * deleted_page_size + 1) if deleted_total else 0
+            deleted_end = ((deleted_page - 1) * deleted_page_size + len(deleted_visible)) if deleted_total else 0
+            active_start = ((active_page - 1) * active_page_size + 1) if active_total else 0
+            active_end = ((active_page - 1) * active_page_size + len(active_visible)) if active_total else 0
+
+            deleted_status_var.set(
+                f"回收站共 {deleted_total} 人。"
+                + (f" 当前第 {deleted_page}/{deleted_total_pages} 页，显示 {deleted_start}-{deleted_end}。" if deleted_total else " 当前为空。")
+            )
+            active_status_var.set(
+                f"正常人物共 {active_total} 人。"
+                + (f" 当前第 {active_page}/{active_total_pages} 页，显示 {active_start}-{active_end}。" if active_total else " 当前为空。")
+            )
+
+            deleted_page_var.set(str(deleted_page))
+            deleted_page_total_var.set(f"/ {deleted_total_pages}")
+            active_page_var.set(str(active_page))
+            active_page_total_var.set(f"/ {active_total_pages}")
+
+            deleted_first_btn.configure(state=tk.NORMAL if deleted_page > 1 else tk.DISABLED)
+            deleted_prev_btn.configure(state=tk.NORMAL if deleted_page > 1 else tk.DISABLED)
+            deleted_next_btn.configure(state=tk.NORMAL if deleted_page < deleted_total_pages else tk.DISABLED)
+            deleted_last_btn.configure(state=tk.NORMAL if deleted_page < deleted_total_pages else tk.DISABLED)
+            active_first_btn.configure(state=tk.NORMAL if active_page > 1 else tk.DISABLED)
+            active_prev_btn.configure(state=tk.NORMAL if active_page > 1 else tk.DISABLED)
+            active_next_btn.configure(state=tk.NORMAL if active_page < active_total_pages else tk.DISABLED)
+            active_last_btn.configure(state=tk.NORMAL if active_page < active_total_pages else tk.DISABLED)
+
+        def _schedule_render(list_key):
+            flag_key = f"{list_key}_render_scheduled"
+            if state[flag_key]:
+                return
+            state[flag_key] = True
+
+            def _run_render():
+                state[flag_key] = False
+                if dlg.winfo_exists():
+                    _render_pool(list_key)
+
+            self.after_idle(_run_render)
+
+        def _refresh_views():
+            _update_status()
+            _schedule_render("deleted")
+            _schedule_render("active")
+
+        def _go_to_page(list_key, page):
+            page_key = f"{list_key}_current_page"
+            state[page_key] = min(max(1, int(page)), _get_total_pages(list_key))
+            _refresh_views()
+
+        def _go_to_page_from_entry(list_key, page_var):
+            try:
+                requested_page = int(str(page_var.get()).strip())
+            except Exception:
+                requested_page = int(state.get(f"{list_key}_current_page", 1))
+            _go_to_page(list_key, requested_page)
+
+        def _move_person(person_id, from_key, to_key, target_deleted_state):
+            if state["busy"]:
+                return
+
+            source_list = _get_people(from_key)
+            target_list = _get_people(to_key)
+            person = next((item for item in source_list if str(item.get("id")) == str(person_id)), None)
+            if person is None:
+                return
+
+            state["busy"] = True
+            try:
+                _persist_deleted_state(person, target_deleted_state)
+                source_list.remove(person)
+                target_list.append(person)
+                _sort_people(source_list)
+                _sort_people(target_list)
+                _normalize_page(from_key)
+                _normalize_page(to_key)
+                self.person_status_var.set(
+                    f"已将 {person.get('display_name', person.get('name', '未命名人物'))}"
+                    + (" 移入人物回收站。" if target_deleted_state else " 移出人物回收站。")
+                )
+                self._refresh_persons()
+                _refresh_views()
+            except Exception as e:
+                messagebox.showerror("错误", f"更新人物回收站失败：\n{e}", parent=dlg)
+            finally:
+                state["busy"] = False
+
+        def _load_person_images_for_details(person_data):
+            images = []
+            for source in person_data.get("sources", []):
+                db_path = source.get("db_path")
+                if not db_path:
+                    continue
+                storage = Storage(db_path)
+                try:
+                    db_images = storage.get_images_by_person(str(source.get("person_id") or person_data.get("id") or ""))
+                    for img in db_images:
+                        img["db_path"] = db_path
+                    images.extend(db_images)
+                finally:
+                    storage.close()
+            images.sort(key=lambda row: (str(row.get("modified_time") or ""), int(row.get("id") or 0)), reverse=True)
+            return images
+
+        def _show_person_details_from_trash(person_data, *, focus_list):
+            target_person_id = str(person_data.get("id") or "")
+            self.notebook.select(self.person_tab)
+            if focus_list and target_person_id:
+                for index, person in enumerate(self.person_list):
+                    if str(person.get("id")) == target_person_id:
+                        self._go_to_person_page(index // self._person_page_size + 1, auto_select_id=target_person_id, refresh_gallery=True)
+                        return
+            try:
+                images = _load_person_images_for_details(person_data)
+                self.person_image_count_var.set(f"包含此人的照片总数: {len(images)}")
+                self._load_person_thumbnails(images, person_data)
+            except Exception as e:
+                self.person_status_var.set(f"加载照片失败: {e}")
+
+        def _bind_person_actions(person_id, list_key, *widgets):
+            target_key = "active" if list_key == "deleted" else "deleted"
+            target_deleted_state = list_key != "deleted"
+
+            def _handler(event, pid=person_id, from_key=list_key, to_key=target_key, deleted_state=target_deleted_state):
+                _move_person(pid, from_key, to_key, deleted_state)
+
+            for widget in widgets:
+                widget.bind("<Button-1>", _handler)
+
+        def _bind_right_click_for_details(person_data, list_key, *widgets):
+            def _handler(event, current_person=person_data, current_key=list_key):
+                _show_person_details_from_trash(current_person, focus_list=(current_key == "active"))
+
+            for widget in widgets:
+                widget.bind("<Button-3>", _handler)
+
+        def _create_person_tile(parent, person, list_key, refs_key):
+            person_id = str(person.get("id") or "")
+            tile_bg = parent.cget("bg")
+            ring_color = "#ef4444" if list_key == "deleted" else "#2563eb"
+            badge_bg = "#b91c1c"
+            badge_text = "回收站"
+
+            tile = tk.Frame(parent, bg=tile_bg, cursor="hand2", padx=2, pady=2)
+            canvas_size = avatar_size + 6
+            avatar_canvas = tk.Canvas(
+                tile,
+                width=canvas_size,
+                height=canvas_size,
+                bg=tile_bg,
+                bd=0,
+                highlightthickness=0,
+            )
+            avatar_canvas.pack(side=tk.TOP)
+            avatar_canvas.create_oval(3, 3, canvas_size - 3, canvas_size - 3, outline=ring_color, width=2)
+
+            photo = None
+            avatar = state["image_cache"].get(person_id)
+            if avatar is not None:
+                try:
+                    photo = ImageTk.PhotoImage(avatar)
+                except Exception:
+                    photo = None
+            if photo is not None:
+                state["photo_refs"][refs_key].append(photo)
+                avatar_canvas.create_image(canvas_size // 2, canvas_size // 2, image=photo)
+            else:
+                avatar_canvas.create_text(
+                    canvas_size // 2,
+                    canvas_size // 2,
+                    text="…",
+                    fill="#94a3b8",
+                    font=("Microsoft YaHei UI", max(8, avatar_size // 2), "bold"),
+                )
+
+            badge = None
+            if list_key == "deleted":
+                badge = tk.Label(
+                    tile,
+                    text=badge_text,
+                    bg=badge_bg,
+                    fg="white",
+                    font=("Microsoft YaHei UI", 9, "bold"),
+                    padx=4,
+                    pady=0,
+                )
+                badge.place(in_=avatar_canvas, relx=1.0, x=-1, y=1, anchor="ne")
+
+            display_name = person.get("display_name") or person.get("name", "未命名人物")
+            name_lbl = tk.Label(
+                tile,
+                text=display_name,
+                bg=tile_bg,
+                fg="#0f172a",
+                font=("Microsoft YaHei UI", 9),
+                width=16,
+                anchor="center",
+            )
+            name_lbl.pack(side=tk.TOP, pady=(4, 0))
+            count_lbl = tk.Label(
+                tile,
+                text=f"{int(person.get('face_count') or 0)} 张",
+                bg=tile_bg,
+                fg="#64748b",
+                font=("Microsoft YaHei UI", 8),
+                anchor="center",
+            )
+            count_lbl.pack(side=tk.TOP)
+
+            action_widgets = [tile, avatar_canvas, name_lbl, count_lbl]
+            if badge is not None:
+                action_widgets.append(badge)
+            _bind_person_actions(person_id, list_key, *action_widgets)
+            _bind_right_click_for_details(person, list_key, *action_widgets)
+            return tile
+
+        def _render_pool(list_key):
+            inner = deleted_inner if list_key == "deleted" else active_inner
+            canvas = deleted_canvas if list_key == "deleted" else active_canvas
+            refs_key = list_key
+            for child in inner.winfo_children():
+                child.destroy()
+            state["photo_refs"][refs_key].clear()
+
+            visible_people = _get_visible_people(list_key)
+            if not visible_people:
+                tk.Label(
+                    inner,
+                    text="当前页没有人物。" if _get_people(list_key) else ("回收站当前为空。" if list_key == "deleted" else "当前没有正常人物。"),
+                    bg=bg_color,
+                    fg="#64748b",
+                    font=("Microsoft YaHei UI", 10),
+                    pady=16,
+                ).grid(row=0, column=0, sticky="w")
+                return
+
+            columns, _, _ = _get_page_layout(list_key)
+            for col in range(columns):
+                inner.grid_columnconfigure(col, weight=1, uniform=f"trash_{list_key}")
+            for idx, person in enumerate(visible_people):
+                tile = _create_person_tile(inner, person, list_key, refs_key)
+                tile.grid(row=idx // columns, column=idx % columns, padx=2, pady=8, sticky="n")
+
+        title_frame = ttk.Frame(dlg, padding=(12, 12, 12, 4))
+        title_frame.pack(fill=tk.X)
+        ttk.Label(title_frame, text="人物回收站", font=("Microsoft YaHei UI", 13, "bold")).pack(side=tk.LEFT)
+
+        main_frame = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        deleted_frame = ttk.LabelFrame(main_frame, text="回收站", padding=8)
+        deleted_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        deleted_body = ttk.Frame(deleted_frame)
+        deleted_body.pack(fill=tk.BOTH, expand=True)
+        deleted_canvas = tk.Canvas(deleted_body, bg=bg_color, highlightthickness=0)
+        deleted_canvas.pack(fill=tk.BOTH, expand=True)
+
+        deleted_inner = tk.Frame(deleted_canvas, bg=bg_color)
+        deleted_window = deleted_canvas.create_window((0, 0), window=deleted_inner, anchor="nw")
+
+        def _on_deleted_canvas_configure(event):
+            deleted_canvas.itemconfig(deleted_window, width=event.width)
+            if dlg.winfo_exists():
+                _schedule_render("deleted")
+
+        deleted_canvas.bind("<Configure>", _on_deleted_canvas_configure)
+
+        deleted_footer = ttk.Frame(deleted_frame, padding=(0, 8, 0, 0))
+        deleted_footer.pack(fill=tk.X)
+        ttk.Label(
+            deleted_footer,
+            text="点击上方人物可移出回收站。",
+            foreground="#64748b",
+        ).pack(anchor="w", pady=(0, 4))
+        deleted_status_bar = ttk.Frame(deleted_footer)
+        deleted_status_bar.pack(fill=tk.X)
+        deleted_status_var = tk.StringVar(value="")
+        ttk.Label(deleted_status_bar, textvariable=deleted_status_var, foreground="#b91c1c").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        deleted_pager = ttk.Frame(deleted_status_bar)
+        deleted_pager.pack(side=tk.RIGHT)
+        deleted_first_btn = ttk.Button(deleted_pager, text="<<", width=4, command=lambda: _go_to_page("deleted", 1))
+        deleted_first_btn.pack(side=tk.LEFT)
+        deleted_prev_btn = ttk.Button(deleted_pager, text="<", width=4, command=lambda: _go_to_page("deleted", int(state.get("deleted_current_page", 1)) - 1))
+        deleted_prev_btn.pack(side=tk.LEFT, padx=(4, 0))
+        deleted_page_var = tk.StringVar(value="1")
+        deleted_page_entry = ttk.Entry(deleted_pager, textvariable=deleted_page_var, width=6, justify="center")
+        deleted_page_entry.pack(side=tk.LEFT, padx=4)
+        deleted_page_entry.bind("<Return>", lambda event: _go_to_page_from_entry("deleted", deleted_page_var))
+        deleted_page_total_var = tk.StringVar(value="/ 1")
+        ttk.Label(deleted_pager, textvariable=deleted_page_total_var).pack(side=tk.LEFT)
+        deleted_next_btn = ttk.Button(deleted_pager, text=">", width=4, command=lambda: _go_to_page("deleted", int(state.get("deleted_current_page", 1)) + 1))
+        deleted_next_btn.pack(side=tk.LEFT, padx=(4, 0))
+        deleted_last_btn = ttk.Button(deleted_pager, text=">>", width=4, command=lambda: _go_to_page("deleted", _get_total_pages("deleted")))
+        deleted_last_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        active_frame = ttk.LabelFrame(main_frame, text="正常人物", padding=8)
+        active_frame.pack(fill=tk.BOTH, expand=True)
+
+        active_body = ttk.Frame(active_frame)
+        active_body.pack(fill=tk.BOTH, expand=True)
+        active_canvas = tk.Canvas(active_body, bg=bg_color, highlightthickness=0)
+        active_canvas.pack(fill=tk.BOTH, expand=True)
+
+        active_inner = tk.Frame(active_canvas, bg=bg_color)
+        active_window = active_canvas.create_window((0, 0), window=active_inner, anchor="nw")
+
+        def _on_active_canvas_configure(event):
+            active_canvas.itemconfig(active_window, width=event.width)
+            if dlg.winfo_exists():
+                _schedule_render("active")
+
+        active_canvas.bind("<Configure>", _on_active_canvas_configure)
+
+        active_footer = ttk.Frame(active_frame, padding=(0, 8, 0, 0))
+        active_footer.pack(fill=tk.X)
+        ttk.Label(
+            active_footer,
+            text="点击下方人物可移入回收站。",
+            foreground="#64748b",
+        ).pack(anchor="w", pady=(0, 4))
+        active_status_bar = ttk.Frame(active_footer)
+        active_status_bar.pack(fill=tk.X)
+        active_status_var = tk.StringVar(value="")
+        ttk.Label(active_status_bar, textvariable=active_status_var, foreground="#2563eb").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        active_pager = ttk.Frame(active_status_bar)
+        active_pager.pack(side=tk.RIGHT)
+        active_first_btn = ttk.Button(active_pager, text="<<", width=4, command=lambda: _go_to_page("active", 1))
+        active_first_btn.pack(side=tk.LEFT)
+        active_prev_btn = ttk.Button(active_pager, text="<", width=4, command=lambda: _go_to_page("active", int(state.get("active_current_page", 1)) - 1))
+        active_prev_btn.pack(side=tk.LEFT, padx=(4, 0))
+        active_page_var = tk.StringVar(value="1")
+        active_page_entry = ttk.Entry(active_pager, textvariable=active_page_var, width=6, justify="center")
+        active_page_entry.pack(side=tk.LEFT, padx=4)
+        active_page_entry.bind("<Return>", lambda event: _go_to_page_from_entry("active", active_page_var))
+        active_page_total_var = tk.StringVar(value="/ 1")
+        ttk.Label(active_pager, textvariable=active_page_total_var).pack(side=tk.LEFT)
+        active_next_btn = ttk.Button(active_pager, text=">", width=4, command=lambda: _go_to_page("active", int(state.get("active_current_page", 1)) + 1))
+        active_next_btn.pack(side=tk.LEFT, padx=(4, 0))
+        active_last_btn = ttk.Button(active_pager, text=">>", width=4, command=lambda: _go_to_page("active", _get_total_pages("active")))
+        active_last_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        dialog_footer = ttk.Frame(dlg, padding=(12, 0, 12, 12))
+        dialog_footer.pack(fill=tk.X)
+        ttk.Button(dialog_footer, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        _sort_people(state["deleted_people"])
+        _sort_people(state["active_people"])
+        _refresh_views()
+
+        def _load_trash_images():
+            for person in state["deleted_people"] + state["active_people"]:
+                if not dlg.winfo_exists():
+                    return
+                person_id = str(person.get("id") or "")
+                state["image_cache"][person_id] = _load_avatar(person, avatar_size)
+            if dlg.winfo_exists():
+                self.after(0, lambda: dlg.winfo_exists() and _refresh_views())
+
+        threading.Thread(target=_load_trash_images, daemon=True).start()
+
         dlg.update_idletasks()
         pw = self.winfo_rootx() + self.winfo_width() // 2
         ph = self.winfo_rooty() + self.winfo_height() // 2
         w, h = dlg.winfo_width(), dlg.winfo_height()
         dlg.geometry(f"+{pw - w // 2}+{ph - h // 2}")
     def _rename_person(self, person_id):
+        person_id = str(person_id)
         if person_id not in self._person_frames:
             return
         frame = self._person_frames[person_id]
@@ -1733,22 +3178,32 @@ class PhotoIdentifyGUI(tk.Tk):
         if not name_var:
             return
         old_name = name_var.get()
-        import tkinter.simpledialog as simpledialog
         new_name = simpledialog.askstring("重命名人物", "请输入新的姓名:", initialvalue=old_name, parent=self)
         if new_name and new_name.strip() and new_name != old_name:
             try:
                 from photo_identify.storage import Storage
-                storage = Storage(self.scan_db_var.get())
-                storage.update_person_name(person_id, new_name.strip())
-                storage.close()
-                name_var.set(new_name.strip())
+
                 p_data = getattr(frame, "person_data", {})
+                for source in p_data.get("sources", []):
+                    db_path = source.get("db_path")
+                    source_person_id = str(source.get("person_id") or person_id)
+                    if not db_path:
+                        continue
+                    storage = Storage(db_path)
+                    try:
+                        storage.update_person_name(source_person_id, new_name.strip())
+                    finally:
+                        storage.close()
+                name_var.set(new_name.strip())
                 if p_data:
                     p_data["name"] = new_name.strip()
+                    p_data["display_name"] = new_name.strip()
+                self._refresh_persons(keep_selected_id=person_id, refresh_gallery=True)
             except Exception as e:
                 messagebox.showerror("重命名失败", f"数据库更新错误:\n{e}")
 
     def _delete_person(self, person_id):
+        person_id = str(person_id)
         if person_id not in self._person_frames:
             return
         frame = self._person_frames[person_id]
@@ -1757,100 +3212,61 @@ class PhotoIdentifyGUI(tk.Tk):
         if messagebox.askyesno("确认删除", f"确定要将 {name} 移入回收站吗？\n下次扫描该人物也不会恢复显示。"):
             try:
                 from photo_identify.storage import Storage
-                storage = Storage(self.scan_db_var.get())
-                storage.set_person_deleted(person_id, 1)
-                storage.close()
-                self._refresh_persons() # 刷新列表
+
+                p_data = getattr(frame, "person_data", {})
+                for source in p_data.get("sources", []):
+                    db_path = source.get("db_path")
+                    source_person_id = str(source.get("person_id") or person_id)
+                    if not db_path:
+                        continue
+                    storage = Storage(db_path)
+                    try:
+                        storage.set_person_deleted(source_person_id, 1)
+                    finally:
+                        storage.close()
+                self._refresh_persons()
             except Exception as e:
                 messagebox.showerror("删除失败", f"数据库更新错误:\n{e}")
 
-    def _move_person(self, person_id, direction):
-        # 使用跟踪的显示顺序，而非 winfo_children()（后者始终返回创建顺序，排序后会失效）
-        if self._person_frame_order is None:
-            self._person_frame_order = list(self.person_list_inner_frame.winfo_children())
-
-        frames_list = list(self._person_frame_order)
-        idx = -1
-        for i, f in enumerate(frames_list):
-            p_data = getattr(f, "person_data", None)
-            if p_data and p_data["id"] == person_id:
-                idx = i
-                break
-
-        if idx == -1:
+    def _toggle_person_pin(self, person_id):
+        person_id = str(person_id)
+        person_data = self._person_data_by_id.get(person_id)
+        if not person_data:
             return
 
-        new_idx = idx + direction
-        if 0 <= new_idx < len(frames_list):
-            # 交换位置
-            frames_list.insert(new_idx, frames_list.pop(idx))
-            # 重新 pack
-            for f in frames_list:
-                f.pack_forget()
-            for f in frames_list:
-                f.pack(side=tk.TOP, fill=tk.X, expand=True)
+        new_pinned = not bool(person_data.get("is_pinned"))
+        try:
+            from photo_identify.storage import Storage
 
-            # 更新跟踪的显示顺序
-            self._person_frame_order = frames_list
-                
-            # 保存到数据库
-            try:
-                from photo_identify.storage import Storage
-                storage = Storage(self.scan_db_var.get())
-                person_ids_in_order = [getattr(f, "person_data")["id"] for f in frames_list if hasattr(f, "person_data")]
-                storage.update_person_sort_order(person_ids_in_order)
-                storage.close()
-            except Exception as e:
-                print(f"Error saving sort order: {e}")
-
-
-    def _load_person_thumbnails(self, images, person_data):
-        self.person_gallery_text.configure(state="normal")
-        self.person_gallery_text.delete(1.0, tk.END)
-        self.person_gallery_text.configure(state="disabled")
-        self.gallery_thumbnail_images.clear()
-        
-        self._gallery_gen += 1
-        current_gen = self._gallery_gen
-        
-        # 先在第一张强行插入该人物当前的圆角头像，然后再启动其它图片的加载线程
-        def _add_cover():
-            img = None
-            try:
-                if person_data.get("path") and os.path.isfile(person_data["path"]):
-                    frame_bytes = get_image_frame_bytes(person_data["path"])
-                    pil_img = Image.open(io.BytesIO(frame_bytes))
-                    img = crop_and_circle_face(pil_img, person_data.get("bbox", "[]"), size=150)
-            except Exception:
-                pass
-            self.after(0, lambda: self._add_gallery_item(None, "【当前头像】", img, current_gen, is_cover=True, p_data=person_data))
-            self.after(0, lambda: threading.Thread(target=_thread, daemon=True).start())
-            
-        def _thread():
-            for i, record in enumerate(images):
-                if current_gen != self._gallery_gen:
-                    break
-                
-                file_path, actual_path = split_media_record_path(record.get("path"))
-                
-                img = None
+            for source in person_data.get("sources", []):
+                db_path = source.get("db_path")
+                source_person_id = str(source.get("person_id") or person_id)
+                if not db_path:
+                    continue
+                storage = Storage(db_path)
                 try:
-                    if os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(file_path)
-                        pil_img = Image.open(io.BytesIO(frame_bytes))
-                        pil_img = ImageOps.exif_transpose(pil_img)
-                        if pil_img.mode != 'RGB':
-                            pil_img = pil_img.convert('RGB')
-                            
-                        # 如果需要显示普通的照片缩略图
-                        pil_img.thumbnail((150, 150), Image.Resampling.LANCZOS)
-                        img = pil_img
-                except Exception:
-                    pass
-                
-                self.after(0, lambda r=record, image=img: self._add_gallery_item(r, None, image, current_gen, is_cover=False, p_data=person_data))
+                    storage.set_person_pinned(source_person_id, new_pinned)
+                finally:
+                    storage.close()
+                source["sort_order"] = -1 if new_pinned else 0
 
-        threading.Thread(target=_add_cover, daemon=True).start()
+            person_data["is_pinned"] = new_pinned
+            self.person_status_var.set(
+                f"{'已置顶' if new_pinned else '已取消置顶'} {person_data.get('display_name', person_data.get('name', '未命名人物'))}。"
+            )
+            self._refresh_persons(keep_selected_id=person_id, refresh_gallery=True)
+        except Exception as e:
+            messagebox.showerror("操作失败", f"更新人物置顶状态失败:\n{e}")
+
+
+    def _load_person_thumbnails(self, images, person_data, *, preserve_page=False, preserve_search=False):
+        self._all_person_gallery_records = list(images)
+        self._current_person_gallery_person_data = person_data
+        self._update_person_detail_meta(person_data)
+        if not preserve_search and hasattr(self, "person_gallery_search_var"):
+            self.person_gallery_search_var.set("")
+        query = self.person_gallery_search_var.get() if preserve_search and hasattr(self, "person_gallery_search_var") else ""
+        self._apply_person_gallery_filter(query=query, preserve_page=preserve_page)
 
     def _add_gallery_item(self, record, custom_name, img, gen, is_cover, p_data):
         if gen != self._gallery_gen:
@@ -1920,14 +3336,11 @@ class PhotoIdentifyGUI(tk.Tk):
                 self.clipboard_append(file_name)
             menu.add_command(label="复制文件名", command=lambda r=record: _copy_filename(r))
             def _set_cover(r=record):
-                person_id = p_data["id"]
+                person_id = str(p_data["id"])
                 image_id = r["id"]
-                # 由于这整个列表是基于 images 返回的，但是 cover 必须是 face_id
-                # 为了简便起见，在这个 record 里我们需要得到 face_id。但是 storage 里的查询只有 images 数据。
-                # 修改 storage 的 get_images_by_person 返回包含 face_id。
-                # 为了不改动过大，我们单独查一下该图像对应的当前人的 face_id
-                self._set_person_cover_action(person_id, p_data["cluster_id"], image_id)
-                
+                db_path = r.get("db_path", "")
+                self._set_person_cover_action(person_id, image_id, db_path)
+
             menu.add_command(label="设为头像", command=lambda r=record: _set_cover(r))
             
             def _open_loc(r=record):
@@ -1980,56 +3393,53 @@ class PhotoIdentifyGUI(tk.Tk):
         self.person_gallery_text.window_create("end", window=item_frame, padx=10, pady=10)
         self.person_gallery_text.configure(state="disabled")
 
-    def _set_person_cover_action(self, person_id, cluster_id, image_id):
+    def _set_person_cover_action(self, person_id, image_id, db_path):
         try:
             from photo_identify.storage import Storage
-            storage = Storage(self.scan_db_var.get())
-            # 找到这张图属于这个人的 face_id 和 bbox
-            cursor = storage._conn.cursor()
-            cursor.execute("SELECT id, bbox FROM face_embeddings WHERE image_id = ? AND cluster_id = ? LIMIT 1", (image_id, cluster_id))
-            row = cursor.fetchone()
-            if not row:
-                messagebox.showerror("错误", "该照片不包含此人脸，无法设为头像。")
+
+            storage = Storage(db_path)
+            try:
+                face_info = storage.get_person_face_for_image(str(person_id), image_id)
+                if not face_info:
+                    messagebox.showerror("错误", "该照片不包含此人脸，无法设为头像。")
+                    return
+                face_id, face_bbox = face_info
+                storage.update_person_cover(str(person_id), image_id, face_id)
+                cursor = storage._conn.cursor()
+                cursor.execute("SELECT path FROM images WHERE id = ?", (image_id,))
+                img_row = cursor.fetchone()
+                new_path = img_row[0] if img_row else ""
+            finally:
                 storage.close()
-                return
-            face_id = row[0]
-            face_bbox = row[1]
-            storage.update_person_cover(person_id, image_id, face_id)
-            
-            # 获取新的 path 用于局部更新
-            cursor.execute("SELECT path FROM images WHERE id = ?", (image_id,))
-            img_row = cursor.fetchone()
-            new_path = img_row[0] if img_row else ""
-            storage.close()
-            
-            # 局部更新逻辑
-            if person_id in self._person_frames:
-                frame = self._person_frames[person_id]
+
+            if str(person_id) in self._person_frames:
+                frame = self._person_frames[str(person_id)]
                 p_data = getattr(frame, "person_data", {})
                 if p_data:
                     p_data["cover_image_id"] = image_id
                     p_data["cover_face_id"] = face_id
                     p_data["path"] = new_path
                     p_data["bbox"] = face_bbox
-                    
-                    # 重新生成左侧小头像
+
                     try:
-                        _, actual_path = split_media_record_path(new_path)
+                        file_path, actual_path = split_media_record_path(new_path)
                         if os.path.isfile(actual_path):
-                            frame_bytes = get_image_frame_bytes(new_path)
-                            pil_img = Image.open(io.BytesIO(frame_bytes))
-                            img = crop_and_circle_face(pil_img, face_bbox, size=40)
+                            img = load_cached_face_avatar_image(file_path, face_bbox, size=40)
                             photo = ImageTk.PhotoImage(img)
                             self.person_thumbnail_images.append(photo)
                             img_lbl = getattr(frame, "img_lbl", None)
                             if img_lbl:
                                 img_lbl.configure(image=photo, text="", width=0, height=0)
-                    except Exception as e:
+                    except Exception:
                         pass
-                        
-                    # 重新选中，触发右侧画廊的重新渲染
-                    self._select_person(person_id, refresh_gallery=True)
-                
+
+                    self._select_person(
+                        str(person_id),
+                        refresh_gallery=True,
+                        preserve_gallery_page=True,
+                        preserve_gallery_search=True,
+                    )
+
         except Exception as e:
             messagebox.showerror("错误", f"更新头像失败:\n{e}")
 
@@ -2144,13 +3554,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 img = None
                 try:
                     if os.path.isfile(actual_path):
-                        frame_bytes = get_image_frame_bytes(file_path)
-                        pil_img = Image.open(io.BytesIO(frame_bytes))
-                        pil_img = ImageOps.exif_transpose(pil_img)
-                        if pil_img.mode != 'RGB':
-                            pil_img = pil_img.convert('RGB')
-                        pil_img.thumbnail((150, 150), Image.Resampling.LANCZOS)
-                        img = pil_img
+                        img = load_cached_thumbnail_image(file_path)
                 except:
                     pass
                 
@@ -2234,6 +3638,70 @@ class PhotoIdentifyGUI(tk.Tk):
         self.favorite_gallery_text.configure(state="normal")
         self.favorite_gallery_text.window_create("end", window=item_frame, padx=10, pady=10)
         self.favorite_gallery_text.configure(state="disabled")
+
+    # ── Tab 4.5: 缓存管理 ──────────────────────────────────────────
+
+    def _init_cache_tab(self):
+        container = ttk.Frame(self.cache_tab, padding=(16, 14))
+        container.pack(fill=tk.BOTH, expand=True)
+
+        settings_group = ttk.LabelFrame(container, text="缓存管理", padding=12)
+        settings_group.pack(fill=tk.X)
+        settings_group.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(settings_group, text="缓存目录:").grid(row=0, column=0, sticky=tk.W, pady=6)
+        self.cache_dir_entry = ttk.Entry(settings_group, textvariable=self.cache_dir_var)
+        self.cache_dir_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 8), pady=6)
+        self.cache_dir_entry.bind("<Return>", lambda e: self._apply_cache_settings_from_ui())
+        self.cache_apply_btn = ttk.Button(settings_group, text="💾 应用设置", command=self._apply_cache_settings_from_ui)
+        self.cache_apply_btn.grid(row=0, column=2, sticky=tk.E, pady=6)
+
+        ttk.Label(settings_group, text="容量上限:").grid(row=1, column=0, sticky=tk.W, pady=6)
+        size_frame = ttk.Frame(settings_group)
+        size_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=6)
+        self.cache_size_spinbox = ttk.Spinbox(size_frame, from_=1, to=102400, textvariable=self.cache_max_size_value_var, width=10)
+        self.cache_size_spinbox.pack(side=tk.LEFT)
+        self.cache_size_spinbox.bind("<Return>", lambda e: self._apply_cache_settings_from_ui())
+        self.cache_unit_combo = ttk.Combobox(size_frame, state="readonly", width=8, values=("MB", "GB"), textvariable=self.cache_max_size_unit_var)
+        self.cache_unit_combo.pack(side=tk.LEFT, padx=(8, 8))
+        self.cache_unit_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_cache_settings_from_ui())
+        ttk.Label(size_frame, text="默认 1GB，路径不存在会自动创建。", foreground="gray").pack(side=tk.LEFT)
+
+        ttk.Label(settings_group, text="重建并发:").grid(row=2, column=0, sticky=tk.W, pady=6)
+        worker_frame = ttk.Frame(settings_group)
+        worker_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=6)
+        self.cache_workers_spinbox = ttk.Spinbox(worker_frame, from_=1, to=32, textvariable=self.cache_rebuild_workers_var, width=10)
+        self.cache_workers_spinbox.pack(side=tk.LEFT)
+        self.cache_workers_spinbox.bind("<Return>", lambda e: self._apply_cache_settings_from_ui())
+        ttk.Label(worker_frame, text="建议 4-16，受磁盘与图片大小影响。", foreground="gray").pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(settings_group, text="当前用量:").grid(row=3, column=0, sticky=tk.NW, pady=(10, 6))
+        usage_frame = ttk.Frame(settings_group)
+        usage_frame.grid(row=3, column=1, columnspan=2, sticky=tk.EW, pady=(10, 6))
+        usage_frame.grid_columnconfigure(0, weight=1)
+        self.cache_usage_progress = ttk.Progressbar(usage_frame, mode="determinate", maximum=100)
+        self.cache_usage_progress.grid(row=0, column=0, sticky=tk.EW)
+        ttk.Label(usage_frame, textvariable=self.cache_usage_var).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+
+        action_frame = ttk.Frame(settings_group)
+        action_frame.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+        self.cache_open_dir_btn = ttk.Button(action_frame, text="📂 打开目录", command=self._open_cache_directory)
+        self.cache_open_dir_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.cache_clear_btn = ttk.Button(action_frame, text="🗑 清除缓存", command=self._clear_cache)
+        self.cache_clear_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.cache_rebuild_btn = ttk.Button(action_frame, text="▶ 继续缓存", command=self._rebuild_cache)
+        self.cache_rebuild_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.cache_pause_btn = ttk.Button(action_frame, text="⏸ 暂停", command=self._toggle_cache_rebuild_pause, state=tk.DISABLED)
+        self.cache_pause_btn.pack(side=tk.LEFT)
+
+        progress_group = ttk.LabelFrame(container, text="重建进度", padding=12)
+        progress_group.pack(fill=tk.X, pady=(12, 0))
+        progress_group.grid_columnconfigure(0, weight=1)
+        self.cache_rebuild_progress = ttk.Progressbar(progress_group, mode="determinate", maximum=100)
+        self.cache_rebuild_progress.grid(row=0, column=0, sticky=tk.EW)
+        ttk.Label(progress_group, textvariable=self.cache_rebuild_var).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Label(progress_group, textvariable=self.cache_eta_var, foreground="gray").grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Label(progress_group, textvariable=self.cache_action_status_var, foreground="blue", wraplength=860, justify=tk.LEFT).grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
 
     # ── Tab 4: 模型管理 ──────────────────────────────────────────
 
@@ -2545,6 +4013,464 @@ class PhotoIdentifyGUI(tk.Tk):
             seen.add(normalized)
             resolved_paths.append(normalized)
         return resolved_paths
+
+    def _normalize_cache_dir(self, raw_path: str) -> str:
+        normalized = str(raw_path or "").strip() or str(DEFAULT_CACHE_DIR)
+        normalized = os.path.expandvars(normalized)
+        return os.path.normpath(os.path.abspath(normalized))
+
+    def _parse_cache_limit_bytes(self) -> int:
+        unit = str(self.cache_max_size_unit_var.get() or "GB").upper()
+        if unit not in {"MB", "GB"}:
+            unit = "GB"
+        try:
+            value = int(float(self.cache_max_size_value_var.get()))
+        except (TypeError, ValueError):
+            value = 1 if unit == "GB" else DEFAULT_CACHE_MAX_SIZE_MB
+        value = max(value, 1)
+        self.cache_max_size_value_var.set(str(value))
+        self.cache_max_size_unit_var.set(unit)
+        factor = 1024 * 1024 if unit == "MB" else 1024 * 1024 * 1024
+        return value * factor
+
+    def _parse_cache_rebuild_workers(self) -> int:
+        try:
+            value = int(float(self.cache_rebuild_workers_var.get()))
+        except (TypeError, ValueError):
+            value = max(2, min((os.cpu_count() or 8), 8))
+        value = max(1, min(value, 32))
+        self.cache_rebuild_workers_var.set(str(value))
+        return value
+
+    def _apply_cache_settings_from_values(self, save: bool = False, refresh_usage: bool = True) -> None:
+        normalized_dir = self._normalize_cache_dir(self.cache_dir_var.get())
+        self.cache_dir_var.set(normalized_dir)
+        self._cache_limit_bytes = self._parse_cache_limit_bytes()
+        self._parse_cache_rebuild_workers()
+        cache = configure_thumbnail_cache(normalized_dir, self._cache_limit_bytes)
+        cache.cache_dir.mkdir(parents=True, exist_ok=True)
+        if save:
+            self._save_settings()
+        if refresh_usage and hasattr(self, "cache_usage_var"):
+            self._refresh_cache_usage_async()
+
+    def _apply_cache_settings_from_ui(self) -> None:
+        try:
+            self._apply_cache_settings_from_values(save=True, refresh_usage=True)
+            self.cache_action_status_var.set("缓存设置已保存。")
+        except Exception as e:
+            messagebox.showerror("错误", f"应用缓存设置失败: {e}")
+
+    def _update_cache_usage_display(self, used_bytes: int | None) -> None:
+        limit_bytes = max(int(getattr(self, "_cache_limit_bytes", DEFAULT_CACHE_MAX_SIZE_MB * 1024 * 1024)), 1)
+        if used_bytes is None:
+            progress = 0
+            text = f"已用: 计算中... / {format_bytes(limit_bytes)}"
+        else:
+            progress = min(100.0, (max(used_bytes, 0) / limit_bytes) * 100.0)
+            text = f"已用: {format_bytes(used_bytes)} / {format_bytes(limit_bytes)}"
+        if hasattr(self, "cache_usage_progress"):
+            self.cache_usage_progress.configure(value=progress)
+        if hasattr(self, "cache_usage_var"):
+            self.cache_usage_var.set(text)
+
+    def _refresh_cache_usage_async(self) -> None:
+        try:
+            self._apply_cache_settings_from_values(save=False, refresh_usage=False)
+        except Exception as e:
+            self.cache_action_status_var.set(f"缓存设置无效: {e}")
+            return
+
+        self._cache_usage_refresh_gen += 1
+        current_gen = self._cache_usage_refresh_gen
+        self._update_cache_usage_display(None)
+
+        def _thread():
+            try:
+                used_bytes = get_thumbnail_cache().folder_size()
+            except Exception as e:
+                self.after(0, lambda e=e: self.cache_action_status_var.set(f"读取缓存用量失败: {e}"))
+                return
+
+            def _update():
+                if current_gen != self._cache_usage_refresh_gen:
+                    return
+                self._update_cache_usage_display(used_bytes)
+
+            self.after(0, _update)
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _set_cache_controls_state(self, busy: bool) -> None:
+        state = tk.DISABLED if busy else tk.NORMAL
+        combo_state = "disabled" if busy else "readonly"
+        for attr in (
+            "cache_dir_entry",
+            "cache_size_spinbox",
+            "cache_workers_spinbox",
+            "cache_apply_btn",
+            "cache_open_dir_btn",
+            "cache_clear_btn",
+            "cache_rebuild_btn",
+        ):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.configure(state=state)
+        if hasattr(self, "cache_unit_combo"):
+            self.cache_unit_combo.configure(state=combo_state)
+        if hasattr(self, "cache_pause_btn"):
+            pause_text = "▶ 继续" if self._cache_rebuild_pause_event.is_set() else "⏸ 暂停"
+            pause_state = tk.NORMAL if self._cache_rebuild_running else tk.DISABLED
+            self.cache_pause_btn.configure(state=pause_state, text=pause_text)
+
+    def _format_cache_duration(self, seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours}小时{minutes}分{secs}秒"
+        if minutes > 0:
+            return f"{minutes}分{secs}秒"
+        return f"{secs}秒"
+
+    def _update_cache_eta_display(self) -> None:
+        if self._cache_rebuild_pause_event.is_set():
+            self.cache_eta_var.set("预计剩余: 已暂停")
+            return
+        if not self._cache_rebuild_running or self._cache_rebuild_total <= 0:
+            self.cache_eta_var.set("预计剩余: --")
+            return
+
+        session_completed = max(self._cache_rebuild_completed - self._cache_rebuild_initial_completed, 0)
+        if session_completed <= 0:
+            self.cache_eta_var.set("预计剩余: --")
+            return
+
+        paused_now = 0.0
+        if self._cache_rebuild_pause_started_at is not None:
+            paused_now = time.perf_counter() - self._cache_rebuild_pause_started_at
+        active_elapsed = max(
+            0.001,
+            time.perf_counter() - self._cache_rebuild_started_at - self._cache_rebuild_paused_seconds - paused_now,
+        )
+        remaining = max(self._cache_rebuild_total - self._cache_rebuild_completed, 0)
+        if remaining <= 0:
+            self.cache_eta_var.set("预计剩余: 0秒")
+            return
+        eta_seconds = active_elapsed / session_completed * remaining
+        self.cache_eta_var.set(f"预计剩余: {self._format_cache_duration(eta_seconds)}")
+
+    def _set_cache_rebuild_progress(self, current: int, total: int) -> None:
+        safe_total = max(int(total), 1)
+        current_value = min(max(int(current), 0), safe_total)
+        self._cache_rebuild_completed = current_value
+        self._cache_rebuild_total = safe_total
+        if hasattr(self, "cache_rebuild_progress"):
+            self.cache_rebuild_progress.configure(maximum=safe_total, value=current_value)
+        self.cache_rebuild_var.set(f"正在继续缓存: {current_value}/{safe_total}")
+        self._update_cache_eta_display()
+
+    def _toggle_cache_rebuild_pause(self) -> None:
+        if not self._cache_rebuild_running:
+            return
+        if self._cache_rebuild_pause_event.is_set():
+            self._cache_rebuild_pause_event.clear()
+            if self._cache_rebuild_pause_started_at is not None:
+                self._cache_rebuild_paused_seconds += time.perf_counter() - self._cache_rebuild_pause_started_at
+                self._cache_rebuild_pause_started_at = None
+            self.cache_action_status_var.set("继续缓存已继续。")
+            self.cache_pause_btn.configure(text="⏸ 暂停")
+            self._update_cache_eta_display()
+        else:
+            self._cache_rebuild_pause_started_at = time.perf_counter()
+            self._cache_rebuild_pause_event.set()
+            self.cache_action_status_var.set("继续缓存已暂停，当前进行中的任务完成后会暂停。")
+            self.cache_pause_btn.configure(text="▶ 继续")
+            self.cache_eta_var.set("预计剩余: 已暂停")
+
+    def _open_cache_directory(self) -> None:
+        try:
+            self._apply_cache_settings_from_values(save=True, refresh_usage=False)
+            cache_dir = get_thumbnail_cache().cache_dir
+        except Exception as e:
+            messagebox.showerror("错误", f"缓存目录配置无效: {e}")
+            return
+
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(cache_dir))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(cache_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(cache_dir)])
+            self.cache_action_status_var.set(f"已打开缓存目录: {cache_dir}")
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开缓存目录: {e}")
+
+    def _clear_cache(self) -> None:
+        if self._cache_rebuild_running:
+            messagebox.showinfo("提示", "缓存正在重建中，请稍候完成后再执行清理。")
+            return
+
+        try:
+            self._apply_cache_settings_from_values(save=True, refresh_usage=False)
+        except Exception as e:
+            messagebox.showerror("错误", f"缓存目录配置无效: {e}")
+            return
+
+        if not messagebox.askyesno("确认清除缓存", "确定要清空缓存目录中的所有缓存文件吗？\n将保留目录结构，但会删除所有缓存内容。"):
+            return
+
+        self._set_cache_controls_state(True)
+        self.cache_action_status_var.set("正在清除缓存...")
+        self.cache_rebuild_var.set("等待继续")
+        self.cache_eta_var.set("预计剩余: --")
+        self._cache_rebuild_initial_completed = 0
+        self._cache_rebuild_completed = 0
+        self._cache_rebuild_total = 0
+        if hasattr(self, "cache_rebuild_progress"):
+            self.cache_rebuild_progress.configure(maximum=100, value=0)
+
+        def _thread():
+            try:
+                deleted_count = get_thumbnail_cache().clear_files()
+
+                def _success():
+                    self._update_cache_usage_display(0)
+                    self.cache_action_status_var.set(f"缓存已清空，共删除 {deleted_count} 个文件。")
+                    self.cache_eta_var.set("预计剩余: --")
+                    self._set_cache_controls_state(False)
+
+                self.after(0, _success)
+            except Exception as e:
+                def _error(error=e):
+                    self.cache_action_status_var.set(f"清除缓存失败: {error}")
+                    self._set_cache_controls_state(False)
+                    messagebox.showerror("错误", f"清除缓存失败: {error}")
+
+                self.after(0, _error)
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _rebuild_cache(self) -> None:
+        if self._cache_rebuild_running:
+            messagebox.showinfo("提示", "继续缓存已在后台运行。")
+            return
+
+        try:
+            self._apply_cache_settings_from_values(save=True, refresh_usage=False)
+        except Exception as e:
+            messagebox.showerror("错误", f"缓存目录配置无效: {e}")
+            return
+
+        db_paths = self._get_favorite_db_paths()
+        if not db_paths:
+            messagebox.showinfo("提示", "当前没有可用于继续缓存的数据库。")
+            return
+
+        from photo_identify.storage import Storage
+
+        unique_paths: list[str] = []
+        pending_paths: list[str] = []
+        seen_paths: set[str] = set()
+        total_records = 0
+        cached_count = 0
+        try:
+            for db_path in db_paths:
+                storage = Storage(db_path)
+                try:
+                    records = storage.all_records()
+                finally:
+                    storage.close()
+                total_records += len(records)
+                for record in records:
+                    raw_path = str(record.get("path", "")).strip()
+                    if not raw_path or raw_path in seen_paths:
+                        continue
+                    seen_paths.add(raw_path)
+                    unique_paths.append(raw_path)
+                    if has_cached_thumbnail(raw_path):
+                        cached_count += 1
+                    else:
+                        pending_paths.append(raw_path)
+        except Exception as e:
+            messagebox.showerror("错误", f"读取数据库记录失败: {e}")
+            return
+
+        if not unique_paths:
+            messagebox.showinfo("提示", "当前数据库没有可继续缓存的图片记录。")
+            return
+
+        total_unique = len(unique_paths)
+        worker_count = self._parse_cache_rebuild_workers()
+        if not messagebox.askyesno(
+            "确认继续缓存",
+            (
+                f"即将继续缓存：\n"
+                f"- 数据库数: {len(db_paths)}\n"
+                f"- 记录数: {total_records}\n"
+                f"- 去重后文件数: {total_unique}\n"
+                f"- 已存在缓存: {cached_count}\n"
+                f"- 待补齐缓存: {len(pending_paths)}\n"
+                f"- 缓存目录: {self.cache_dir_var.get()}\n"
+                f"- 并发线程: {worker_count}\n\n"
+                f"本次不会清空现有缓存，只会补齐缺失项。是否继续执行？"
+            ),
+        ):
+            return
+
+        if not pending_paths:
+            self._cache_rebuild_initial_completed = total_unique
+            self._cache_rebuild_completed = total_unique
+            self._cache_rebuild_total = total_unique
+            self._set_cache_rebuild_progress(total_unique, total_unique)
+            self.cache_eta_var.set("预计剩余: 0秒")
+            self.cache_action_status_var.set("缓存已完整，无需继续。")
+            self._refresh_cache_usage_async()
+            return
+
+        self._cache_rebuild_running = True
+        self._cache_rebuild_pause_event.clear()
+        self._cache_rebuild_pause_started_at = None
+        self._cache_rebuild_paused_seconds = 0.0
+        self._cache_rebuild_started_at = time.perf_counter()
+        self._cache_rebuild_initial_completed = cached_count
+        self._cache_rebuild_completed = cached_count
+        self._cache_rebuild_total = total_unique
+        self._set_cache_controls_state(True)
+        self.cache_action_status_var.set(
+            f"正在继续缓存，已命中 {cached_count} 项，将补齐 {len(pending_paths)} 项，使用 {worker_count} 个并发线程..."
+        )
+        self.cache_eta_var.set("预计剩余: --")
+        self._set_cache_rebuild_progress(cached_count, total_unique)
+
+        def _thread():
+            failed_count = 0
+            progress_lock = threading.Lock()
+            pending_queue = queue.Queue(maxsize=max(worker_count * 4, 32))
+            batch_size = max(worker_count * 8, 64)
+
+            try:
+                def _write_one(raw_path: str, thumbnail_bytes: bytes) -> bool:
+                    try:
+                        warm_cached_thumbnail_encoded_bytes(raw_path, thumbnail_bytes)
+                        return True
+                    except Exception:
+                        return False
+
+                def _reader_loop() -> None:
+                    for start in range(0, len(pending_paths), batch_size):
+                        while self._cache_rebuild_pause_event.is_set():
+                            time.sleep(0.2)
+                        batch = pending_paths[start:start + batch_size]
+                        for raw_path in batch:
+                            while self._cache_rebuild_pause_event.is_set():
+                                time.sleep(0.2)
+                            try:
+                                frame_bytes = get_image_frame_bytes(raw_path)
+                                pending_queue.put((raw_path, frame_bytes))
+                            except Exception:
+                                pending_queue.put((raw_path, None))
+                    for _ in range(worker_count):
+                        pending_queue.put(None)
+
+                reader_thread = threading.Thread(target=_reader_loop, daemon=True, name="cache-prefetch-reader")
+                reader_thread.start()
+                with ProcessPoolExecutor(max_workers=worker_count) as process_executor:
+                    in_flight_limit = max(worker_count * 2, 8)
+                    future_to_path = {}
+                    reader_done = False
+
+                    while True:
+                        while self._cache_rebuild_pause_event.is_set():
+                            time.sleep(0.2)
+
+                        while not reader_done and len(future_to_path) < in_flight_limit:
+                            task = pending_queue.get()
+                            if task is None:
+                                reader_done = True
+                                break
+                            raw_path, frame_bytes = task
+                            if not frame_bytes:
+                                with progress_lock:
+                                    self._cache_rebuild_completed += 1
+                                    failed_count += 1
+                                    completed_snapshot = self._cache_rebuild_completed
+                                if (
+                                    completed_snapshot == cached_count + 1
+                                    or completed_snapshot == total_unique
+                                    or completed_snapshot % 25 == 0
+                                ):
+                                    self.after(0, lambda current=completed_snapshot, total=total_unique: self._set_cache_rebuild_progress(current, total))
+                                continue
+                            future = process_executor.submit(build_thumbnail_jpeg_bytes_from_frame_bytes, frame_bytes)
+                            future_to_path[future] = raw_path
+
+                        if not future_to_path:
+                            if reader_done:
+                                break
+                            time.sleep(0.02)
+                            continue
+
+                        done_futures = [future for future in list(future_to_path.keys()) if future.done()]
+                        if not done_futures:
+                            time.sleep(0.01)
+                            continue
+
+                        for future in done_futures:
+                            raw_path = future_to_path.pop(future)
+                            try:
+                                thumbnail_bytes = future.result()
+                                is_success = _write_one(raw_path, thumbnail_bytes)
+                            except Exception:
+                                is_success = False
+                            with progress_lock:
+                                self._cache_rebuild_completed += 1
+                                if not is_success:
+                                    failed_count += 1
+                                completed_snapshot = self._cache_rebuild_completed
+                            if (
+                                completed_snapshot == cached_count + 1
+                                or completed_snapshot == total_unique
+                                or completed_snapshot % 25 == 0
+                            ):
+                                self.after(0, lambda current=completed_snapshot, total=total_unique: self._set_cache_rebuild_progress(current, total))
+                reader_thread.join()
+
+                def _done():
+                    success_count = total_unique - failed_count
+                    self._cache_rebuild_running = False
+                    self._cache_rebuild_pause_event.clear()
+                    self._cache_rebuild_pause_started_at = None
+                    self._cache_rebuild_paused_seconds = 0.0
+                    self._set_cache_rebuild_progress(total_unique, total_unique)
+                    if failed_count:
+                        self.cache_action_status_var.set(
+                            f"继续缓存完成，缓存现有/新增成功共 {success_count} 项，失败 {failed_count} 项，使用 {worker_count} 个进程，按批预读 {batch_size} 项。"
+                        )
+                    else:
+                        self.cache_action_status_var.set(
+                            f"继续缓存完成，缓存现有/新增成功共 {success_count} 项，使用 {worker_count} 个进程，按批预读 {batch_size} 项。"
+                        )
+                    self._set_cache_controls_state(False)
+                    self._refresh_cache_usage_async()
+
+                self.after(0, _done)
+            except Exception as e:
+                def _error(error=e):
+                    self._cache_rebuild_running = False
+                    self._cache_rebuild_pause_event.clear()
+                    self._cache_rebuild_pause_started_at = None
+                    self._cache_rebuild_paused_seconds = 0.0
+                    self.cache_eta_var.set("预计剩余: --")
+                    self.cache_action_status_var.set(f"继续缓存失败: {error}")
+                    self._set_cache_controls_state(False)
+                    messagebox.showerror("错误", f"继续缓存失败: {error}")
+
+                self.after(0, _error)
+
+        threading.Thread(target=_thread, daemon=True).start()
 
     def _reset_scan_log(self, initial_text: str) -> None:
         """清空扫描日志框并写入新的初始内容。"""
@@ -3236,12 +5162,7 @@ class PhotoIdentifyGUI(tk.Tk):
                             is_video = True
                             duration = get_video_duration(actual_path)
 
-                        frame_bytes = get_image_frame_bytes(file_path)
-                        img = Image.open(io.BytesIO(frame_bytes))
-                        img = ImageOps.exif_transpose(img)
-                        if img.mode != 'RGBA':
-                            img = img.convert('RGBA')
-                        img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                        img = load_cached_thumbnail_image(file_path)
                 except Exception:
                     pass
                 
