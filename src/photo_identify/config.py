@@ -50,6 +50,9 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "photo_identif
 # ── 搜索 ──────────────────────────────────────────────────
 DEFAULT_SEARCH_LIMIT = 20
 
+# ── 浏览模式 ──────────────────────────────────────────────
+DEFAULT_BROWSE_PAGE_SIZE = 48
+
 
 def load_api_key(explicit_key: str = "") -> str:
     """读取 API Key，优先使用显式传入的值，其次读取环境变量。

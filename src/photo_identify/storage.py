@@ -1101,6 +1101,34 @@ class Storage:
 
         return ordered_results
 
+    def get_images_paginated(self, offset: int = 0, limit: int = 50) -> list[dict]:
+        """分页获取所有图片，按修改时间倒序排列。
+
+        Args:
+            offset: 跳过的记录数
+            limit: 返回的最大记录数
+
+        Returns:
+            图片记录列表
+        """
+        self._conn.row_factory = sqlite3.Row
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM images
+            ORDER BY modified_time DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        results = []
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            row_dict["file_size"] = row_dict.get("size_bytes")
+            row_dict["photo_date"] = row_dict.get("created_time")
+            row_dict["updated_at"] = row_dict.get("modified_time")
+            results.append(row_dict)
+        return results
+
     def search_fts(self, query: str, limit: int = 50) -> list[dict]:
         """全文检索。
 

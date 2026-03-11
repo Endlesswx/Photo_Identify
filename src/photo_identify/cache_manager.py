@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -11,6 +12,20 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageOps
 
 from photo_identify.image_utils import get_image_frame_bytes
+
+logger = logging.getLogger(__name__)
+
+
+def _register_heif_opener() -> None:
+    """Register HEIF/HEIC decoder for Pillow if available."""
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except Exception as exc:
+        logger.warning("HEIF/HEIC support unavailable: %s", exc)
+
+
+_register_heif_opener()
 
 DEFAULT_CACHE_DIR = Path(r"E:\Caches\Photo_Identify_Cahces")
 DEFAULT_CACHE_MAX_SIZE_MB = 1024
