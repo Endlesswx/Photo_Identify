@@ -92,6 +92,11 @@ uv run python -m photo_identify gui
 
 - ****所有交互都可以在GUI界面完成，以下非开发需求无需再看****
 
+
+
+如果是iphone同步到云盘导出的livp文件，建议运行lvip_decompression项目将livp转换为图片和视频。
+
+
 ### 2. 使用命令行 (CLI) 扫描图片/视频目录
 
 将指定路径（支持多个目录）下的所有图片和视频扫描入库：

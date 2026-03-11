@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import threading
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -25,9 +28,37 @@ try:
 except ImportError:
     SentenceTransformer = None
 
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:
+    snapshot_download = None
+
 
 _LOCAL_MODEL_CACHE: dict[tuple[str, str, str], object] = {}
 _LOCAL_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def unload_local_embedding_models(clear_cuda_cache: bool = True) -> int:
+    """卸载已缓存的本地 embedding 模型以释放显存。"""
+
+    cleared = 0
+    with _LOCAL_MODEL_CACHE_LOCK:
+        cleared = len(_LOCAL_MODEL_CACHE)
+        _LOCAL_MODEL_CACHE.clear()
+
+    if clear_cuda_cache and torch is not None:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception as exc:
+            logger.warning("清理 CUDA 缓存失败: %s", exc)
+
+    if cleared:
+        logger.info("已卸载 %d 个本地 embedding 模型缓存。", cleared)
+    else:
+        logger.info("本地 embedding 模型缓存为空，无需卸载。")
+    return cleared
 
 
 def normalize_embedding_backend(backend: str, base_url: str = "") -> str:
@@ -46,6 +77,24 @@ def ensure_local_embedding_runtime() -> None:
         raise RuntimeError("未安装 sentence-transformers，无法运行本地 embedding 模型。")
     if torch is None:
         raise RuntimeError("未安装 torch，无法运行本地 embedding 模型。")
+
+
+@contextlib.contextmanager
+def _temporary_env(updates: dict[str, str]) -> Iterator[None]:
+    """在作用域内临时覆盖环境变量。"""
+
+    previous_values: dict[str, str | None] = {}
+    for key, value in updates.items():
+        previous_values[key] = os.environ.get(key)
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, previous in previous_values.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
 
 
 def resolve_local_embedding_device(device_arg: str = "auto") -> str:
@@ -89,6 +138,33 @@ def describe_local_embedding_device(device: str) -> str:
     return f"{device} ({device_name})"
 
 
+def _resolve_local_model_dir(model_id: str, model_cache_dir: Path | None = None) -> Path | None:
+    """解析本地模型目录，不存在则尝试下载。"""
+
+    if model_cache_dir is not None:
+        local_dir = model_cache_dir
+    else:
+        local_dir = Path.home() / ".cache" / "huggingface" / "bge-m3"
+
+    if local_dir.exists():
+        return local_dir
+
+    if snapshot_download is None:
+        return None
+
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:
+        logger.warning("下载本地 embedding 模型失败: %s", exc)
+        return None
+
+    return local_dir
+
+
 def get_local_embedding_model(model_id: str, device: str = "auto", model_cache_dir: Path | None = None) -> tuple[object, str]:
     """加载并缓存本地 embedding 模型实例。"""
 
@@ -107,13 +183,21 @@ def get_local_embedding_model(model_id: str, device: str = "auto", model_cache_d
             model_id,
             describe_local_embedding_device(resolved_device),
         )
+        assert SentenceTransformer is not None
+        local_dir = _resolve_local_model_dir(model_id=model_id, model_cache_dir=model_cache_dir)
+        local_model_id = str(local_dir) if local_dir is not None else model_id
+
         try:
-            model = SentenceTransformer(
-                model_id,
-                device=resolved_device,
-                cache_folder=cache_dir or None,
-                local_files_only=True,
-            )
+            with _temporary_env({
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+            }):
+                model = SentenceTransformer(
+                    local_model_id,
+                    device=resolved_device,
+                    cache_folder=cache_dir or None,
+                    local_files_only=True,
+                )
         except Exception as e:
             logger.info("本地无完整缓存，尝试联网加载模型: %s", e)
             model = SentenceTransformer(
@@ -122,7 +206,7 @@ def get_local_embedding_model(model_id: str, device: str = "auto", model_cache_d
                 cache_folder=cache_dir or None,
                 local_files_only=False,
             )
-        
+
         if resolved_device.startswith("cuda"):
             model.half()
         _LOCAL_MODEL_CACHE[cache_key] = model

@@ -16,6 +16,8 @@ import logging
 import pillow_heif
 from PIL import ExifTags, Image, ImageFile
 
+logger = logging.getLogger(__name__)
+
 # 注册支持 HEIC/HEIF 等 Apple 格式的解码器到原生 Pillow 系统中
 pillow_heif.register_heif_opener()
 
@@ -469,7 +471,18 @@ def list_images(root: str | Path, extensions: frozenset[str]) -> list[str]:
     root_path = Path(root)
     if not root_path.exists():
         return []
-    return sorted(
-        str(p) for p in root_path.rglob("*")
-        if p.is_file() and p.suffix.lower() in extensions
-    )
+    results: list[str] = []
+    skipped_zero = 0
+    for p in root_path.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in extensions:
+            continue
+        try:
+            if p.stat().st_size == 0:
+                skipped_zero += 1
+                continue
+        except OSError:
+            continue
+        results.append(str(p))
+    if skipped_zero:
+        logger.info("扫描过滤 0KB 文件: %d", skipped_zero)
+    return sorted(results)

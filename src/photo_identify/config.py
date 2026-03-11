@@ -29,6 +29,7 @@ DEFAULT_TPM_LIMIT = 50000
 # ── 图片扫描 ──────────────────────────────────────────────
 DEFAULT_IMAGE_EXTENSIONS = frozenset({
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif",
+    ".heic", ".heif",
     ".livp", ".mp4", ".mov", ".avi", ".mkv",
 })
 # 上传前缩放的最长边像素数

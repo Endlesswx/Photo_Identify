@@ -89,7 +89,7 @@ async def _wait_if_paused_async(
     return bool(cancel_event is not None and cancel_event.is_set())
 
 
-def _extract_faces_with_resize(image_bytes: bytes) -> list[dict]:
+def _extract_faces_with_resize(image_bytes: bytes, *, raise_on_error: bool = False) -> list[dict]:
     """提取人脸前修正方向并适当缩放，以避免高分原图导致 CPU 转换瓶颈和内存激增。"""
     try:
         from photo_identify.face_manager import extract_faces
@@ -126,6 +126,8 @@ def _extract_faces_with_resize(image_bytes: bytes) -> list[dict]:
         return faces
     except Exception as e:
         logger.error("人脸提取过程中出错: %s", e, exc_info=False)
+        if raise_on_error:
+            raise
         return []
 
 
@@ -485,14 +487,17 @@ def scan(
                             continue
                     
                     image_bytes = get_image_frame_bytes(img_path)
-                    faces = _extract_faces_with_resize(image_bytes)
+                    if not image_bytes:
+                        logger.info("[GPU流水线] 跳过 0KB/空数据文件: %s", img_path)
+                        continue
+                    faces = _extract_faces_with_resize(image_bytes, raise_on_error=True)
                     with _face_cache_lock:
                         _face_cache[img_path] = faces
                     _pipeline_count += 1
                     if _pipeline_count % 50 == 0:
                         logger.info("[GPU流水线] 已预提取 %d 张图片的人脸特征", _pipeline_count)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("[GPU流水线] 人脸提取失败 %s: %s", img_path, exc)
             if _pipeline_count > 0:
                 logger.info("[GPU流水线] 预提取完成，共处理 %d 张图片", _pipeline_count)
 
@@ -558,11 +563,21 @@ def scan(
                     else:
                         try:
                             image_bytes = get_image_frame_bytes(img_path)
-                            faces = _extract_faces_with_resize(image_bytes)
+                            if not image_bytes:
+                                logger.info("人物扫描跳过 0KB/空数据文件: %s", img_path)
+                                if _face_bar:
+                                    _face_bar.update(1)
+                                _face_queue.task_done()
+                                continue
+                            faces = _extract_faces_with_resize(image_bytes, raise_on_error=True)
                         except Exception as exc:
-                            logger.error("人脸提取失败 %s: %s", img_path, exc)
+                            logger.warning("人物扫描跳过异常文件 %s: %s", img_path, exc)
+                            try:
+                                p2_storage.add_skipped_file(img_path, f"人脸扫描解码失败: {exc}")
+                            except Exception as skip_exc:
+                                logger.warning("记录人物扫描跳过失败 %s: %s", img_path, skip_exc)
                             faces = []
-                            
+
                     face_count = len(faces)
                     with _face_found_lock:
                         if face_count > 0:
@@ -1239,6 +1254,22 @@ def scan_faces(
             stats.failed += 1
             continue
 
+        if stat_result.st_size == 0:
+            stats.skipped += 1
+            logger.info("人物扫描跳过 0KB 文件: %s", img_path)
+            if progress_writer:
+                progress_writer.write(f"[{FACE_SCAN_LABEL}] 跳过 0KB 文件: {Path(img_path).name}\n")
+            try:
+                storage.add_skipped_file(img_path, "0KB 文件")
+                md5 = compute_file_md5_chunked(img_path)
+                record = _build_face_scan_record(img_path, md5, stat_result.st_size)
+                image_id = storage.upsert(record)
+                storage.mark_face_scanned(image_id)
+                face_scanned_md5s.add(md5)
+            except Exception as exc:
+                logger.warning("人物扫描写入 0KB 跳过标记失败 %s: %s", img_path, exc)
+            continue
+
         cached = known_paths.get(img_path)
         if cached:
             cached_size, cached_mtime, cached_md5 = cached
@@ -1298,12 +1329,26 @@ def scan_faces(
 
         worker_storage = Storage(db_path)
         try:
+            if size_bytes == 0:
+                logger.info("人物扫描跳过 0KB 文件: %s", img_path)
+                return {
+                    "path": img_path,
+                    "skipped": True,
+                }
+
             md5 = known_md5 or compute_file_md5_chunked(img_path)
             record = _build_face_scan_record(img_path, md5, size_bytes)
             image_id = worker_storage.upsert(record)
 
             image_bytes = get_image_frame_bytes(img_path)
-            faces = _extract_faces_with_resize(image_bytes)
+            if not image_bytes:
+                logger.info("人物扫描跳过 0KB/空数据文件: %s", img_path)
+                return {
+                    "path": img_path,
+                    "skipped": True,
+                }
+
+            faces = _extract_faces_with_resize(image_bytes, raise_on_error=True)
 
             worker_storage.delete_face_embeddings_for_image(image_id)
             if faces:
@@ -1315,7 +1360,11 @@ def scan_faces(
                 "face_count": len(faces),
             }
         except Exception as exc:
-            logger.error("人物扫描失败 %s: %s", img_path, exc)
+            logger.warning("人物扫描跳过异常文件 %s: %s", img_path, exc)
+            try:
+                worker_storage.add_skipped_file(img_path, f"人脸扫描解码失败: {exc}")
+            except Exception as skip_exc:
+                logger.warning("记录人物扫描跳过失败 %s: %s", img_path, skip_exc)
             return {
                 "path": img_path,
                 "error": str(exc),
@@ -1340,6 +1389,9 @@ def scan_faces(
                 progress_bar.update(1)
 
                 if result.get("cancelled"):
+                    continue
+                if result.get("skipped"):
+                    stats.skipped += 1
                     continue
                 if result.get("error"):
                     stats.failed += 1

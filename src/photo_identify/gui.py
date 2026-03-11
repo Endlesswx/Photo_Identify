@@ -429,12 +429,14 @@ class PhotoIdentifyGUI(tk.Tk):
         # Notebook (Tab) Container
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        
+
+        self._scan_embedding_preload_blocked = False
+
         # Tab 1: 检索
         self.search_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.search_tab, text="图片检索")
         self._init_search_tab()
-        
+
         # Tab 2: 扫描
         self.scan_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.scan_tab, text="信息扫描")
@@ -477,15 +479,22 @@ class PhotoIdentifyGUI(tk.Tk):
     def _on_tab_changed(self, event):
         selected_tab = self.notebook.select()
         tab_name = self.notebook.tab(selected_tab, "text")
-        
-        # 激活该 Tab 下可用的预加载逻辑
-        if tab_name == "图片检索":
-            # 搜索模式配置在切换回来时也能联动保证状态同步激发一次
-            self._on_search_options_changed()
-        elif tab_name == "信息扫描":
+
+        if tab_name == "信息扫描":
+            self._scan_embedding_preload_blocked = True
             self._on_scan_embedding_selected(None)
             self._on_scan_model_selected(None)
-            
+        else:
+            if self._has_running_scan_task():
+                self._scan_embedding_preload_blocked = True
+            else:
+                self._scan_embedding_preload_blocked = False
+
+                # 激活该 Tab 下可用的预加载逻辑
+                if tab_name == "图片检索":
+                    # 搜索模式配置在切换回来时也能联动保证状态同步激发一次
+                    self._on_search_options_changed()
+
         if tab_name == "人物管理":
             if not self._person_tab_loaded:
                 # 只有从没加载过才在这时刷新，后面手动刷
@@ -840,6 +849,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self._refresh_scan_embedding_combo()
 
     def _preload_model_async(self, model_id_str: str, is_text: bool):
+        if self._scan_embedding_preload_blocked:
+            return
         if is_text or not model_id_str or model_id_str in self._preloaded_models:
             # 文本大模型通常无需发送伪造的 HTTP 测试请求进行预加载，因为：
             # 1. API 本身就绪。2. Ollama 等本地 OpenAI 兼容后端内部也有机制。
@@ -890,7 +901,8 @@ class PhotoIdentifyGUI(tk.Tk):
             model_ref = self._scan_embedding_map.get(name, "")
             self.scan_embedding_id_var.set(model_ref)
             self._update_scan_workers_display()
-            self._preload_model_async(model_ref, is_text=False)
+            if event is not None:
+                self._preload_model_async(model_ref, is_text=False)
 
     def _on_search_options_changed(self):
         """当检索页的查询模式或预处理复选框改变时，更新关联下拉框的可选状态。"""
@@ -926,7 +938,8 @@ class PhotoIdentifyGUI(tk.Tk):
             model_ref = self._scan_model_map.get(name, "")
             self.scan_model_id_var.set(model_ref)
             self._update_scan_workers_display()
-            self._preload_model_async(model_ref, is_text=True)
+            if event is not None:
+                self._preload_model_async(model_ref, is_text=True)
             
     def _update_scan_workers_display(self):
         """更新扫描页的并发线程数显示"""
@@ -970,6 +983,24 @@ class PhotoIdentifyGUI(tk.Tk):
                 parts.append("向量: API")
 
         self.scan_workers_var.set(" | ".join(parts) if parts else "并发: -")
+
+    def _release_local_embedding_cache(self, reason: str) -> None:
+        """释放本地向量模型缓存以腾出显存。"""
+        try:
+            from photo_identify.embedding_runtime import unload_local_embedding_models
+            cleared = unload_local_embedding_models()
+        except Exception as exc:
+            logger.warning("释放本地向量模型缓存失败: %s", exc)
+            return
+
+        if cleared:
+            self._preloaded_models.clear()
+            if reason:
+                self.status_var.set(f"已卸载本地向量模型（{reason}）。")
+                self._append_scan_log(f"\n[向量模型] 已卸载本地向量模型（{reason}）。\n")
+            else:
+                self.status_var.set("已卸载本地向量模型。")
+                self._append_scan_log("\n[向量模型] 已卸载本地向量模型。\n")
 
     # ── 获取当前模型的 API 参数 ──────────────────────────────────
 
@@ -4575,6 +4606,15 @@ class PhotoIdentifyGUI(tk.Tk):
         emb_backend = emb_params["backend"]
         emb_workers = emb_params["workers"]
 
+        if emb_backend == "local":
+            try:
+                from photo_identify.embedding_runtime import get_local_embedding_model
+                self.scan_status_var.set("正在加载本地向量模型，请稍候...")
+                get_local_embedding_model(emb_model_id, device="auto")
+            except Exception as exc:
+                messagebox.showerror("错误", f"加载本地向量模型失败:\n{exc}")
+                return
+
         self._save_settings()
         self.scan_status_var.set("正在刷新图片向量，查看下方日志区...")
         self._reset_scan_log(
@@ -4693,23 +4733,16 @@ class PhotoIdentifyGUI(tk.Tk):
             return
         model_id, base_url, api_key, current_workers, current_video_workers = api_params
         
-        # 获取 Embedding 模型参数
-        emb_params = self._get_scan_embedding_params()
-        if emb_params:
-            emb_model_id = emb_params["model_id"]
-            emb_base_url = emb_params["base_url"]
-            emb_api_key = emb_params["api_key"]
-            emb_backend = emb_params["backend"]
-            emb_workers = emb_params["workers"]
-        else:
-            emb_model_id, emb_base_url, emb_api_key = "", "", ""
-            emb_backend, emb_workers = "", 1
-            
+        # 图片/视频信息提取不触发向量模型
+        self._release_local_embedding_cache("图片/视频信息提取")
+        emb_model_id, emb_base_url, emb_api_key = "", "", ""
+        emb_backend, emb_workers = "", 1
+
         self.scan_status_var.set("正在执行图片/视频信息提取，查看下方日志区...")
-        embedding_hint = f"{emb_model_id} ({emb_backend})" if emb_model_id else "未启用"
+        embedding_hint = "未启用"
         self._reset_scan_log(
             f"[{IMAGE_EXTRACTION_LABEL}] 准备中...\n"
-            f"[{FACE_SCAN_LABEL}] 已独立，可按需单独运行\n"
+            f"[{FACE_SCAN_LABEL}] 未启用\n"
             f"[向量模型] {embedding_hint}\n"
         )
 
@@ -4839,6 +4872,7 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         self._save_settings()
+        self._release_local_embedding_cache("人物扫描")
         model_data = self._resolve_model_from_selection(self.scan_model_id_var.get())
         face_workers = max(1, int(model_data.get("workers", DEFAULT_WORKERS))) if model_data else max(1, DEFAULT_WORKERS)
 
