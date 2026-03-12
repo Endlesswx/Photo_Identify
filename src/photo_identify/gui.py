@@ -6184,6 +6184,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self._browse_mode = True
         self._search_all_results = []
         self._browse_current_page = 1
+        self._load_browse_gallery()
 
     def _auto_browse_on_start(self):
         """启动时自动进入查看所有模式（静默，无数据库时不弹窗）"""
