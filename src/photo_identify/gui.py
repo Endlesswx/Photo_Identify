@@ -413,6 +413,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self._browse_current_page = 1
         self._browse_total_count = 0
         self._browse_loaded = False
+        # 搜索结果分页状态
+        self._search_all_results = []  # 完整搜索结果（内存中）
 
         # 缓存管理
         self.cache_dir_var = tk.StringVar(value=str(DEFAULT_CACHE_DIR))
@@ -5128,13 +5130,14 @@ class PhotoIdentifyGUI(tk.Tk):
         if not query:
             # 空关键词时进入浏览模式
             self._browse_mode = True
+            self._search_all_results = []
             self._browse_current_page = 1
             self._load_browse_gallery()
             return
 
         # 退出浏览模式
         self._browse_mode = False
-        self._set_browse_pager_visible(False)
+        self._search_all_results = []
 
         self._save_settings()
 
@@ -5263,11 +5266,13 @@ class PhotoIdentifyGUI(tk.Tk):
         if not results:
             self.status_var.set(f"搜索完成：未找到匹配的图片。{time_str}")
             self.status_label.configure(foreground="blue")
+            self._search_all_results = []
             self.current_results = []
             self.current_index = 0
             self._update_display()
             self.show_gallery_view()
             self._clear_gallery()
+            self._set_browse_pager_visible(False)
             return
 
         # 检查是否有警告（如 LLM 排序失败）
@@ -5279,16 +5284,18 @@ class PhotoIdentifyGUI(tk.Tk):
             self.status_var.set(f"搜索完成：共找到并重排序 {len(results)} 张图片。{time_str}")
             self.status_label.configure(foreground="blue")
 
-        self.current_results = results
-        self.current_index = 0
-        self.show_gallery_view()
-        self._load_thumbnails()
+        # 保存完整结果，分页展示
+        self._search_all_results = results
+        self._browse_total_count = len(results)
+        self._browse_current_page = 1
+        self._show_search_results_page(1)
 
     def show_gallery_view(self):
         self.preview_frame.pack_forget()
         self.gallery_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        # 根据浏览模式显示/隐藏分页控件
-        self._set_browse_pager_visible(self._browse_mode)
+        # 浏览模式或搜索结果有分页时显示分页控件
+        has_pager = self._browse_mode or len(self._search_all_results) > 0
+        self._set_browse_pager_visible(has_pager)
 
     def show_preview_view(self):
         self.gallery_frame.pack_forget()
@@ -5804,6 +5811,7 @@ class PhotoIdentifyGUI(tk.Tk):
             messagebox.showwarning("警告", "请至少添加一个数据库用于检索！")
             return
         self._browse_mode = True
+        self._search_all_results = []
         self._browse_current_page = 1
 
     def _auto_browse_on_start(self):
@@ -5910,7 +5918,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.after(600, self._measure_and_adjust_page_size)
 
     def _measure_and_adjust_page_size(self):
-        """实测单元格后，如果页面大小需要调整则重新加载"""
+        """实测单元格后，如果页面大小需要调整则重新加载（浏览模式）"""
         if not self._browse_mode:
             return
         old_size = self._browse_page_size
@@ -5919,6 +5927,17 @@ class PhotoIdentifyGUI(tk.Tk):
         if new_size != old_size:
             self._browse_page_size = new_size
             self._go_to_browse_page(self._browse_current_page)
+
+    def _measure_and_adjust_search_page_size(self):
+        """实测单元格后，如果页面大小需要调整则重新加载（搜索结果）"""
+        if self._browse_mode or not self._search_all_results:
+            return
+        old_size = self._browse_page_size
+        self._measure_cell_size()
+        new_size = self._estimate_browse_page_size()
+        if new_size != old_size:
+            self._browse_page_size = new_size
+            self._show_search_results_page(self._browse_current_page)
 
     def _update_browse_pagination_state(self):
         """更新分页控件状态"""
@@ -5933,29 +5952,51 @@ class PhotoIdentifyGUI(tk.Tk):
         self.browse_last_btn.config(state=tk.NORMAL if self._browse_current_page < total_pages else tk.DISABLED)
 
     def _first_browse_page(self):
-        """跳转到首页"""
-        self._go_to_browse_page(1)
+        self._go_to_page(1)
 
     def _prev_browse_page(self):
-        """上一页"""
-        self._go_to_browse_page(self._browse_current_page - 1)
+        self._go_to_page(self._browse_current_page - 1)
 
     def _next_browse_page(self):
-        """下一页"""
-        self._go_to_browse_page(self._browse_current_page + 1)
+        self._go_to_page(self._browse_current_page + 1)
 
     def _last_browse_page(self):
-        """跳转到末页"""
         total_pages = max(1, (self._browse_total_count + self._browse_page_size - 1) // self._browse_page_size)
-        self._go_to_browse_page(total_pages)
+        self._go_to_page(total_pages)
 
     def _go_to_browse_page_from_entry(self):
-        """从输入框跳转到指定页"""
         try:
             page = int(self.browse_page_var.get())
-            self._go_to_browse_page(page)
+            self._go_to_page(page)
         except ValueError:
             pass
+
+    def _go_to_page(self, page: int):
+        """统一分页跳转：浏览模式从数据库加载，搜索模式从内存切片"""
+        if self._browse_mode:
+            self._go_to_browse_page(page)
+        else:
+            self._show_search_results_page(page)
+
+    def _show_search_results_page(self, page: int):
+        """从内存中的搜索结果切片显示指定页"""
+        self._browse_page_size = self._estimate_browse_page_size()
+        total = len(self._search_all_results)
+        total_pages = max(1, (total + self._browse_page_size - 1) // self._browse_page_size)
+        page = max(1, min(page, total_pages))
+        self._browse_current_page = page
+        self._browse_total_count = total
+
+        start = (page - 1) * self._browse_page_size
+        end = start + self._browse_page_size
+        self.current_results = self._search_all_results[start:end]
+        self.current_index = 0
+
+        self.show_gallery_view()
+        self._load_thumbnails()
+        self._update_browse_pagination_state()
+        # 延迟实测单元格尺寸
+        self.after(600, self._measure_and_adjust_search_page_size)
 
     def _estimate_browse_page_size(self) -> int:
         """根据窗口大小动态估算每页显示数量，确保一屏显示完无滚动条"""
@@ -6000,7 +6041,8 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _on_gallery_configure(self, event):
         """窗口大小变化时重新计算分页大小"""
-        if not self._browse_mode:
+        # 浏览模式或搜索结果分页模式都需要响应窗口变化
+        if not self._browse_mode and not self._search_all_results:
             return
 
         if self._resize_debounce_timer:
@@ -6016,7 +6058,7 @@ class PhotoIdentifyGUI(tk.Tk):
             current_offset = (self._browse_current_page - 1) * self._browse_page_size
             new_page = max(1, current_offset // new_size + 1)
             self._browse_page_size = new_size
-            self._go_to_browse_page(new_page)
+            self._go_to_page(new_page)
 
     def open_file_location(self):
         if not self.current_results:
