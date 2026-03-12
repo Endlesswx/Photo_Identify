@@ -5906,6 +5906,19 @@ class PhotoIdentifyGUI(tk.Tk):
         self._load_thumbnails()
         self._update_browse_pagination_state()
         self.status_var.set(f"已加载 {len(results)} 张图片")
+        # 延迟实测单元格尺寸，等缩略图渲染完毕
+        self.after(600, self._measure_and_adjust_page_size)
+
+    def _measure_and_adjust_page_size(self):
+        """实测单元格后，如果页面大小需要调整则重新加载"""
+        if not self._browse_mode:
+            return
+        old_size = self._browse_page_size
+        self._measure_cell_size()
+        new_size = self._estimate_browse_page_size()
+        if new_size != old_size:
+            self._browse_page_size = new_size
+            self._go_to_browse_page(self._browse_current_page)
 
     def _update_browse_pagination_state(self):
         """更新分页控件状态"""
@@ -5952,20 +5965,38 @@ class PhotoIdentifyGUI(tk.Tk):
             if width <= 1 or height <= 1:
                 return DEFAULT_BROWSE_PAGE_SIZE
 
-            # 每个缩略图单元格：150px图片 + ~20px文字 + ~18px内外边距
-            cell_width = 182
-            cell_height = 190
+            # 优先使用实测的单元格尺寸，否则用默认估算
+            cell_w = getattr(self, "_measured_cell_width", 0)
+            cell_h = getattr(self, "_measured_cell_height", 0)
+            if cell_w < 50 or cell_h < 50:
+                # 150px图片 + padx=10*2 (window_create)
+                cell_w = 170
+                # 150px图片 + ~20px文字 + pady=10*2 (window_create)
+                cell_h = 190
 
-            cols = max(1, width // cell_width)
-            # 减去底部分页栏的空间（约40px）
-            usable_height = height - 40
-            rows = max(1, usable_height // cell_height)
+            cols = max(1, width // cell_w)
+            rows = max(1, height // cell_h)
             page_size = cols * rows
 
-            # 不设硬编码最小值，完全根据窗口大小决定，保证无滚动条
             return max(1, min(page_size, 200))
         except Exception:
             return DEFAULT_BROWSE_PAGE_SIZE
+
+    def _measure_cell_size(self):
+        """在首个缩略图渲染后实测单元格尺寸，供下次分页使用"""
+        try:
+            children = [w for w in self.gallery_text.winfo_children() if w.winfo_viewable()]
+            if not children:
+                return
+            first = children[0]
+            first.update_idletasks()
+            w = first.winfo_reqwidth() + 20   # + padx=10*2
+            h = first.winfo_reqheight() + 20  # + pady=10*2
+            if w > 50 and h > 50:
+                self._measured_cell_width = w
+                self._measured_cell_height = h
+        except Exception:
+            pass
 
     def _on_gallery_configure(self, event):
         """窗口大小变化时重新计算分页大小"""
