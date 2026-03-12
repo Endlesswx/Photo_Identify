@@ -919,13 +919,30 @@ class PhotoIdentifyGUI(tk.Tk):
     def _on_search_options_changed(self):
         """当检索页的查询模式或预处理复选框改变时，更新关联下拉框的可选状态。"""
         is_llm_mode = False
+        is_filename_mode = False
         if getattr(self, "search_mode_var", None):
-            is_llm_mode = (self.search_mode_var.get() == "llm")
-            if is_llm_mode:
+            mode = self.search_mode_var.get()
+            is_llm_mode = (mode == "llm")
+            is_filename_mode = (mode == "filename")
+
+            if is_filename_mode:
+                # 文件名模式：禁用所有拓展功能和模型选择
+                self.search_embedding_combo.config(state="disabled")
+                if hasattr(self, "expand_chk"):
+                    self.expand_chk.config(state=tk.DISABLED)
+                    if getattr(self, "search_expand_var", None):
+                        self.search_expand_var.set(False)
+                if hasattr(self, "rerank_chk"):
+                    self.rerank_chk.config(state=tk.DISABLED)
+                    if getattr(self, "search_rerank_var", None):
+                        self.search_rerank_var.set(False)
+                self.search_model_combo.config(state="disabled")
+                return
+            elif is_llm_mode:
                 self.search_embedding_combo.config(state="readonly")
                 # 切换为向量检索可能激活了下拉框内容，执行一次预加载判断
                 self._on_search_embedding_selected()
-                
+
                 if hasattr(self, "expand_chk"):
                     self.expand_chk.config(state=tk.DISABLED)
                     if getattr(self, "search_expand_var", None):
@@ -935,7 +952,11 @@ class PhotoIdentifyGUI(tk.Tk):
                 if hasattr(self, "expand_chk"):
                     self.expand_chk.config(state=tk.NORMAL)
 
-        # 如果选中了“大模型分词拓展”或“使用大模型排序”，才启用文本模型下拉框
+            # 恢复 rerank 复选框（非文件名模式下可用）
+            if hasattr(self, "rerank_chk"):
+                self.rerank_chk.config(state=tk.NORMAL)
+
+        # 如果选中了"大模型分词拓展"或"使用大模型排序"，才启用文本模型下拉框
         if getattr(self, "search_expand_var", None) and getattr(self, "search_rerank_var", None):
             if self.search_expand_var.get() or self.search_rerank_var.get():
                 self.search_model_combo.config(state="readonly")
@@ -1127,8 +1148,10 @@ class PhotoIdentifyGUI(tk.Tk):
         
         radio_frame = ttk.Frame(left_frame)
         radio_frame.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        self.filename_radio = ttk.Radiobutton(radio_frame, text="文件名", variable=self.search_mode_var, value="filename", command=self._on_search_options_changed)
+        self.filename_radio.pack(side=tk.LEFT)
         self.local_radio = ttk.Radiobutton(radio_frame, text="本地算法", variable=self.search_mode_var, value="local", command=self._on_search_options_changed)
-        self.local_radio.pack(side=tk.LEFT)
+        self.local_radio.pack(side=tk.LEFT, padx=(10, 0))
         self.llm_radio = ttk.Radiobutton(radio_frame, text="向量查询", variable=self.search_mode_var, value="llm", command=self._on_search_options_changed)
         self.llm_radio.pack(side=tk.LEFT, padx=(10, 5))
         
@@ -1161,7 +1184,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.search_model_combo.pack(side=tk.LEFT, padx=(0, 0))
         self.search_model_combo.bind("<<ComboboxSelected>>", self._on_search_model_selected)
 
-        # L-Row 3: Query Keyword
+        # L-Row 3: Query Keyword (full width, matching db_frame)
         ttk.Label(left_frame, text="查询关键字:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
         self.query_entry = ttk.Entry(left_frame, textvariable=self.query_var)
         self.query_entry.grid(row=3, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=5)
@@ -1170,7 +1193,7 @@ class PhotoIdentifyGUI(tk.Tk):
         # ====== RIGHT FRAME (30%) ======
         right_frame = ttk.Frame(self.top_frame)
         right_frame.grid(row=0, column=1, sticky=tk.NW, padx=(10, 0), pady=0)
-        
+
         # R-Row 0: Add / Remove DB Buttons
         btn_frame = ttk.Frame(right_frame)
         btn_frame.pack(side=tk.TOP, anchor=tk.W, pady=(5, 10))
@@ -1179,22 +1202,18 @@ class PhotoIdentifyGUI(tk.Tk):
         self.rm_db_btn = ttk.Button(btn_frame, text="➖ 移 除", command=self.remove_search_db, width=12)
         self.rm_db_btn.pack(fill=tk.X, pady=2)
 
-        # R-Row 1: Limit Label (aligned with Vec model on left essentially based on subjective spacing)
-        limit_lbl_frame = ttk.Frame(right_frame)
-        limit_lbl_frame.pack(side=tk.TOP, anchor=tk.W, pady=(0, 2))
-        ttk.Label(limit_lbl_frame, text="查询张数:").pack(side=tk.LEFT, padx=0)
+        # R-Row 1: Limit Label + Spinbox on one line
+        limit_frame = ttk.Frame(right_frame)
+        limit_frame.pack(side=tk.TOP, anchor=tk.W, pady=(0, 8))
+        ttk.Label(limit_frame, text="查询张数:").pack(side=tk.LEFT, padx=0)
+        self.limit_entry = ttk.Spinbox(limit_frame, from_=1, to=1000, textvariable=self.search_limit_var, width=8)
+        self.limit_entry.pack(side=tk.LEFT, padx=(4, 0))
 
-        # R-Row 2: Limit Spinbox
-        limit_box_frame = ttk.Frame(right_frame)
-        limit_box_frame.pack(side=tk.TOP, anchor=tk.W, pady=(0, 15))
-        self.limit_entry = ttk.Spinbox(limit_box_frame, from_=1, to=1000, textvariable=self.search_limit_var, width=10)
-        self.limit_entry.pack(side=tk.LEFT)
-
-        # R-Row 3: Search Button
-        search_btn_frame = ttk.Frame(right_frame)
-        search_btn_frame.pack(side=tk.TOP, anchor=tk.W, pady=0)
-        self.search_btn = ttk.Button(search_btn_frame, text="🔍 搜索", command=self.do_search, width=12)
-        self.search_btn.pack(fill=tk.X, pady=0)
+        # R-Row 2: Search + View All (vertically aligned)
+        self.browse_all_btn = ttk.Button(right_frame, text="📂 查看所有", command=self._enter_browse_mode, width=12)
+        self.browse_all_btn.pack(side=tk.TOP, anchor=tk.W, pady=(0, 4))
+        self.search_btn = ttk.Button(right_frame, text="🔍 搜索", command=self.do_search, width=12)
+        self.search_btn.pack(side=tk.TOP, anchor=tk.W, pady=0)
 
         # 初始化下拉选项
         self._refresh_search_model_combo()
@@ -1310,9 +1329,12 @@ class PhotoIdentifyGUI(tk.Tk):
         
         # 初始显示列表视图
         self.gallery_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
+
         self.thumbnail_images = []
         self._thumbnail_gen = 0
+
+        # 启动时自动进入查看所有模式
+        self.after(200, self._auto_browse_on_start)
 
     # ── Tab 2: 信息扫描 ──────────────────────────────────────────
 
@@ -5081,11 +5103,15 @@ class PhotoIdentifyGUI(tk.Tk):
         """控制搜索时的组件状态"""
         self.search_btn.config(state=state)
         self.query_entry.config(state=state)
+        if hasattr(self, 'browse_all_btn'):
+            self.browse_all_btn.config(state=state)
         if hasattr(self, 'add_db_btn'):
             self.add_db_btn.config(state=state)
         if hasattr(self, 'rm_db_btn'):
             self.rm_db_btn.config(state=state)
         # Also disable/enable radio buttons
+        if hasattr(self, 'filename_radio'):
+            self.filename_radio.config(state=state)
         if hasattr(self, 'local_radio'):
             self.local_radio.config(state=state)
         if hasattr(self, 'llm_radio'):
@@ -5112,7 +5138,45 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self._save_settings()
 
-        is_llm_mode = (self.search_mode_var.get() == "llm")
+        search_mode = self.search_mode_var.get()
+
+        # ── 文件名搜索模式：直接从数据库按 file_name 模糊匹配 ──
+        if search_mode == "filename":
+            self.toggle_state(tk.DISABLED)
+            self.status_var.set("正在按文件名搜索...")
+            self.update_idletasks()
+
+            try:
+                limit_val = int(self.search_limit_var.get())
+                if limit_val <= 0:
+                    limit_val = 30
+            except ValueError:
+                limit_val = 30
+
+            import time as _time
+            def _filename_search_thread():
+                t0 = _time.perf_counter()
+                try:
+                    all_results = []
+                    for db_path in self.search_dbs:
+                        storage = Storage(db_path)
+                        results = storage.search_by_filename(query, limit=limit_val)
+                        for r in results:
+                            r["db_path"] = db_path
+                        all_results.extend(results)
+                        storage.close()
+                    # 按修改时间降序排序，取前 limit_val 条
+                    all_results.sort(key=lambda x: (x.get("modified_time") or ""), reverse=True)
+                    all_results = all_results[:limit_val]
+                    elapsed = _time.perf_counter() - t0
+                    self.after(0, self._on_search_done, all_results, None, elapsed, [])
+                except Exception as e:
+                    elapsed = _time.perf_counter() - t0
+                    self.after(0, self._on_search_done, None, str(e), elapsed, [])
+            threading.Thread(target=_filename_search_thread, daemon=True).start()
+            return
+
+        is_llm_mode = (search_mode == "llm")
         is_expand = self.search_expand_var.get()
         is_rerank = self.search_rerank_var.get()
         
@@ -5187,6 +5251,7 @@ class PhotoIdentifyGUI(tk.Tk):
     def _on_search_done(self, results, error, elapsed=0.0, warnings=None):
         """搜索完成回调，显示结果、耗时和警告。"""
         self.toggle_state(tk.NORMAL)
+        self._on_search_options_changed()
         time_str = f"（耗时 {elapsed:.1f}s）"
 
         if error is not None:
@@ -5258,8 +5323,8 @@ class PhotoIdentifyGUI(tk.Tk):
                             duration = get_video_duration(actual_path)
 
                         img = load_cached_thumbnail_image(file_path)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.getLogger(__name__).debug("缩略图加载失败 %s: %s", actual_path, e)
                 
                 if current_gen == self._thumbnail_gen:
                     self.after(0, self._add_thumbnail, i, record, img, current_gen, is_video, duration)
@@ -5733,12 +5798,32 @@ class PhotoIdentifyGUI(tk.Tk):
 
     # ── 浏览模式方法 ──────────────────────────────────────────
 
+    def _enter_browse_mode(self):
+        """点击"查看所有"按钮进入浏览模式"""
+        if not self.search_dbs:
+            messagebox.showwarning("警告", "请至少添加一个数据库用于检索！")
+            return
+        self._browse_mode = True
+        self._browse_current_page = 1
+
+    def _auto_browse_on_start(self):
+        """启动时自动进入查看所有模式（静默，无数据库时不弹窗）"""
+        if self.search_dbs:
+            self._browse_mode = True
+            self._browse_current_page = 1
+            self._load_browse_gallery()
+        self._load_browse_gallery()
+
     def _set_browse_pager_visible(self, show: bool):
-        """显示或隐藏浏览模式分页控件"""
+        """显示或隐藏浏览模式分页控件，并控制滚动条"""
         if show:
             self.browse_pager_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+            # 浏览模式隐藏滚动条（分页已保证内容不超出可视区域）
+            self.gallery_scrollbar.pack_forget()
         else:
             self.browse_pager_frame.pack_forget()
+            # 搜索模式恢复滚动条
+            self.gallery_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def _load_browse_gallery(self):
         """加载浏览模式的图片列表（分页）"""
@@ -5860,22 +5945,25 @@ class PhotoIdentifyGUI(tk.Tk):
             pass
 
     def _estimate_browse_page_size(self) -> int:
-        """根据窗口大小动态估算每页显示数量"""
+        """根据窗口大小动态估算每页显示数量，确保一屏显示完无滚动条"""
         try:
             width = self.gallery_text.winfo_width()
             height = self.gallery_text.winfo_height()
             if width <= 1 or height <= 1:
                 return DEFAULT_BROWSE_PAGE_SIZE
 
-            # 每个缩略图单元格约 178x200 像素
-            cell_width = 178
-            cell_height = 200
+            # 每个缩略图单元格：150px图片 + ~20px文字 + ~18px内外边距
+            cell_width = 182
+            cell_height = 190
 
             cols = max(1, width // cell_width)
-            rows = max(1, height // cell_height)
+            # 减去底部分页栏的空间（约40px）
+            usable_height = height - 40
+            rows = max(1, usable_height // cell_height)
             page_size = cols * rows
 
-            return max(12, min(page_size, 200))
+            # 不设硬编码最小值，完全根据窗口大小决定，保证无滚动条
+            return max(1, min(page_size, 200))
         except Exception:
             return DEFAULT_BROWSE_PAGE_SIZE
 

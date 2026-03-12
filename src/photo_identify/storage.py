@@ -1279,6 +1279,15 @@ class Storage:
         )
         return [dict(row) for row in cursor.fetchall()]
 
+    def search_by_filename(self, keyword: str, limit: int = 50) -> list[dict]:
+        """按文件名模糊搜索，支持部分匹配。"""
+        self._conn.row_factory = sqlite3.Row
+        cursor = self._conn.execute(
+            "SELECT * FROM images WHERE file_name LIKE ? ORDER BY modified_time DESC LIMIT ?",
+            (f"%{keyword}%", limit),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     def count(self) -> int:
         """返回已入库的图片总数。
 
