@@ -407,6 +407,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self.geometry("900x700")
         self.minsize(800, 600)
 
+        self._setup_button_styles()
+
         self.db_path = db_path
         self.search_dbs = [db_path] if db_path else []
         
@@ -1387,6 +1389,9 @@ class PhotoIdentifyGUI(tk.Tk):
         # 启动时自动进入查看所有模式
         self.after(200, self._auto_browse_on_start)
 
+    def _setup_button_styles(self):
+        pass
+
     # ── Tab 2: 信息扫描 ──────────────────────────────────────────
 
     def _init_scan_tab(self):
@@ -1491,17 +1496,34 @@ class PhotoIdentifyGUI(tk.Tk):
         # 4. 操作按钮
         action_frame = ttk.Frame(form_frame)
         action_frame.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(8, 6))
-        self.video_transcode_btn = ttk.Button(action_frame, text="视频转码", command=self.start_video_transcode)
-        self.video_transcode_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
-        ToolTip(self.video_transcode_btn, "为了能让多模态模型理解视频，建议执行转码，否则将采用抽帧策略")
-        self.scan_btn = ttk.Button(action_frame, text=f"▶ {IMAGE_EXTRACTION_LABEL}", command=self.start_scan)
-        self.scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
-        self.face_scan_btn = ttk.Button(action_frame, text=f"👤 {FACE_SCAN_LABEL}", command=self.start_face_scan)
-        self.face_scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+
+        def _create_primary_button(parent, text, command, tooltip_text=None):
+            btn = tk.Button(
+                parent,
+                text=text,
+                command=command,
+                bg="#1890FF",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                relief=tk.FLAT,
+                cursor="hand2",
+                padx=12,
+                pady=5,
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 8))
+            btn.bind("<Enter>", lambda e: btn.config(bg="#007BFF"))
+            btn.bind("<Leave>", lambda e: btn.config(bg="#1890FF"))
+            if tooltip_text:
+                ToolTip(btn, tooltip_text)
+            return btn
+
+        self.video_transcode_btn = _create_primary_button(action_frame, "视频转码", self.start_video_transcode, "为了能让多模态模型理解视频，建议执行转码，否则将采用抽帧策略")
+        self.scan_btn = _create_primary_button(action_frame, f"▶ {IMAGE_EXTRACTION_LABEL}", self.start_scan)
+        self.face_scan_btn = _create_primary_button(action_frame, f"👤 {FACE_SCAN_LABEL}", self.start_face_scan)
         self.face_rebuild_btn = ttk.Button(action_frame, text="🧹 重建", command=self.rebuild_face_scan)
         self.face_rebuild_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
-        self.refresh_vectors_btn = ttk.Button(action_frame, text="♻ 刷新图片向量", command=self.refresh_image_embeddings)
-        self.refresh_vectors_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.refresh_vectors_btn = _create_primary_button(action_frame, f"♻ 刷新图片向量", self.refresh_image_embeddings)
+
         self.embedding_rebuild_btn = ttk.Button(action_frame, text="🧹 重建", command=self.rebuild_image_embeddings)
         self.embedding_rebuild_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
 
