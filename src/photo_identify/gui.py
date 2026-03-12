@@ -451,6 +451,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self._browse_loaded = False
         # 搜索结果分页状态
         self._search_all_results = []  # 完整搜索结果（内存中）
+        self._search_page_adjust_timer = None  # 搜索结果页面调整定时器（防止闪烁）
+        self._browse_page_adjust_timer = None  # 浏览模式页面调整定时器（防止闪烁）
 
         # 缓存管理
         self.cache_dir_var = tk.StringVar(value=str(DEFAULT_CACHE_DIR))
@@ -6297,11 +6299,14 @@ class PhotoIdentifyGUI(tk.Tk):
         self._load_thumbnails()
         self._update_browse_pagination_state()
         self.status_var.set(f"已加载 {len(results)} 张图片")
-        # 延迟实测单元格尺寸，等缩略图渲染完毕
-        self.after(600, self._measure_and_adjust_page_size)
+        # 延迟实测单元格尺寸，等缩略图渲染完毕（先取消之前的定时器防止闪烁）
+        if self._browse_page_adjust_timer:
+            self.after_cancel(self._browse_page_adjust_timer)
+        self._browse_page_adjust_timer = self.after(600, self._measure_and_adjust_page_size)
 
     def _measure_and_adjust_page_size(self):
         """实测单元格后，如果页面大小需要调整则重新加载（浏览模式）"""
+        self._browse_page_adjust_timer = None
         if not self._browse_mode:
             return
         old_size = self._browse_page_size
@@ -6313,6 +6318,7 @@ class PhotoIdentifyGUI(tk.Tk):
 
     def _measure_and_adjust_search_page_size(self):
         """实测单元格后，如果页面大小需要调整则重新加载（搜索结果）"""
+        self._search_page_adjust_timer = None
         if self._browse_mode or not self._search_all_results:
             return
         old_size = self._browse_page_size
@@ -6378,8 +6384,10 @@ class PhotoIdentifyGUI(tk.Tk):
         self.show_gallery_view()
         self._load_thumbnails()
         self._update_browse_pagination_state()
-        # 延迟实测单元格尺寸
-        self.after(600, self._measure_and_adjust_search_page_size)
+        # 延迟实测单元格尺寸（先取消之前的定时器防止闪烁，增加延迟时间减少调整次数）
+        if self._search_page_adjust_timer:
+            self.after_cancel(self._search_page_adjust_timer)
+        self._search_page_adjust_timer = self.after(1200, self._measure_and_adjust_search_page_size)
 
     def _estimate_browse_page_size(self) -> int:
         """根据窗口大小动态估算每页显示数量，确保一屏显示完无滚动条"""
