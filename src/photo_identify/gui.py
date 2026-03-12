@@ -1161,9 +1161,9 @@ class PhotoIdentifyGUI(tk.Tk):
         radio_frame.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
         self.filename_radio = ttk.Radiobutton(radio_frame, text="文件名", variable=self.search_mode_var, value="filename", command=self._on_search_options_changed)
         self.filename_radio.pack(side=tk.LEFT)
-        self.local_radio = ttk.Radiobutton(radio_frame, text="本地算法", variable=self.search_mode_var, value="local", command=self._on_search_options_changed)
+        self.local_radio = ttk.Radiobutton(radio_frame, text="FTS", variable=self.search_mode_var, value="local", command=self._on_search_options_changed)
         self.local_radio.pack(side=tk.LEFT, padx=(10, 0))
-        self.llm_radio = ttk.Radiobutton(radio_frame, text="向量查询", variable=self.search_mode_var, value="llm", command=self._on_search_options_changed)
+        self.llm_radio = ttk.Radiobutton(radio_frame, text="向量(更准确)", variable=self.search_mode_var, value="llm", command=self._on_search_options_changed)
         self.llm_radio.pack(side=tk.LEFT, padx=(10, 5))
         
         vec_combo_frame = ttk.Frame(left_frame)
@@ -1229,7 +1229,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self.limit_entry.pack(side=tk.LEFT, padx=(4, 0))
 
         # R-Row 2: Search + View All (vertically aligned)
-        self.browse_all_btn = ttk.Button(right_frame, text="📂 查看所有", command=self._enter_browse_mode, width=12)
+        self.browse_all_btn = ttk.Button(right_frame, text="⭕ 查看所有", command=self._enter_browse_mode, width=12)
         self.browse_all_btn.pack(side=tk.TOP, anchor=tk.W, pady=(0, 4))
         self.search_btn = ttk.Button(right_frame, text="🔍 搜索", command=self.do_search, width=12)
         self.search_btn.pack(side=tk.TOP, anchor=tk.W, pady=0)
