@@ -40,7 +40,7 @@ def _get_query_embedding(
         )
     except Exception as exc:
         logger.warning("获取 Query Embedding 失败: %s", exc)
-        print(f"  ⚠️ 获取语义向量失败: {exc}", file=sys.stderr)
+        print(f"  [WARN] 获取语义向量失败: {exc}", file=sys.stderr)
     return []
 
 
@@ -135,7 +135,7 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
 
     except Exception as exc:
         logger.warning("LLM 重排序失败: %s", exc)
-        print(f"  ⚠️ LLM 排序失败，回退默认顺序: {exc}", file=sys.stderr)
+        print(f"  [WARN] LLM 排序失败，回退默认顺序: {exc}", file=sys.stderr)
         return results, f"LLM 排序失败，已回退默认顺序: {exc}"
 
 
@@ -183,7 +183,7 @@ def _llm_expand_query(query: str, api_key: str, base_url: str, model: str) -> st
         
     except Exception as exc:
         logger.warning("LLM 拓展查询词失败: %s", exc)
-        print(f"  ⚠️ LLM 拓展查询词失败，回退原始搜索: {exc}", file=sys.stderr)
+        print(f"  [WARN] LLM 拓展查询词失败，回退原始搜索: {exc}", file=sys.stderr)
         return query
 
 
@@ -225,18 +225,18 @@ def search(
         (results, warnings) 二元组：匹配的图片记录列表 和 警告信息列表。
     """
     if expand_query and model:
-        print("  🔍 正在使用 LLM 进行搜索意图拓展...")
+        print("  [INFO] 正在使用 LLM 进行搜索意图拓展...")
         query = _llm_expand_query(query, api_key, base_url, model)
         
     query_emb = None
     if smart:
         if not embedding_model:
-            print("  ⚠️ 智能模式(Semantic Search)需要配置向量模型，回退为普通本地搜索", file=sys.stderr)
+            print("  [WARN] 智能模式(Semantic Search)需要配置向量模型，回退为普通本地搜索", file=sys.stderr)
             smart = False
         else:
             emb_key = embedding_api_key or api_key
             emb_url = embedding_base_url or base_url
-            print(f"  🔍 正在获取检索词的语义向量...")
+            print("  [INFO] 正在获取检索词的语义向量...")
             query_emb_list = _get_query_embedding(
                 query,
                 emb_key,
@@ -308,7 +308,7 @@ def search(
             storage.close()
         except Exception as e:
             logger.warning("在数据库 %s 中搜索失败: %s", db, e)
-            print(f"  ⚠️ 读取数据库出错 {db}: {e}", file=sys.stderr)
+            print(f"  [WARN] 读取数据库出错 {db}: {e}", file=sys.stderr)
             
     # 如果有多个库，全局排序
     results.sort(key=lambda x: x.get("score", 0.0))

@@ -1170,7 +1170,7 @@ class Storage:
         fts_results = {}
         if match_terms:
             match_query_and = " AND ".join(match_terms)
-            print(f"  🔍 FTS 分词转换 (精确): \"{query}\" -> \"{match_query_and}\"")
+            print(f"  [FTS] 分词转换 (精确): \"{query}\" -> \"{match_query_and}\"")
 
             sql = """
             SELECT
@@ -1200,11 +1200,11 @@ class Storage:
             except sqlite3.OperationalError as e:
                 import sys
 
-                print(f"  ⚠️ FTS 精确查询语法有误: {match_query_and} ({e})", file=sys.stderr)
+                print(f"  [WARN] FTS 精确查询语法有误: {match_query_and} ({e})", file=sys.stderr)
 
             if and_count < limit and len(match_terms) > 1:
                 match_query_or = " OR ".join(match_terms)
-                print(f"  🔍 FTS 分词转换 (降级): \"{query}\" -> \"{match_query_or}\"")
+                print(f"  [FTS] 分词转换 (降级): \"{query}\" -> \"{match_query_or}\"")
                 try:
                     cursor.execute(sql + f" LIMIT {limit * 5}", (match_query_or,))
                     for row in cursor.fetchall():
@@ -1214,7 +1214,7 @@ class Storage:
                 except sqlite3.OperationalError as e:
                     import sys
 
-                    print(f"  ⚠️ FTS 降级查询语法有误: {match_query_or} ({e})", file=sys.stderr)
+                    print(f"  [WARN] FTS 降级查询语法有误: {match_query_or} ({e})", file=sys.stderr)
 
             if not fts_results:
                 cursor.execute(
@@ -1224,6 +1224,57 @@ class Storage:
                 for row in cursor.fetchall():
                     row_dict = dict(row)
                     row_dict["score"] = -0.5
+                    fts_results[row_dict["id"]] = row_dict
+
+        exact_query = query.strip()
+        if exact_query:
+            exact_like = f"%{exact_query}%"
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    path,
+                    file_name,
+                    size_bytes AS file_size,
+                    created_time AS photo_date,
+                    scene,
+                    objects,
+                    style,
+                    location_time,
+                    wallpaper_hint,
+                    modified_time AS updated_at
+                FROM images
+                WHERE scene LIKE ?
+                   OR objects LIKE ?
+                   OR style LIKE ?
+                   OR location_time LIKE ?
+                   OR wallpaper_hint LIKE ?
+                   OR file_name LIKE ?
+                LIMIT ?
+                """,
+                (exact_like, exact_like, exact_like, exact_like, exact_like, exact_like, limit * 5),
+            )
+            for row in cursor.fetchall():
+                row_dict = dict(row)
+                exact_score = -10000.0
+                if exact_query in str(row_dict.get("objects") or ""):
+                    exact_score -= 300.0
+                if exact_query in str(row_dict.get("scene") or ""):
+                    exact_score -= 200.0
+                if exact_query in str(row_dict.get("style") or ""):
+                    exact_score -= 80.0
+                if exact_query in str(row_dict.get("location_time") or ""):
+                    exact_score -= 60.0
+                if exact_query in str(row_dict.get("wallpaper_hint") or ""):
+                    exact_score -= 40.0
+                if exact_query in str(row_dict.get("file_name") or ""):
+                    exact_score -= 20.0
+
+                existing = fts_results.get(row_dict["id"])
+                if existing:
+                    existing["score"] = min(existing.get("score", 0.0), exact_score)
+                else:
+                    row_dict["score"] = exact_score
                     fts_results[row_dict["id"]] = row_dict
 
         final_results = {}

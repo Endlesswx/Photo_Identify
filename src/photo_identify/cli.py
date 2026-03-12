@@ -84,7 +84,7 @@ def _cmd_search(args):
     api_key = load_api_key(args.api_key)
     results, warnings = search(
         query=args.query,
-        db_path=str(args.db),
+        db_paths=str(args.db),
         limit=args.limit,
         smart=args.smart,
         api_key=api_key,
@@ -92,7 +92,7 @@ def _cmd_search(args):
     )
     if warnings:
         for w in warnings:
-            print(f"  ⚠️ {w}", file=sys.stderr)
+            print(f"  [WARN] {w}", file=sys.stderr)
     print(format_results(results))
 
 
