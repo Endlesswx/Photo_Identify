@@ -95,6 +95,35 @@ def crop_and_circle_face(image: Image.Image, bbox_str: str, size: int = 80) -> I
     return result
 
 
+class ToolTip:
+    """为控件创建悬浮提示。"""
+
+    def __init__(self, widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        widget.bind("<Enter>", self._show_tooltip)
+        widget.bind("<Leave>", self._hide_tooltip)
+
+    def _show_tooltip(self, event=None):
+        if self.tooltip_window or not self.text:
+            return
+        x, y, _, _ = self.widget.bbox("insert") if hasattr(self.widget, 'bbox') else (0, 0, 0, 0)
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify=tk.LEFT, background="#ffffe0", relief=tk.SOLID, borderwidth=1, font=("Arial", 9))
+        label.pack()
+
+    def _hide_tooltip(self, event=None):
+        tw = self.tooltip_window
+        self.tooltip_window = None
+        if tw:
+            tw.destroy()
+
+
 def split_media_record_path(file_path: str | None) -> tuple[str, str]:
     """将数据库中的媒体记录路径拆分为原始路径和实际文件路径。"""
 
@@ -1463,6 +1492,7 @@ class PhotoIdentifyGUI(tk.Tk):
         action_frame.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(8, 6))
         self.video_transcode_btn = ttk.Button(action_frame, text="视频转码", command=self.start_video_transcode)
         self.video_transcode_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        ToolTip(self.video_transcode_btn, "为了能让多模态模型理解视频，建议执行转码，否则将采用抽帧策略")
         self.scan_btn = ttk.Button(action_frame, text=f"▶ {IMAGE_EXTRACTION_LABEL}", command=self.start_scan)
         self.scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.face_scan_btn = ttk.Button(action_frame, text=f"👤 {FACE_SCAN_LABEL}", command=self.start_face_scan)
@@ -4183,14 +4213,12 @@ class PhotoIdentifyGUI(tk.Tk):
 
                     script_path = Path(__file__).resolve().parents[1] / "video_edit" / "video_compression.py"
                     cmd = [sys.executable, str(script_path)]
-                    creationflags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
                     self._video_transcode_process = subprocess.Popen(
                         cmd,
                         env=env,
-                        creationflags=creationflags,
                     )
                     self._append_scan_log_from_thread(
-                        f"[视频转码] 已启动转码进程 (PID={self._video_transcode_process.pid})，请查看 CMD 窗口输出。\n"
+                        f"[视频转码] 已启动转码进程 (PID={self._video_transcode_process.pid})，详细日志请查看启动终端。\n"
                     )
 
                     while True:
