@@ -396,6 +396,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self.query_var = tk.StringVar(value="")
         self.search_mode_var = tk.StringVar(value="llm")
         self.search_limit_var = tk.StringVar(value="30")
+        self.search_expand_var = tk.BooleanVar(value=False)
+        self.search_rerank_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="准备就绪。")
         self.info_var = tk.StringVar(value="暂无图片")
         self.desc_var = tk.StringVar(value="")
@@ -595,8 +597,13 @@ class PhotoIdentifyGUI(tk.Tk):
                     self.db_listbox.insert(tk.END, db)
         if cfg.has_option("search", "last_query"):
             self.query_var.set(cfg.get("search", "last_query"))
+
         if cfg.has_option("search", "expand"):
             self.search_expand_var.set(cfg.getboolean("search", "expand"))
+        elif cfg.has_option("search", "expand_mode"):
+            expand_mode = cfg.get("search", "expand_mode").strip()
+            self.search_expand_var.set(expand_mode == "llm")
+
         if cfg.has_option("search", "rerank"):
             self.search_rerank_var.set(cfg.getboolean("search", "rerank"))
 
@@ -659,6 +666,10 @@ class PhotoIdentifyGUI(tk.Tk):
             "selected_tab": str(selected_tab),
         }
 
+        llm_expand = False
+        if getattr(self, "search_expand_var", None):
+            llm_expand = bool(self.search_expand_var.get())
+
         cfg["search"] = {
             "model_ref": self.search_model_id_var.get(),
             "model_id": search_model.get("model_id", "") if search_model else "",
@@ -668,7 +679,7 @@ class PhotoIdentifyGUI(tk.Tk):
             "limit": self.search_limit_var.get(),
             "databases": "|".join(self.search_dbs),
             "last_query": self.query_var.get(),
-            "expand": str(self.search_expand_var.get()),
+            "expand": str(llm_expand),
             "rerank": str(self.search_rerank_var.get()),
         }
         cfg["scan"] = {
@@ -946,9 +957,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 self._on_search_embedding_selected()
 
                 if hasattr(self, "expand_chk"):
-                    self.expand_chk.config(state=tk.DISABLED)
-                    if getattr(self, "search_expand_var", None):
-                        self.search_expand_var.set(False)
+                    self.expand_chk.config(state=tk.NORMAL)
             else:
                 self.search_embedding_combo.config(state="disabled")
                 if hasattr(self, "expand_chk"):
@@ -958,7 +967,7 @@ class PhotoIdentifyGUI(tk.Tk):
             if hasattr(self, "rerank_chk"):
                 self.rerank_chk.config(state=tk.NORMAL)
 
-        # 如果选中了"大模型分词拓展"或"使用大模型排序"，才启用文本模型下拉框
+        # 如果选中了"LLM 兜底拓展"或"使用大模型排序"，才启用文本模型下拉框
         if getattr(self, "search_expand_var", None) and getattr(self, "search_rerank_var", None):
             if self.search_expand_var.get() or self.search_rerank_var.get():
                 self.search_model_combo.config(state="readonly")
@@ -1170,12 +1179,20 @@ class PhotoIdentifyGUI(tk.Tk):
         
         chk_frame = ttk.Frame(left_frame)
         chk_frame.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
-        self.search_expand_var = tk.BooleanVar(value=False)
-        self.search_rerank_var = tk.BooleanVar(value=False)
-        
-        self.expand_chk = ttk.Checkbutton(chk_frame, text="大模型分词拓展", variable=self.search_expand_var, command=self._on_search_options_changed)
+
+        self.expand_chk = ttk.Checkbutton(
+            chk_frame,
+            text="LLM拓展(本地不足时触发)",
+            variable=self.search_expand_var,
+            command=self._on_search_options_changed,
+        )
         self.expand_chk.pack(side=tk.LEFT)
-        self.rerank_chk = ttk.Checkbutton(chk_frame, text="使用大模型排序", variable=self.search_rerank_var, command=self._on_search_options_changed)
+        self.rerank_chk = ttk.Checkbutton(
+            chk_frame,
+            text="使用大模型排序",
+            variable=self.search_rerank_var,
+            command=self._on_search_options_changed,
+        )
         self.rerank_chk.pack(side=tk.LEFT, padx=(10, 5))
         
         txt_combo_frame = ttk.Frame(left_frame)
@@ -5188,7 +5205,10 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         is_llm_mode = (search_mode == "llm")
-        is_expand = self.search_expand_var.get()
+        is_expand = False
+        if getattr(self, "search_expand_var", None):
+            is_expand = bool(self.search_expand_var.get())
+        is_local_expand = True
         is_rerank = self.search_rerank_var.get()
         
         # 处理文本模型参数（当且仅当由于开启了拓展或重排序时需要）
@@ -5215,7 +5235,9 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self.toggle_state(tk.DISABLED)
         if is_expand:
-            self.status_var.set("正在使用大模型拓展词意，请稍候...")
+            self.status_var.set("正在使用 LLM 兜底拓展（本地不足时触发），请稍候...")
+        elif is_local_expand:
+            self.status_var.set("正在使用本地分词拓展，请稍候...")
         elif is_llm_mode:
             self.status_var.set("正在使用向量匹配召回数据，请稍候...")
         else:
@@ -5245,6 +5267,7 @@ class PhotoIdentifyGUI(tk.Tk):
                     model=text_model_id,
                     rerank=is_rerank,
                     expand_query=is_expand,
+                    local_expand=is_local_expand,
                     embedding_model=emb_model_id,
                     embedding_base_url=emb_base_url,
                     embedding_api_key=emb_api_key,

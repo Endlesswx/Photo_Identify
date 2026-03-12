@@ -89,6 +89,7 @@ def _cmd_search(args):
         smart=args.smart,
         api_key=api_key,
         base_url=args.base_url,
+        local_expand=True,
     )
     if warnings:
         for w in warnings:
