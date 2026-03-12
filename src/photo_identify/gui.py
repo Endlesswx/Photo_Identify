@@ -42,6 +42,8 @@ from photo_identify.scanner import FACE_SCAN_LABEL, IMAGE_EXTRACTION_LABEL, scan
 from photo_identify.storage import Storage
 
 
+logger = logging.getLogger(__name__)
+
 def crop_and_circle_face(image: Image.Image, bbox_str: str, size: int = 80) -> Image.Image:
     """根据 bbox 从图片裁剪人脸，并生成圆形带透明背景的图。"""
     import json
@@ -1461,8 +1463,12 @@ class PhotoIdentifyGUI(tk.Tk):
         self.scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.face_scan_btn = ttk.Button(action_frame, text=f"👤 {FACE_SCAN_LABEL}", command=self.start_face_scan)
         self.face_scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.face_rebuild_btn = ttk.Button(action_frame, text="🧹 重建", command=self.rebuild_face_scan)
+        self.face_rebuild_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.refresh_vectors_btn = ttk.Button(action_frame, text="♻ 刷新图片向量", command=self.refresh_image_embeddings)
         self.refresh_vectors_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.embedding_rebuild_btn = ttk.Button(action_frame, text="🧹 重建", command=self.rebuild_image_embeddings)
+        self.embedding_rebuild_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.pause_btn = ttk.Button(action_frame, text="⏸ 暂停扫描", command=self.toggle_pause_scan, state=tk.DISABLED)
         self.pause_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.restart_btn = ttk.Button(action_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
@@ -4631,7 +4637,9 @@ class PhotoIdentifyGUI(tk.Tk):
 
         self.scan_btn.config(state=tk.DISABLED)
         self.face_scan_btn.config(state=tk.DISABLED)
+        self.face_rebuild_btn.config(state=tk.DISABLED)
         self.refresh_vectors_btn.config(state=tk.DISABLED)
+        self.embedding_rebuild_btn.config(state=tk.DISABLED)
         self.pause_btn.config(state=tk.NORMAL, text="⏸ 暂停扫描")
         self.restart_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL)
@@ -4647,7 +4655,9 @@ class PhotoIdentifyGUI(tk.Tk):
         self._active_task_restart_action = None
         self.scan_btn.config(state=tk.NORMAL)
         self.face_scan_btn.config(state=tk.NORMAL)
+        self.face_rebuild_btn.config(state=tk.NORMAL)
         self.refresh_vectors_btn.config(state=tk.NORMAL)
+        self.embedding_rebuild_btn.config(state=tk.NORMAL)
         self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停扫描")
         self.restart_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.DISABLED)
@@ -4675,6 +4685,86 @@ class PhotoIdentifyGUI(tk.Tk):
             self.pause_btn.config(text="▶ 继续扫描")
             self.scan_status_var.set(f"{task_label}已暂停，等待继续...")
             self._append_scan_log(f"\n[{task_label}] 已暂停，等待继续...\n")
+
+    def rebuild_image_embeddings(self) -> None:
+        """清空图片向量并重新生成。"""
+        db_path = self.scan_db_var.get().strip()
+        if not db_path:
+            messagebox.showwarning("警告", "请先指定数据库路径！")
+            return
+
+        if not os.path.exists(db_path):
+            messagebox.showwarning("警告", f"数据库不存在：\n{db_path}")
+            return
+
+        if self._has_running_scan_task():
+            messagebox.showinfo("提示", "当前已有扫描或向量刷新任务正在执行，请等待其结束。")
+            return
+
+        emb_params = self._get_scan_embedding_params()
+        if emb_params is None:
+            return
+
+        confirm = messagebox.askyesno(
+            "确认重建",
+            "即将清空数据库中所有图片向量并重新生成。\n"
+            "此操作不可撤销，即使已标记已扫描也会重建。\n\n"
+            "是否继续？",
+        )
+        if not confirm:
+            return
+
+        try:
+            storage = Storage(db_path)
+            storage.reset_text_embeddings()
+            storage.close()
+        except Exception as exc:
+            messagebox.showerror("错误", f"清空图片向量失败:\n{exc}")
+            return
+
+        self.refresh_image_embeddings()
+        self.scan_status_var.set("正在重建图片向量，查看下方日志区...")
+        self._append_scan_log("\n[图片向量重建] 已清空向量，开始全量重建...\n")
+
+    def rebuild_face_scan(self) -> None:
+        """清空人物扫描数据并重新执行人物扫描。"""
+        if self._has_running_scan_task():
+            messagebox.showinfo("提示", "当前已有任务正在执行，请等待其结束。")
+            return
+
+        if not self.scan_paths:
+            messagebox.showwarning("警告", "请先添加要扫描的目录！")
+            return
+
+        db_path = self.scan_db_var.get().strip()
+        if not db_path:
+            messagebox.showwarning("警告", "请先指定数据库路径！")
+            return
+
+        if not os.path.exists(db_path):
+            messagebox.showwarning("警告", f"数据库不存在：\n{db_path}")
+            return
+
+        confirm = messagebox.askyesno(
+            "确认重建",
+            "即将清空人物扫描结果（人脸特征、人物分组与关联）并重新扫描全部图片。\n"
+            "此操作不可撤销，即使已标记已扫描也会重建。\n\n"
+            "是否继续？",
+        )
+        if not confirm:
+            return
+
+        try:
+            storage = Storage(db_path)
+            storage.reset_face_scan_data()
+            storage.close()
+        except Exception as exc:
+            messagebox.showerror("错误", f"清空人物扫描数据失败:\n{exc}")
+            return
+
+        self.start_face_scan()
+        self.scan_status_var.set("正在重建人物扫描，查看下方日志区...")
+        self._append_scan_log("\n[人物扫描重建] 已清空人物/人脸数据，开始全量重建...\n")
 
     def refresh_image_embeddings(self) -> None:
         """基于当前数据库执行图片文本向量回填，并将日志输出到扫描日志区。"""

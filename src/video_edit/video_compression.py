@@ -8,7 +8,6 @@ import threading
 
 # ================= 最终极速配置 =================
 SOURCE_DIR = Path(r"F:\图片\iPhone相册") 
-# SOURCE_DIR = Path(r"F:\图片\照片")
 OUTPUT_DIR = Path(r"E:\Caches\相册视频-压缩后")
 
 

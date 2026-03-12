@@ -1364,6 +1364,25 @@ class Storage:
         self._conn.execute("UPDATE images SET text_embedding = ? WHERE id = ?", (embedding_bytes, image_id))
         self._conn.commit()
 
+    def reset_text_embeddings(self) -> None:
+        """清空所有图片的 text_embedding，并刷新相关统计信息。"""
+        cursor = self._conn.cursor()
+        cursor.execute("UPDATE images SET text_embedding = NULL")
+        try:
+            cursor.execute("ANALYZE images")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.commit()
+
+    def reset_face_scan_data(self) -> None:
+        """清空人物扫描相关数据，并重置 face_scanned 标记。"""
+        cursor = self._conn.cursor()
+        cursor.execute("DELETE FROM photos")
+        cursor.execute("DELETE FROM persons")
+        cursor.execute("DELETE FROM face_embeddings")
+        cursor.execute("UPDATE images SET face_scanned = 0")
+        self._conn.commit()
+
     def count(self) -> int:
         """返回已入库的图片总数。
 

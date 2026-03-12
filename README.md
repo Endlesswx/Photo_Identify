@@ -10,7 +10,7 @@
 - Smart Search 扩展同义词
 - 结果预览与定位
 
-![image-20260308184839748](assets/image-20260308184839748.png)
+![image-20260312202514917](assets/image-20260312202514917.png)
 
 ### 信息扫描
 
@@ -90,7 +90,11 @@ export SILICONFLOW_API_KEY="您的_API_KEY"
 uv run python -m photo_identify gui
 ```
 
-- ****所有交互都可以在GUI界面完成，以下非开发需求无需再看****
+2.
+
+
+
+****所有交互都可以在GUI界面完成，以下非开发需求无需再看****
 
 
 
