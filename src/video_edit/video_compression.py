@@ -7,8 +7,10 @@ from tqdm import tqdm
 import threading
 
 # ================= 最终极速配置 =================
-SOURCE_DIR = Path(r"F:\图片\iPhone相册") 
-OUTPUT_DIR = Path(r"E:\Caches\相册视频-压缩后")
+ENV_SOURCE_DIR = os.environ.get("VIDEO_COMPRESSION_SOURCE_DIR", "").strip()
+ENV_OUTPUT_DIR = os.environ.get("VIDEO_COMPRESSION_OUTPUT_DIR", "").strip()
+SOURCE_DIR = Path(os.path.expandvars(ENV_SOURCE_DIR)) if ENV_SOURCE_DIR else Path(r"F:\图片\iPhone相册")
+OUTPUT_DIR = Path(os.path.expandvars(ENV_OUTPUT_DIR)) if ENV_OUTPUT_DIR else Path(r"E:\Caches\相册视频-压缩后")
 
 
 # 【火力全开】
@@ -121,9 +123,10 @@ def main():
                 stats["skipped"] += 1
             elif status == 1: 
                 stats["processed"] += 1
-            else: 
+            else:
                 stats["error"] += 1
-                tqdm.write(msg)
+                if msg:
+                    tqdm.write(msg)
             pbar.update(1)
         pbar.close()
 

@@ -11,6 +11,7 @@ import threading
 import time
 import io
 import re
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import scrolledtext
@@ -1369,6 +1370,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self._active_task_cancel_event = None
         self._active_task_pause_event = None
         self._active_task_restart_action = None
+        self._video_transcode_process = None
         
         form_frame = ttk.Frame(self.scan_tab, padding=(18, 16, 18, 8))
         form_frame.pack(fill=tk.X)
@@ -1459,6 +1461,8 @@ class PhotoIdentifyGUI(tk.Tk):
         # 4. 操作按钮
         action_frame = ttk.Frame(form_frame)
         action_frame.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(8, 6))
+        self.video_transcode_btn = ttk.Button(action_frame, text="视频转码", command=self.start_video_transcode)
+        self.video_transcode_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.scan_btn = ttk.Button(action_frame, text=f"▶ {IMAGE_EXTRACTION_LABEL}", command=self.start_scan)
         self.scan_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.face_scan_btn = ttk.Button(action_frame, text=f"👤 {FACE_SCAN_LABEL}", command=self.start_face_scan)
@@ -1469,12 +1473,6 @@ class PhotoIdentifyGUI(tk.Tk):
         self.refresh_vectors_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.embedding_rebuild_btn = ttk.Button(action_frame, text="🧹 重建", command=self.rebuild_image_embeddings)
         self.embedding_rebuild_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
-        self.pause_btn = ttk.Button(action_frame, text="⏸ 暂停扫描", command=self.toggle_pause_scan, state=tk.DISABLED)
-        self.pause_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
-        self.restart_btn = ttk.Button(action_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
-        self.restart_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
-        self.stop_btn = ttk.Button(action_frame, text="⏹ 停止扫描", command=self.stop_scan, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, ipady=5)
 
         # 5. 提醒文案
         self.scan_status_var = tk.StringVar(value="准备就绪")
@@ -1488,7 +1486,17 @@ class PhotoIdentifyGUI(tk.Tk):
         self.scan_status_label.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(0, 4))
         form_frame.bind("<Configure>", self._on_scan_form_configure)
 
-        # 6. 日志区域
+        # 6. 暂停/重启/停止按钮（位于提醒文案下一行）
+        control_frame = ttk.Frame(form_frame)
+        control_frame.grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=(0, 6))
+        self.pause_btn = ttk.Button(control_frame, text="⏸ 暂停扫描", command=self.toggle_pause_scan, state=tk.DISABLED)
+        self.pause_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.restart_btn = ttk.Button(control_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
+        self.restart_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.stop_btn = ttk.Button(control_frame, text="⏹ 停止扫描", command=self.stop_scan, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, ipady=5)
+
+        # 7. 日志区域
         log_frame = ttk.LabelFrame(self.scan_tab, text="任务日志", padding="5")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
@@ -4124,6 +4132,116 @@ class PhotoIdentifyGUI(tk.Tk):
         self.log_text.configure(state=tk.DISABLED)
         self.log_text.see(tk.END)
 
+    def _append_scan_log_from_thread(self, message: str) -> None:
+        """线程安全地追加扫描日志。"""
+        self.log_text.after(0, self._append_scan_log, message)
+
+    def _ensure_scan_task_idle(self, action_label: str) -> bool:
+        if self._has_running_scan_task():
+            messagebox.showinfo("提示", f"当前已有扫描或向量任务正在执行，请等待其结束后再执行{action_label}。")
+            return False
+        if self._video_transcode_process is not None and self._video_transcode_process.poll() is None:
+            messagebox.showinfo("提示", f"当前已有视频转码任务正在执行，请等待其结束后再执行{action_label}。")
+            return False
+        return True
+
+    def start_video_transcode(self) -> None:
+        if not self._ensure_scan_task_idle("视频转码"):
+            return
+        if not self.scan_paths:
+            messagebox.showwarning("警告", "请先添加要扫描的目录！")
+            return
+        output_dir = self.transcoded_video_path_var.get().strip() if hasattr(self, "transcoded_video_path_var") else ""
+        if not output_dir:
+            messagebox.showwarning("警告", "请先设置转码后视频路径！")
+            return
+
+        self._save_settings()
+        self.scan_status_var.set("正在执行视频转码，查看下方日志区...")
+        self._reset_scan_log("[视频转码] 准备中...\n")
+
+        cancel_event = threading.Event()
+        pause_event = threading.Event()
+
+        def _transcode_thread():
+            log_path = ""
+            try:
+                total_paths = len(self.scan_paths)
+                self._append_scan_log_from_thread(f"[视频转码] 输出目录: {output_dir}\n")
+                for idx, source_dir in enumerate(self.scan_paths, start=1):
+                    if cancel_event.is_set():
+                        break
+                    source_dir = str(source_dir).strip()
+                    if not source_dir:
+                        continue
+                    self.after(0, lambda i=idx, t=total_paths: self.scan_status_var.set(f"正在执行视频转码 ({i}/{t})，查看下方日志区..."))
+                    self._append_scan_log_from_thread(f"[视频转码] ({idx}/{total_paths}) 源目录: {source_dir}\n")
+
+                    env = os.environ.copy()
+                    env["VIDEO_COMPRESSION_SOURCE_DIR"] = source_dir
+                    env["VIDEO_COMPRESSION_OUTPUT_DIR"] = output_dir
+
+                    script_path = Path(__file__).resolve().parents[1] / "video_edit" / "video_compression.py"
+                    cmd = [sys.executable, str(script_path)]
+                    creationflags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+                    self._video_transcode_process = subprocess.Popen(
+                        cmd,
+                        env=env,
+                        creationflags=creationflags,
+                    )
+                    self._append_scan_log_from_thread(
+                        f"[视频转码] 已启动转码进程 (PID={self._video_transcode_process.pid})，请查看 CMD 窗口输出。\n"
+                    )
+
+                    while True:
+                        if cancel_event.is_set():
+                            try:
+                                self._video_transcode_process.terminate()
+                            except Exception:
+                                pass
+                            try:
+                                self._video_transcode_process.wait(timeout=10)
+                            except Exception:
+                                pass
+                            break
+                        exit_code = self._video_transcode_process.poll()
+                        if exit_code is not None:
+                            break
+                        time.sleep(0.5)
+
+                    if cancel_event.is_set():
+                        break
+
+                    exit_code = self._video_transcode_process.wait()
+                    if exit_code != 0:
+                        raise RuntimeError(f"转码失败，退出码: {exit_code}")
+                    self._append_scan_log_from_thread(f"[视频转码] ({idx}/{total_paths}) 已完成。\n")
+
+                if cancel_event.is_set():
+                    self.after(0, lambda: self.scan_status_var.set("视频转码已停止。"))
+                    self.after(0, lambda: self._append_task_completion_log("视频转码", "已结束（用户停止）。", log_path))
+                else:
+                    self.after(0, lambda: self.scan_status_var.set("视频转码完成。"))
+                    self.after(0, lambda: self._append_task_completion_log("视频转码", "已结束（完成）。", log_path))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: self.scan_status_var.set(f"视频转码出错: {exc}"))
+                self.after(0, lambda exc=exc: self._append_task_completion_log("视频转码", f"已结束（异常：{exc}）。", log_path))
+                self.after(0, lambda exc=exc: messagebox.showerror("错误", f"视频转码异常:\n{exc}"))
+            finally:
+                self._video_transcode_process = None
+                self.after(0, lambda: self._finalize_scan_task(current_gen))
+
+        t = threading.Thread(target=_transcode_thread, daemon=True)
+        current_gen = self._begin_scan_task(
+            task_kind="video_transcode",
+            task_label="视频转码",
+            thread=t,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            restart_action=self.start_video_transcode,
+        )
+        t.start()
+
     def _append_task_completion_log(self, task_label: str, summary: str, log_path: str = "") -> None:
         """向扫描日志区追加明确的任务结束提示。"""
 
@@ -4640,6 +4758,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self.face_rebuild_btn.config(state=tk.DISABLED)
         self.refresh_vectors_btn.config(state=tk.DISABLED)
         self.embedding_rebuild_btn.config(state=tk.DISABLED)
+        if hasattr(self, "video_transcode_btn"):
+            self.video_transcode_btn.config(state=tk.DISABLED)
         self.pause_btn.config(state=tk.NORMAL, text="⏸ 暂停扫描")
         self.restart_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL)
@@ -4658,6 +4778,8 @@ class PhotoIdentifyGUI(tk.Tk):
         self.face_rebuild_btn.config(state=tk.NORMAL)
         self.refresh_vectors_btn.config(state=tk.NORMAL)
         self.embedding_rebuild_btn.config(state=tk.NORMAL)
+        if hasattr(self, "video_transcode_btn"):
+            self.video_transcode_btn.config(state=tk.NORMAL)
         self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停扫描")
         self.restart_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.DISABLED)
@@ -5148,7 +5270,8 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         task_label = self._active_task_label or "当前任务"
-        self._active_task_cancel_event.set()
+        if self._active_task_cancel_event is not None:
+            self._active_task_cancel_event.set()
         if self._active_task_pause_event is not None:
             self._active_task_pause_event.clear()
         self.scan_status_var.set(f"正在重启{task_label}，请稍候...")
@@ -5176,7 +5299,8 @@ class PhotoIdentifyGUI(tk.Tk):
             return
 
         task_label = self._active_task_label or "当前任务"
-        self._active_task_cancel_event.set()
+        if self._active_task_cancel_event is not None:
+            self._active_task_cancel_event.set()
         if self._active_task_pause_event is not None:
             self._active_task_pause_event.clear()
         self.scan_status_var.set(f"正在停止{task_label}...")
