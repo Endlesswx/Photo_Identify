@@ -3479,7 +3479,11 @@ class PhotoIdentifyGUI(tk.Tk):
                 # as this item might be in the search results, not the favorites tab.
                 # The menu text will be updated dynamically by show_menu.
             menu.add_command(label="取消收藏" if record.get("is_favorite") else "加入收藏", command=lambda r=record: _toggle_fav(r))
-            
+
+            def _edit_desc(r=record):
+                self._show_edit_description_dialog(r)
+            menu.add_command(label="编辑描述", command=lambda r=record: _edit_desc(r))
+
             def show_menu(e, r=record):
                 is_fav = r.get("is_favorite", 0)
                 # The index for "加入收藏" / "取消收藏" is 3 (0:复制文件名, 1:设为头像, 2:打开文件位置, 3:收藏)
@@ -3728,7 +3732,11 @@ class PhotoIdentifyGUI(tk.Tk):
             # 由于在收藏页，点击取消收藏后需要刷新
             self._refresh_favorites()
         menu.add_command(label="取消收藏" if record.get("is_favorite") else "加入收藏", command=lambda r=record: _toggle_fav(r))
-        
+
+        def _edit_desc(r=record):
+            self._show_edit_description_dialog(r)
+        menu.add_command(label="编辑描述", command=lambda r=record: _edit_desc(r))
+
         def show_menu(e, r=record):
             menu.tk_popup(e.x_root, e.y_root)
             
@@ -5413,11 +5421,11 @@ class PhotoIdentifyGUI(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(file_name)
         menu.add_command(label="复制文件名", command=lambda r=record: _copy_filename(r))
-        
+
         def _open_loc(r=record):
             self._open_file_location_by_path(r.get("path", ""))
         menu.add_command(label="打开文件位置", command=lambda r=record: _open_loc(r))
-        
+
         def _toggle_fav(r=record):
             from photo_identify.storage import Storage # Import Storage
             target_db = r.get("db_path", self.db_path)
@@ -5434,6 +5442,10 @@ class PhotoIdentifyGUI(tk.Tk):
             except:
                 pass
         menu.add_command(label="取消收藏" if record.get("is_favorite") else "加入收藏", command=lambda r=record: _toggle_fav(r))
+
+        def _edit_desc(r=record):
+            self._show_edit_description_dialog(r)
+        menu.add_command(label="编辑描述", command=lambda r=record: _edit_desc(r))
 
         def show_menu(e, r=record):
             # 每次弹出前先根据当前记录更新菜单项文字
@@ -5552,7 +5564,11 @@ class PhotoIdentifyGUI(tk.Tk):
             
         is_fav = record.get("is_favorite", 0)
         menu.add_command(label="取消收藏" if is_fav else "加入收藏", command=_toggle_fav)
-        
+
+        def _edit_desc(r=record):
+            self._show_edit_description_dialog(r)
+        menu.add_command(label="编辑描述", command=_edit_desc)
+
         menu.tk_popup(event.x_root, event.y_root)
 
     def _load_and_draw_image(self, file_path: str):
@@ -5886,14 +5902,25 @@ class PhotoIdentifyGUI(tk.Tk):
             try:
                 if len(self.search_dbs) == 1:
                     # 单数据库直接分页
-                    storage = Storage(self.search_dbs[0])
-                    results = storage.get_images_paginated(offset=offset, limit=limit)
+                    db_path = self.search_dbs[0]
+                    storage = Storage(db_path)
+                    try:
+                        results = storage.get_images_paginated(offset=offset, limit=limit)
+                    finally:
+                        storage.close()
+                    for item in results:
+                        item["db_path"] = db_path
                 else:
                     # 多数据库：每个库取部分，合并排序
                     all_results = []
                     for db_path in self.search_dbs:
                         storage = Storage(db_path)
-                        records = storage.get_images_paginated(offset=0, limit=offset + limit)
+                        try:
+                            records = storage.get_images_paginated(offset=0, limit=offset + limit)
+                        finally:
+                            storage.close()
+                        for item in records:
+                            item["db_path"] = db_path
                         all_results.extend(records)
                     # 按 modified_time 降序排序
                     all_results.sort(key=lambda x: (x.get("modified_time") or "", x.get("id", 0)), reverse=True)
@@ -6059,6 +6086,148 @@ class PhotoIdentifyGUI(tk.Tk):
             new_page = max(1, current_offset // new_size + 1)
             self._browse_page_size = new_size
             self._go_to_page(new_page)
+
+    def _show_edit_description_dialog(self, record: dict):
+        """显示编辑描述对话框"""
+        dialog = tk.Toplevel(self)
+        dialog.title("编辑描述")
+        dialog.geometry("600x500")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # 文件名标题
+        file_name = record.get("file_name", "")
+        ttk.Label(dialog, text=f"文件: {file_name}", font=("", 10, "bold")).pack(pady=10)
+
+        # 创建表单
+        form_frame = ttk.Frame(dialog, padding=10)
+        form_frame.pack(fill=tk.BOTH, expand=True)
+
+        fields = [
+            ("场景 (scene):", "scene"),
+            ("物体 (objects):", "objects"),
+            ("风格 (style):", "style"),
+            ("时间地点 (location_time):", "location_time"),
+            ("壁纸提示 (wallpaper_hint):", "wallpaper_hint"),
+        ]
+
+        entries = {}
+        for i, (label_text, field_name) in enumerate(fields):
+            ttk.Label(form_frame, text=label_text).grid(row=i, column=0, sticky=tk.W, pady=5, padx=5)
+            entry = scrolledtext.ScrolledText(form_frame, height=3, width=50, wrap=tk.WORD)
+            entry.grid(row=i, column=1, sticky=tk.EW, pady=5, padx=5)
+            entry.insert("1.0", record.get(field_name, "") or "")
+            entries[field_name] = entry
+
+        form_frame.columnconfigure(1, weight=1)
+
+        # 按钮
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+
+        def on_save():
+            # 收集修改后的数据
+            updated = {}
+            for field_name, entry in entries.items():
+                updated[field_name] = entry.get("1.0", tk.END).strip()
+
+            # 保存到数据库
+            target_db = str(record.get("db_path") or (self.search_dbs[0] if len(self.search_dbs) == 1 else self.db_path))
+            try:
+                from photo_identify.storage import Storage
+                storage = Storage(target_db)
+
+                # 先验证记录存在
+                cursor = storage._conn.execute("SELECT id FROM images WHERE id = ?", (record["id"],))
+                if not cursor.fetchone():
+                    storage.close()
+                    messagebox.showerror("错误", f"记录 ID {record['id']} 不存在", parent=dialog)
+                    return
+
+                storage.update_description(record["id"], updated)
+                storage.close()
+
+                # 更新本地记录
+                for field_name, value in updated.items():
+                    record[field_name] = value
+
+                messagebox.showinfo("保存成功", "描述已保存到数据库", parent=dialog)
+                dialog.destroy()
+
+                # 刷新向量（异步，不阻塞对话框关闭）
+                self._refresh_embedding_after_edit(record, target_db)
+
+            except Exception as e:
+                import traceback
+                messagebox.showerror("保存失败", f"无法保存描述:\n{e}\n\n{traceback.format_exc()}", parent=dialog)
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="保存", command=on_save).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side=tk.LEFT, padx=10)
+
+    def _refresh_embedding_after_edit(self, record: dict, db_path: str):
+        """编辑描述后刷新向量（后台线程）"""
+        def _refresh_thread():
+            try:
+                # 获取向量模型配置
+                emb_params = self._get_scan_embedding_params()
+                if not emb_params:
+                    self.after(0, lambda: messagebox.showwarning(
+                        "向量刷新跳过",
+                        "未配置向量模型，描述已保存但向量未更新。\n如需语义搜索，请在扫描页配置向量模型后重新扫描。"
+                    ))
+                    return
+
+                from photo_identify.storage import Storage
+                from photo_identify.embedding_runtime import get_text_embedding_sync
+
+                # 构建描述文本
+                parts = []
+                for field in ["scene", "objects", "style", "location_time", "wallpaper_hint"]:
+                    val = record.get(field, "")
+                    if val:
+                        parts.append(val)
+                desc_text = " ".join(parts)
+
+                if not desc_text.strip():
+                    # 无描述，清空向量
+                    storage = Storage(db_path)
+                    storage.update_embedding(record["id"], None)
+                    storage.close()
+                    self.after(0, lambda: messagebox.showinfo("向量已清空", "描述为空，已清空该图片的向量。"))
+                    return
+
+                # 生成新向量
+                embedding = get_text_embedding_sync(
+                    text=desc_text,
+                    model=emb_params["model_id"],
+                    backend=emb_params["backend"],
+                    api_key=emb_params["api_key"],
+                    base_url=emb_params["base_url"],
+                    workers=emb_params["workers"],
+                )
+
+                if not embedding:
+                    raise ValueError("向量生成返回空结果")
+
+                # 保存向量
+                import numpy as np
+                embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
+                storage = Storage(db_path)
+                storage.update_embedding(record["id"], embedding_bytes)
+                storage.close()
+
+                self.after(0, lambda: messagebox.showinfo("成功", "描述和向量已更新。"))
+
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(
+                    "向量刷新失败",
+                    f"描述已保存，但向量更新失败:\n{e}\n\n建议重新扫描该图片以更新向量。"
+                ))
+
+        threading.Thread(target=_refresh_thread, daemon=True).start()
 
     def open_file_location(self):
         if not self.current_results:

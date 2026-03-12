@@ -1288,6 +1288,31 @@ class Storage:
         )
         return [dict(row) for row in cursor.fetchall()]
 
+    def update_description(self, image_id: int, fields: dict):
+        """更新图片的描述字段（scene/objects/style/location_time/wallpaper_hint）"""
+        allowed_fields = {"scene", "objects", "style", "location_time", "wallpaper_hint"}
+        updates = {k: v for k, v in fields.items() if k in allowed_fields}
+        if not updates:
+            return
+
+        # 构建 SET 子句
+        set_parts = []
+        values = []
+        for k, v in updates.items():
+            set_parts.append(f"{k} = ?")
+            values.append(v)
+
+        set_clause = ", ".join(set_parts)
+        values.append(image_id)
+
+        self._conn.execute(f"UPDATE images SET {set_clause} WHERE id = ?", values)
+        self._conn.commit()
+
+    def update_embedding(self, image_id: int, embedding_bytes: bytes | None):
+        """更新图片的向量字段"""
+        self._conn.execute("UPDATE images SET text_embedding = ? WHERE id = ?", (embedding_bytes, image_id))
+        self._conn.commit()
+
     def count(self) -> int:
         """返回已入库的图片总数。
 
