@@ -238,7 +238,17 @@ def main():
 
 
 if __name__ == "__main__":
-    # 再次确认路径是否存在
+    import argparse
+    parser = argparse.ArgumentParser(description="LIVP 原地解压工具")
+    parser.add_argument("--source", type=str, help="指定扫描目录路径，覆盖 SOURCE_DIR 配置")
+    parser.add_argument("--batch-size", type=int, help="指定批处理大小，覆盖 BATCH_SIZE 配置")
+    args = parser.parse_args()
+
+    if args.source:
+        SOURCE_DIR = args.source
+    if args.batch_size:
+        BATCH_SIZE = args.batch_size
+
     if os.path.exists(SOURCE_DIR):
         main()
     else:

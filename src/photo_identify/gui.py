@@ -1400,6 +1400,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self._active_task_pause_event = None
         self._active_task_restart_action = None
         self._video_transcode_process = None
+        self._livp_convert_process = None
         
         form_frame = ttk.Frame(self.scan_tab, padding=(18, 16, 18, 8))
         form_frame.pack(fill=tk.X)
@@ -1524,7 +1525,10 @@ class PhotoIdentifyGUI(tk.Tk):
         self.restart_btn = ttk.Button(control_frame, text="🔄 重启扫描", command=self.restart_scan, state=tk.DISABLED)
         self.restart_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
         self.stop_btn = ttk.Button(control_frame, text="⏹ 停止扫描", command=self.stop_scan, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, ipady=5)
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, 8), ipady=5)
+        self.livp_convert_btn = ttk.Button(control_frame, text="🔄 livp转换", command=self.start_livp_convert, state=tk.NORMAL)
+        self.livp_convert_btn.pack(side=tk.LEFT, ipady=5)
+        ToolTip(self.livp_convert_btn, "为了方便immich等软件扫描，建议将 .livp 拆分为图和视频，并将原文件掏空为 0KB（保留原时间戳），以释放空间并防止重复同步。")
 
         # 7. 日志区域
         log_frame = ttk.LabelFrame(self.scan_tab, text="任务日志", padding="5")
@@ -4173,6 +4177,9 @@ class PhotoIdentifyGUI(tk.Tk):
         if self._video_transcode_process is not None and self._video_transcode_process.poll() is None:
             messagebox.showinfo("提示", f"当前已有视频转码任务正在执行，请等待其结束后再执行{action_label}。")
             return False
+        if self._livp_convert_process is not None and self._livp_convert_process.poll() is None:
+            messagebox.showinfo("提示", f"当前已有livp转换任务正在执行，请等待其结束后再执行{action_label}。")
+            return False
         return True
 
     def start_video_transcode(self) -> None:
@@ -4277,6 +4284,67 @@ class PhotoIdentifyGUI(tk.Tk):
         if log_path:
             lines.append(f"[{task_label}] 日志文件: {log_path}")
         self._append_scan_log("\n".join(lines) + "\n")
+
+    def start_livp_convert(self) -> None:
+        if not self._ensure_scan_task_idle("livp转换"):
+            return
+        if not self.scan_paths:
+            messagebox.showwarning("警告", "请先添加要扫描的目录！")
+            return
+
+        self._save_settings()
+        self.scan_status_var.set("正在执行livp转换，查看下方日志区...")
+        self._reset_scan_log("[livp转换] 准备中...\n")
+
+        def _livp_convert_thread():
+            try:
+                total_paths = len(self.scan_paths)
+                for idx, source_dir in enumerate(self.scan_paths, start=1):
+                    source_dir = str(source_dir).strip()
+                    if not source_dir:
+                        continue
+                    self.after(0, lambda i=idx, t=total_paths: self.scan_status_var.set(f"正在执行livp转换 ({i}/{t})，查看下方日志区..."))
+                    self._append_scan_log_from_thread(f"[livp转换] ({idx}/{total_paths}) 源目录: {source_dir}\n")
+
+                    script_path = Path(__file__).resolve().parents[1] / "data_migration" / "lvip_decompression.py"
+                    cmd = [sys.executable, str(script_path), "--source", source_dir]
+                    self._livp_convert_process = subprocess.Popen(cmd)
+                    self._append_scan_log_from_thread(
+                        f"[livp转换] 已启动转换进程 (PID={self._livp_convert_process.pid})，详细日志输出到启动终端。\n"
+                    )
+
+                    while True:
+                        exit_code = self._livp_convert_process.poll()
+                        if exit_code is not None:
+                            break
+                        time.sleep(0.5)
+
+                    exit_code = self._livp_convert_process.wait()
+                    if exit_code != 0:
+                        raise RuntimeError(f"livp转换失败，退出码: {exit_code}")
+                    self._append_scan_log_from_thread(f"[livp转换] ({idx}/{total_paths}) 已完成。\n")
+
+                self.after(0, lambda: self.scan_status_var.set("livp转换完成。"))
+                self.after(0, lambda: self._append_task_completion_log("livp转换", "已结束（完成）。"))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: self.scan_status_var.set(f"livp转换出错: {exc}"))
+                self.after(0, lambda exc=exc: self._append_task_completion_log("livp转换", f"已结束（异常：{exc}）。"))
+                self.after(0, lambda exc=exc: messagebox.showerror("错误", f"livp转换异常:\n{exc}"))
+            finally:
+                self._livp_convert_process = None
+                self._finalize_scan_task_no_task()
+
+        t = threading.Thread(target=_livp_convert_thread, daemon=True)
+        t.start()
+
+    def _finalize_scan_task_no_task(self) -> None:
+        """完成一个没有关联到 _begin_scan_task 的后台任务（如 livp 转换）后，重置 UI 状态。"""
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.configure(state=tk.DISABLED)
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.configure(state=tk.DISABLED)
+        if hasattr(self, "restart_btn"):
+            self.restart_btn.configure(state=tk.DISABLED)
 
     def _get_favorite_db_paths(self) -> list[str]:
         """汇总收藏页应读取的数据库路径列表，并去重保序。"""
