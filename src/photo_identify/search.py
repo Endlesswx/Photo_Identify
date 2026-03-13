@@ -8,6 +8,7 @@
 import json
 import logging
 import re
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -228,6 +229,74 @@ def _compute_concept_coverage_bonus(query: str, row: dict) -> float:
     return bonus
 
 
+def _extract_person_names_from_query(query: str, storage: Storage) -> list[tuple[str, list[int]]]:
+    """从查询中提取人物名，返回人物名及其关联的图片ID列表。"""
+    normalized_query = query.strip()
+    if not normalized_query:
+        return []
+
+    person_matches: list[tuple[str, list[int]]] = []
+    try:
+        all_persons = storage.get_all_persons(include_deleted=False)
+        for person in all_persons:
+            person_name = person.get("name", "")
+            if person_name and person_name in normalized_query:
+                person_id = person.get("id")
+                if person_id:
+                    cursor = storage._conn.cursor()
+                    cursor.execute(
+                        "SELECT DISTINCT image_id FROM photos WHERE person_id = ?",
+                        (person_id,),
+                    )
+                    image_ids = [row[0] for row in cursor.fetchall()]
+                    if image_ids:
+                        person_matches.append((person_name, image_ids))
+    except Exception as exc:
+        logger.warning("提取人物名失败: %s", exc)
+
+    return person_matches
+
+
+def _compute_person_match_bonus(
+    query: str,
+    row: dict,
+    person_matches: list[tuple[str, list[int]]],
+    query_variants: list[tuple[str, float]] | None = None,
+) -> tuple[float, int, int]:
+    """计算人物匹配分数奖励。
+
+    返回: (bonus, matched_count, total_persons)
+    - matched_count: 查询中匹配到的人物数量
+    - total_persons: 查询中的总人物数量
+    """
+    if not person_matches:
+        return 0.0, 0, 0
+
+    total_persons = len(person_matches)
+    matched_count = 0
+    image_id = row.get("id")
+    bonus = 0.0
+
+    if not isinstance(image_id, int):
+        try:
+            image_id = int(image_id)
+        except (ValueError, TypeError):
+            return 0.0, 0, total_persons
+
+    for person_name, person_image_ids in person_matches:
+        if image_id in person_image_ids:
+            matched_count += 1
+
+    if matched_count > 0:
+        base_bonus = -2.5
+        bonus = base_bonus * matched_count
+
+        if matched_count == total_persons and total_persons >= 2:
+            bonus -= 1.5
+
+    return bonus, matched_count, total_persons
+
+
 _RERANK_SYSTEM_PROMPT = """\
 你是一个图片检索重排序助手。请立即、直接输出 JSON 数组结果，禁止输出任何思维过程(Reasoning/Thinking)或解释说明。
 用户提供了一个搜索描述，以及若干候选图片的序号和内容信息。
@@ -238,7 +307,14 @@ _RERANK_SYSTEM_PROMPT = """\
 [3, 1, 5]
 如果没有符合要求的，返回 []。不要输出任何除了方括号和数字之外的内容（不要加 ```json 标记）。"""
 
-def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url: str, model: str) -> tuple[list[dict], str]:
+def _llm_rerank_results(
+    query: str,
+    results: list[dict],
+    api_key: str,
+    base_url: str,
+    model: str,
+    person_matches: list[tuple[str, list[int]]] | None = None,
+) -> tuple[list[dict], str]:
     if not results:
         return [], ""
 
@@ -256,10 +332,18 @@ def _llm_rerank_results(query: str, results: list[dict], api_key: str, base_url:
             objects_str = ", ".join(objects)
         else:
             objects_str = str(objects)
-        text = f"[{i}] 场景: {scene} | 包含物体: {objects_str}"
+
+        matched_persons = r.get("matched_persons", "")
+        person_info = f" | 人物匹配: {matched_persons}" if matched_persons else ""
+
+        text = f"[{i}] 场景: {scene} | 包含物体: {objects_str}{person_info}"
         candidates_text.append(text)
-    
-    user_content = f"真实搜索意图：{query}\n\n候选图片列表：\n" + "\n".join(candidates_text)
+
+    query_persons_info = ""
+    if person_matches:
+        query_persons_info = f"\n重要提示：用户查询中包含人物 {[p[0] for p in person_matches]}，请优先选择包含这些人物的照片。"
+
+    user_content = f"真实搜索意图：{query}{query_persons_info}\n\n候选图片列表：\n" + "\n".join(candidates_text)
     
     payload = {
         "model": model,
@@ -417,6 +501,7 @@ def search(
     query_emb = None
     query_variants = _build_query_variants(query) if local_expand else [(query.strip(), 1.0)]
     query_variant_weights: list[float] = []
+    person_matches: list[tuple[str, list[int]]] = []
     if smart:
         if not embedding_model:
             print("  [WARN] 智能模式(Semantic Search)需要配置向量模型，回退为普通本地搜索", file=sys.stderr)
@@ -487,7 +572,10 @@ def search(
                         weighted_sims = sims_matrix * variant_weights[None, :]
                         sims = np.max(weighted_sims, axis=1)
 
-                        # 语义优先：扩大语义召回，再仅用“强整句命中”的文本候选做兜底。
+                        person_matches = _extract_person_names_from_query(query, storage)
+                        if person_matches:
+                            print(f"  [INFO] 检测到查询中的人物: {[p[0] for p in person_matches]}")
+
                         semantic_top_k = max(limit * 8, 100)
                         top_indices = np.argsort(sims)[::-1][:semantic_top_k]
                         top_ids = [ids[i] for i in top_indices if sims[i] > 0.03]
@@ -537,16 +625,24 @@ def search(
                                 text_bonus = _compute_text_match_bonus(query, r, lexical_score, query_variants)
                                 concept_bonus = _compute_concept_coverage_bonus(query, r)
                                 strong_bonus = -0.35 if strong_text_match else 0.0
-                                r["score"] = semantic_score + text_bonus + concept_bonus + strong_bonus
+                                person_bonus, matched_count, total_persons = _compute_person_match_bonus(
+                                    query, r, person_matches, query_variants
+                                )
+                                r["score"] = semantic_score + text_bonus + concept_bonus + strong_bonus + person_bonus
                                 r["semantic_score"] = semantic_score
                                 r["text_bonus"] = text_bonus
                                 r["concept_bonus"] = concept_bonus
                                 r["strong_bonus"] = strong_bonus
+                                r["person_bonus"] = person_bonus
+                                r["matched_persons"] = f"{matched_count}/{total_persons}" if total_persons > 0 else ""
                                 r["db_path"] = db
                             db_results.sort(key=lambda x: x["score"])
                             results.extend(db_results)
             else:
-                # 纯本地多级 FTS 检索
+                person_matches = _extract_person_names_from_query(query, storage)
+                if person_matches:
+                    print(f"  [INFO] 检测到查询中的人物: {[p[0] for p in person_matches]}")
+
                 fetch_limit = limit * 2 if rerank else limit
                 if local_expand and query_variants:
                     merged_results: dict[int, dict] = {}
@@ -563,6 +659,17 @@ def search(
                     db_results.sort(key=lambda x: x.get("score", 0.0))
                 else:
                     db_results = storage.search_fts(query, fetch_limit)
+
+                if person_matches:
+                    for r in db_results:
+                        person_bonus, matched_count, total_persons = _compute_person_match_bonus(
+                            query, r, person_matches, query_variants
+                        )
+                        r["score"] = r.get("score", 0.0) + person_bonus
+                        r["person_bonus"] = person_bonus
+                        r["matched_persons"] = f"{matched_count}/{total_persons}" if total_persons > 0 else ""
+                    db_results.sort(key=lambda x: x.get("score", 0.0))
+
                 for r in db_results:
                     r["db_path"] = db
                 results.extend(db_results)
@@ -760,7 +867,9 @@ def search(
     results = results[:fetch_limit]
 
     if rerank and results:
-        results, rerank_warn = _llm_rerank_results(base_query, results, api_key, base_url, model)
+        results, rerank_warn = _llm_rerank_results(
+            base_query, results, api_key, base_url, model, person_matches
+        )
         if rerank_warn:
             warnings.append(rerank_warn)
 
