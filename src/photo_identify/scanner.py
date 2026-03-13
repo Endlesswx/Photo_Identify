@@ -565,6 +565,10 @@ def scan(
                             image_bytes = get_image_frame_bytes(img_path)
                             if not image_bytes:
                                 logger.info("人物扫描跳过 0KB/空数据文件: %s", img_path)
+                                try:
+                                    p2_storage.add_skipped_file(img_path, "人脸扫描解码失败: 读取图片帧为空")
+                                except Exception as skip_exc:
+                                    logger.warning("记录人物扫描跳过失败 %s: %s", img_path, skip_exc)
                                 if _face_bar:
                                     _face_bar.update(1)
                                 _face_queue.task_done()
@@ -1234,6 +1238,7 @@ def scan_faces(
 
     known_paths = storage.get_known_paths()
     face_scanned_md5s = storage.get_face_scanned_md5s()
+    skipped_paths = storage.get_skipped_paths()
 
     candidates: list[tuple[str, str, int]] = []
     for img_path in all_images:
@@ -1243,6 +1248,13 @@ def scan_faces(
             break
 
         stats.total += 1
+        if img_path in skipped_paths:
+            stats.skipped += 1
+            logger.info("人物扫描跳过已标记异常文件: %s", img_path)
+            if progress_writer:
+                progress_writer.write(f"[{FACE_SCAN_LABEL}] 跳过异常文件: {Path(img_path).name}\n")
+            continue
+
         ext = Path(img_path).suffix.lower()
         if ext in _video_exts:
             stats.skipped += 1
@@ -1280,7 +1292,25 @@ def scan_faces(
                 candidates.append((img_path, cached_md5, stat_result.st_size))
                 continue
 
-        candidates.append((img_path, "", stat_result.st_size))
+        try:
+            md5 = compute_file_md5_chunked(img_path)
+        except Exception as exc:
+            stats.failed += 1
+            logger.warning("人物扫描计算 MD5 失败 %s: %s", img_path, exc)
+            continue
+
+        if md5 in face_scanned_md5s:
+            stats.skipped += 1
+            logger.info("人物扫描跳过重复内容文件: %s", img_path)
+            if progress_writer:
+                progress_writer.write(f"[{FACE_SCAN_LABEL}] 跳过重复内容文件: {Path(img_path).name}\n")
+            try:
+                storage.add_skipped_file(img_path, "重复文件或MD5已扫描")
+            except Exception as skip_exc:
+                logger.warning("记录人物扫描跳过失败 %s: %s", img_path, skip_exc)
+            continue
+
+        candidates.append((img_path, md5, stat_result.st_size))
 
     if cancel_event and cancel_event.is_set():
         storage.close()
@@ -1331,6 +1361,10 @@ def scan_faces(
         try:
             if size_bytes == 0:
                 logger.info("人物扫描跳过 0KB 文件: %s", img_path)
+                try:
+                    worker_storage.add_skipped_file(img_path, "0KB 文件")
+                except Exception as skip_exc:
+                    logger.warning("记录人物扫描跳过失败 %s: %s", img_path, skip_exc)
                 return {
                     "path": img_path,
                     "skipped": True,
@@ -1343,6 +1377,10 @@ def scan_faces(
             image_bytes = get_image_frame_bytes(img_path)
             if not image_bytes:
                 logger.info("人物扫描跳过 0KB/空数据文件: %s", img_path)
+                try:
+                    worker_storage.add_skipped_file(img_path, "人脸扫描解码失败: 读取图片帧为空")
+                except Exception as skip_exc:
+                    logger.warning("记录人物扫描跳过失败 %s: %s", img_path, skip_exc)
                 return {
                     "path": img_path,
                     "skipped": True,
