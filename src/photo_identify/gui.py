@@ -41,6 +41,7 @@ from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_
 from photo_identify.search import search
 from photo_identify.scanner import FACE_SCAN_LABEL, IMAGE_EXTRACTION_LABEL, scan, scan_faces
 from photo_identify.storage import Storage
+from photo_identify.runtime_compat import get_font_path, get_bundled_script_path, get_helper_executable
 
 
 logger = logging.getLogger(__name__)
@@ -4242,8 +4243,14 @@ class PhotoIdentifyGUI(tk.Tk):
                     env["VIDEO_COMPRESSION_SOURCE_DIR"] = source_dir
                     env["VIDEO_COMPRESSION_OUTPUT_DIR"] = output_dir
 
-                    script_path = Path(__file__).resolve().parents[1] / "video_edit" / "video_compression.py"
-                    cmd = [sys.executable, str(script_path)]
+                    helper_executable = get_helper_executable("video_compression")
+                    if helper_executable is not None:
+                        cmd = [str(helper_executable)]
+                    else:
+                        script_path = get_bundled_script_path("video_edit/video_compression.py")
+                        if script_path is None:
+                            raise RuntimeError("未找到视频转码 helper 或脚本 video_edit/video_compression.py")
+                        cmd = [sys.executable, str(script_path)]
                     self._video_transcode_process = subprocess.Popen(
                         cmd,
                         env=env,
@@ -4330,8 +4337,14 @@ class PhotoIdentifyGUI(tk.Tk):
                     self.after(0, lambda i=idx, t=total_paths: self.scan_status_var.set(f"正在执行livp转换 ({i}/{t})，查看下方日志区..."))
                     self._append_scan_log_from_thread(f"[livp转换] ({idx}/{total_paths}) 源目录: {source_dir}\n")
 
-                    script_path = Path(__file__).resolve().parents[1] / "data_migration" / "lvip_decompression.py"
-                    cmd = [sys.executable, str(script_path), "--source", source_dir]
+                    helper_executable = get_helper_executable("lvip_decompression")
+                    if helper_executable is not None:
+                        cmd = [str(helper_executable), "--source", source_dir]
+                    else:
+                        script_path = get_bundled_script_path("data_migration/lvip_decompression.py")
+                        if script_path is None:
+                            raise RuntimeError("未找到 livp 转换 helper 或脚本 data_migration/lvip_decompression.py")
+                        cmd = [sys.executable, str(script_path), "--source", source_dir]
                     self._livp_convert_process = subprocess.Popen(cmd)
                     self._append_scan_log_from_thread(
                         f"[livp转换] 已启动转换进程 (PID={self._livp_convert_process.pid})，详细日志输出到启动终端。\n"
@@ -5719,11 +5732,19 @@ class PhotoIdentifyGUI(tk.Tk):
                 txt = f"{m:02d}:{s:02d}"
             
             if txt:
-                try:
-                    font = ImageFont.truetype("msyh.ttc", 13)
-                except Exception:
+                font = None
+                # 优先使用随包字体或系统字体
+                for font_name in ("msyh.ttc", "seguisym.ttf"):
+                    font_path = get_font_path(font_name)
+                    if font_path:
+                        try:
+                            font = ImageFont.truetype(str(font_path), 13)
+                            break
+                        except Exception:
+                            continue
+                if font is None:
                     try:
-                        font = ImageFont.truetype("seguisym.ttf", 13)
+                        font = ImageFont.truetype("arial.ttf", 13)
                     except Exception:
                         font = ImageFont.load_default()
                 

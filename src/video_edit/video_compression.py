@@ -2,9 +2,33 @@ import os
 import subprocess
 import concurrent.futures
 from pathlib import Path
+import sys
 import time
 from tqdm import tqdm
 import threading
+
+
+def _resolve_ffmpeg_tools() -> tuple[str, str]:
+    """定位 ffmpeg/ffprobe，可优先使用 portable 包内的 `bin/`。"""
+    if getattr(sys, "frozen", False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parents[2]
+
+    bin_dir = base_dir / "bin"
+    ffmpeg = bin_dir / "ffmpeg.exe"
+    ffprobe = bin_dir / "ffprobe.exe"
+
+    if bin_dir.exists():
+        current_path = os.environ.get("PATH", "")
+        bin_dir_str = str(bin_dir)
+        if bin_dir_str not in current_path.split(os.pathsep):
+            os.environ["PATH"] = bin_dir_str + os.pathsep + current_path
+
+    return (str(ffmpeg) if ffmpeg.exists() else "ffmpeg", str(ffprobe) if ffprobe.exists() else "ffprobe")
+
+
+FFMPEG_CMD, FFPROBE_CMD = _resolve_ffmpeg_tools()
 
 # ================= 最终极速配置 =================
 ENV_SOURCE_DIR = os.environ.get("VIDEO_COMPRESSION_SOURCE_DIR", "").strip()
@@ -39,7 +63,7 @@ def process_video(task_args):
 
     try:
         # --- 2. 获取时长 ---
-        cmd_probe = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_file)]
+        cmd_probe = [FFPROBE_CMD, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(input_file)]
         res = subprocess.run(cmd_probe, capture_output=True, text=True, encoding='utf-8', errors='ignore')
         duration = float(res.stdout.strip()) if res.stdout.strip() else 0
         if duration == 0: return (2, f"⚠️ 元数据读失败: {input_file.name}")
@@ -62,7 +86,7 @@ def process_video(task_args):
         scale_filter = f"scale=trunc(oh*a/2)*2:480,fps={fps}"
         
         cmd = [
-            "ffmpeg", "-y", "-i", str(input_file), 
+            FFMPEG_CMD, "-y", "-i", str(input_file),
             "-vf", scale_filter, 
             "-c:v", "libx264", 
             "-preset", "ultrafast", 

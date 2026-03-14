@@ -219,7 +219,7 @@ def main():
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="输出详细日志")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="数据库文件路径")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     # ── gui ───────────────────────────────────────────
     p_gui = subparsers.add_parser("gui", help="启动图形交互界面")
@@ -269,6 +269,11 @@ def main():
 
     args = parser.parse_args()
     _setup_logging(args.verbose)
+    if args.command is None:
+        # 无子命令时默认启动 GUI（双击 exe 场景）
+        from photo_identify.gui import launch_gui
+        launch_gui(args.db)
+        return
     args.func(args)
 
 

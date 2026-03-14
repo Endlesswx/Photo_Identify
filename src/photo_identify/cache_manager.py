@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageOps
 
 from photo_identify.image_utils import get_image_frame_bytes
+from photo_identify.runtime_compat import get_default_cache_dir
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ def _register_heif_opener() -> None:
 
 _register_heif_opener()
 
-DEFAULT_CACHE_DIR = Path(r"E:\Caches\Photo_Identify_Cahces")
+# 使用 runtime_compat 获取默认缓存目录，支持打包后路径
+DEFAULT_CACHE_DIR = get_default_cache_dir()
 DEFAULT_CACHE_MAX_SIZE_MB = 1024
 DEFAULT_THUMBNAIL_SIZE = (150, 150)
 

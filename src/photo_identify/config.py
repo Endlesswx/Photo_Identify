@@ -6,6 +6,9 @@
 import os
 from pathlib import Path
 
+# ── 运行时兼容（支持 PyInstaller 打包）──────────────────────
+from photo_identify.runtime_compat import get_default_db_path as _get_default_db_path
+
 # ── API 配置 ──────────────────────────────────────────────
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 
@@ -45,7 +48,8 @@ MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2  # 秒，指数退避基数
 
 # ── 存储 ──────────────────────────────────────────────────
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "photo_identify.db"
+# 使用 runtime_compat 获取默认数据库路径，支持打包后路径
+DEFAULT_DB_PATH = _get_default_db_path()
 
 # ── 搜索 ──────────────────────────────────────────────────
 DEFAULT_SEARCH_LIMIT = 20
