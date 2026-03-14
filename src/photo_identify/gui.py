@@ -635,6 +635,15 @@ class PhotoIdentifyGUI(tk.Tk):
         if cfg.has_option("search", "last_query"):
             self.query_var.set(cfg.get("search", "last_query"))
 
+        # 加载搜索历史记录
+        self._search_history = []
+        if cfg.has_option("search", "search_history"):
+            raw = cfg.get("search", "search_history").strip()
+            if raw:
+                self._search_history = [q.strip() for q in raw.split("|") if q.strip()]
+        if hasattr(self, "query_entry"):
+            self.query_entry["values"] = self._search_history
+
         if cfg.has_option("search", "expand"):
             self.search_expand_var.set(cfg.getboolean("search", "expand"))
         elif cfg.has_option("search", "expand_mode"):
@@ -716,6 +725,7 @@ class PhotoIdentifyGUI(tk.Tk):
             "limit": self.search_limit_var.get(),
             "databases": "|".join(self.search_dbs),
             "last_query": self.query_var.get(),
+            "search_history": "|".join(getattr(self, "_search_history", [])),
             "expand": str(llm_expand),
             "rerank": str(self.search_rerank_var.get()),
         }
@@ -1242,7 +1252,7 @@ class PhotoIdentifyGUI(tk.Tk):
 
         # L-Row 3: Query Keyword (full width, matching db_frame)
         ttk.Label(left_frame, text="查询关键字:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
-        self.query_entry = ttk.Entry(left_frame, textvariable=self.query_var)
+        self.query_entry = ttk.Combobox(left_frame, textvariable=self.query_var)
         self.query_entry.grid(row=3, column=1, columnspan=2, sticky=tk.EW, padx=5, pady=5)
         self.query_entry.bind("<Return>", lambda e: self.do_search())
 
@@ -5493,6 +5503,16 @@ class PhotoIdentifyGUI(tk.Tk):
         if hasattr(self, 'limit_entry'):
             self.limit_entry.config(state=state)
 
+    def _add_search_history(self, query: str):
+        """将搜索关键字加入历史记录（去重、倒序、最多20条）。"""
+        history = getattr(self, "_search_history", [])
+        if query in history:
+            history.remove(query)
+        history.insert(0, query)
+        self._search_history = history[:20]
+        if hasattr(self, "query_entry"):
+            self.query_entry["values"] = self._search_history
+
     def do_search(self):
         if not self.search_dbs:
             messagebox.showwarning("警告", "请至少添加一个数据库用于检索！")
@@ -5511,6 +5531,7 @@ class PhotoIdentifyGUI(tk.Tk):
         self._browse_mode = False
         self._search_all_results = []
 
+        self._add_search_history(query)
         self._save_settings()
 
         search_mode = self.search_mode_var.get()
