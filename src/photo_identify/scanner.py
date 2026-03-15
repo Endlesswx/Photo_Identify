@@ -932,27 +932,17 @@ def scan(
             
             async with aiohttp.ClientSession(connector=connector) as session:
                 sem = asyncio.Semaphore(workers) # 使用用户配置的并发数
-                tasks = [asyncio.create_task(_llm_worker(p, session, sem, video_sem, io_sem)) for p in to_analyze]
-                
-                # as_completed 的协程等价
-                for future in asyncio.as_completed(tasks):
-                    if await _wait_if_paused_async(cancel_event, pause_event):
-                        for t in tasks:
-                            t.cancel()
-                        logger.warning("图片/视频信息提取已被用户中止，已分析的数据已保存。")
-                        break
-                    if cancel_event and cancel_event.is_set():
-                        for t in tasks:
-                            t.cancel()
-                        logger.warning("图片/视频信息提取已被用户中止，已分析的数据已保存。")
-                        break
+                tasks = {asyncio.create_task(_llm_worker(p, session, sem, video_sem, io_sem)) for p in to_analyze}
+
+                def _handle_future(future: asyncio.Future) -> bool:
+                    nonlocal circuit_breaker_err
                     try:
-                        img_path, result = await future
+                        img_path, result = future.result()
                     except asyncio.CancelledError:
-                        continue
+                        return False
                     except Exception as e:
-                        logger.error(f"意外错误 {e}")
-                        continue
+                        logger.error("意外错误 %s", e)
+                        return False
                     if isinstance(result, list):
                         for r in result:
                             # 提前检查是否是熔断指示
@@ -961,10 +951,8 @@ def scan(
                                 logger.error("检测到 API 熔断，已提前终止后续扫描。")
                                 if cancel_event:
                                     cancel_event.set()
-                                for t in tasks:
-                                    t.cancel()
-                                break
-                                
+                                return True
+
                             stats.current += 1
                             if r is _SKIPPED_SENTINEL:
                                 stats.skipped += 1
@@ -982,10 +970,8 @@ def scan(
                             logger.error("检测到 API 熔断，已提前终止后续扫描。")
                             if cancel_event:
                                 cancel_event.set()
-                            for t in tasks:
-                                t.cancel()
-                            break
-                            
+                            return True
+
                         stats.current += 1
                         if result is _SKIPPED_SENTINEL:
                             stats.skipped += 1
@@ -1006,6 +992,56 @@ def scan(
                             stats.processed += 1
                             if needs_face and enable_face_scan:
                                 _face_queue.put((img_path, result.get("md5")))
+                    return False
+
+                async def _wait_for_cancel() -> bool:
+                    while cancel_event is not None and not cancel_event.is_set():
+                        await asyncio.sleep(0.1)
+                    return cancel_event is not None and cancel_event.is_set()
+
+                cancel_task = asyncio.create_task(_wait_for_cancel()) if cancel_event is not None else None
+                pending = set(tasks)
+
+                while pending:
+                    if await _wait_if_paused_async(cancel_event, pause_event):
+                        for t in pending:
+                            t.cancel()
+                        if cancel_task:
+                            cancel_task.cancel()
+                        logger.warning("图片/视频信息提取已被用户中止，已分析的数据已保存。")
+                        break
+
+                    wait_set = set(pending)
+                    if cancel_task:
+                        wait_set.add(cancel_task)
+                    done, pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                    if cancel_task:
+                        pending.discard(cancel_task)
+
+                    if cancel_task and cancel_task in done:
+                        done.discard(cancel_task)
+                        stop_due_to_circuit = False
+                        for future in done:
+                            if _handle_future(future):
+                                stop_due_to_circuit = True
+                        for t in pending:
+                            t.cancel()
+                        logger.warning("图片/视频信息提取已被用户中止，已分析的数据已保存。")
+                        break
+
+                    stop_due_to_circuit = False
+                    for future in done:
+                        if future is cancel_task:
+                            continue
+                        if _handle_future(future):
+                            stop_due_to_circuit = True
+                    if stop_due_to_circuit:
+                        for t in pending:
+                            t.cancel()
+                        break
+
+                if cancel_task:
+                    cancel_task.cancel()
 
         # 启动异步协程执行并阻塞等待结束
         try:
@@ -1059,11 +1095,16 @@ def scan(
 
     if _face_bar:
         _face_bar.close()
-        logger.info("人物扫描完成(总耗时 %.1fs) — 共 %d 张有人脸", total_face_cost, _face_found)
-        if _face_writer:
-            _face_writer.write(
-                f"[{FACE_SCAN_LABEL}] ✓ 完成 — 共 {_face_found} 张有人脸，正在聚类...\n"
-            )
+        if _cancelled:
+            logger.info("人物扫描已中止(总耗时 %.1fs) — 已处理 %d 张", total_face_cost, _face_found)
+            if _face_writer:
+                _face_writer.write(f"[{FACE_SCAN_LABEL}] 已中止\n")
+        else:
+            logger.info("人物扫描完成(总耗时 %.1fs) — 共 %d 张有人脸", total_face_cost, _face_found)
+            if _face_writer:
+                _face_writer.write(
+                    f"[{FACE_SCAN_LABEL}] ✓ 完成 — 共 {_face_found} 张有人脸，正在聚类...\n"
+                )
     elif enable_face_scan and _face_writer:
         if _cancelled:
             _face_writer.write(f"[{FACE_SCAN_LABEL}] 已中止\n")
@@ -1124,7 +1165,8 @@ def scan(
     except Exception as e:
         logger.error("清理失效记录时发生错误: %s", e)
 
-    _do_clustering()
+    if not _cancelled:
+        _do_clustering()
 
     storage.close()
     
