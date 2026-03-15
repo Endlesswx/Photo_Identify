@@ -509,7 +509,7 @@ class PhotoIdentifyGUI(tk.Tk):
 
         # Tab 5: 缓存管理
         self.cache_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.cache_tab, text="缓存管理")
+        self.notebook.add(self.cache_tab, text="系统设置")
         self._init_cache_tab()
 
         # 绑定 Tab 切换事件
@@ -3898,6 +3898,14 @@ class PhotoIdentifyGUI(tk.Tk):
         ttk.Label(progress_group, textvariable=self.cache_eta_var, foreground="gray").grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
         ttk.Label(progress_group, textvariable=self.cache_action_status_var, foreground="blue", wraplength=860, justify=tk.LEFT).grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
 
+        # ── 备份与恢复 ──
+        backup_group = ttk.LabelFrame(container, text="备份与恢复", padding=12)
+        backup_group.pack(fill=tk.X, pady=(12, 0))
+        self.backup_btn = ttk.Button(backup_group, text="📦 备份数据及配置", command=self._run_backup)
+        self.backup_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.backup_status_var = tk.StringVar(value="")
+        ttk.Label(backup_group, textvariable=self.backup_status_var, foreground="gray").pack(side=tk.LEFT)
+
     # ── Tab 4: 模型管理 ──────────────────────────────────────────
 
     def _init_model_tab(self):
@@ -4583,6 +4591,44 @@ class PhotoIdentifyGUI(tk.Tk):
             self.cache_action_status_var.set("继续缓存已暂停，当前进行中的任务完成后会暂停。")
             self.cache_pause_btn.configure(text="▶ 继续")
             self.cache_eta_var.set("预计剩余: 已暂停")
+
+    def _run_backup(self) -> None:
+        """运行 backup.bat 备份数据及配置。"""
+        bat_path = Path(__file__).resolve().parent.parent.parent / "backup.bat"
+        if not bat_path.exists():
+            messagebox.showerror("错误", f"未找到备份脚本:\n{bat_path}")
+            return
+        self.backup_status_var.set("正在备份…")
+        self.backup_btn.configure(state=tk.DISABLED)
+
+        def _run():
+            try:
+                result = subprocess.run(
+                    ["cmd", "/c", str(bat_path), "nogui"],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=str(bat_path.parent),
+                )
+                self.after(0, lambda: self._on_backup_done(result))
+            except Exception as e:
+                self.after(0, lambda: self._on_backup_done(None, str(e)))
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_backup_done(self, result, error=None) -> None:
+        """备份完成回调。"""
+        self.backup_btn.configure(state=tk.NORMAL)
+        if error:
+            self.backup_status_var.set(f"备份失败: {error}")
+            messagebox.showerror("备份失败", error)
+            return
+        if result.returncode != 0:
+            msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+            self.backup_status_var.set("备份失败")
+            messagebox.showerror("备份失败", msg)
+        else:
+            self.backup_status_var.set("备份完成，文件已保存到桌面")
+            messagebox.showinfo("备份完成", "数据及配置已备份到桌面。")
 
     def _open_cache_directory(self) -> None:
         try:
