@@ -41,7 +41,7 @@ from photo_identify.model_manager import ModelManager, get_model_db_path, MODEL_
 from photo_identify.search import search
 from photo_identify.scanner import FACE_SCAN_LABEL, IMAGE_EXTRACTION_LABEL, scan, scan_faces
 from photo_identify.storage import Storage
-from photo_identify.runtime_compat import get_font_path, get_bundled_script_path, get_helper_executable
+from photo_identify.runtime_compat import get_font_path, get_bundled_script_path, get_helper_executable, get_default_transcoded_video_dir
 
 
 logger = logging.getLogger(__name__)
@@ -1432,7 +1432,7 @@ class PhotoIdentifyGUI(tk.Tk):
         ttk.Button(path_action_frame, text="➖ 移除选中", command=self.remove_scan_path).pack(fill=tk.X, pady=2)
         ttk.Button(path_action_frame, text="🗑 清空列表", command=self.clear_scan_paths).pack(fill=tk.X, pady=2)
 
-        self.transcoded_video_path_var = tk.StringVar()
+        self.transcoded_video_path_var = tk.StringVar(value=str(get_default_transcoded_video_dir()))
         ttk.Label(form_frame, text="转码后视频路径:").grid(row=2, column=0, sticky=tk.W, pady=(2, 8))
         self.transcoded_entry = ttk.Entry(form_frame, textvariable=self.transcoded_video_path_var, width=50)
         self.transcoded_entry.grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=(2, 8))
@@ -4212,6 +4212,23 @@ class PhotoIdentifyGUI(tk.Tk):
         output_dir = self.transcoded_video_path_var.get().strip() if hasattr(self, "transcoded_video_path_var") else ""
         if not output_dir:
             messagebox.showwarning("警告", "请先设置转码后视频路径！")
+            return
+
+        # 预检：扫描目录中是否存在视频文件
+        _video_exts = {".mp4", ".mov", ".avi", ".mkv"}
+        has_video = False
+        for scan_dir in self.scan_paths:
+            scan_dir = str(scan_dir).strip()
+            if not scan_dir or not Path(scan_dir).is_dir():
+                continue
+            for f in Path(scan_dir).rglob("*"):
+                if f.suffix.lower() in _video_exts:
+                    has_video = True
+                    break
+            if has_video:
+                break
+        if not has_video:
+            messagebox.showinfo("提示", "扫描目录中未发现视频文件（.mp4/.mov/.avi/.mkv），无需转码。")
             return
 
         self._save_settings()

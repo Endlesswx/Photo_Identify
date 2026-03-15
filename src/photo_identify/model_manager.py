@@ -298,7 +298,7 @@ class ModelManager:
 
 
 def get_model_db_path(app_db_path: str) -> str:
-    """根据主数据库路径推导出 models.db 的路径（位于 database 目录下）。
+    """根据主数据库路径推导出 models.db 的路径（与主数据库同目录）。
 
     Args:
         app_db_path: 主应用数据库路径（photo_identify.db）
@@ -306,7 +306,6 @@ def get_model_db_path(app_db_path: str) -> str:
     Returns:
         models.db 的绝对路径字符串。
     """
-    app_dir = Path(app_db_path).resolve().parent
-    db_dir = app_dir / "database"
+    db_dir = Path(app_db_path).resolve().parent
     db_dir.mkdir(parents=True, exist_ok=True)
     return str(db_dir / "models.db")

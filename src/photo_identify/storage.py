@@ -457,12 +457,17 @@ class Storage:
         return str(uuid.uuid4())
 
     def get_known_md5s(self) -> set[str]:
-        """获取所有已入库图片的 MD5 集合，用于批量跳过检测。
+        """获取所有已完成 LLM 信息提取的图片 MD5 集合。
+
+        仅返回实际经过 LLM 分析（llm_raw 非空）的记录，
+        排除仅做过人脸扫描但未做信息提取的图片。
 
         Returns:
             MD5 字符串的集合。
         """
-        cursor = self._conn.execute("SELECT md5 FROM images")
+        cursor = self._conn.execute(
+            "SELECT md5 FROM images WHERE llm_raw IS NOT NULL AND llm_raw != ''"
+        )
         return {row[0] for row in cursor.fetchall()}
 
     def get_face_scanned_md5s(self) -> set[str]:
@@ -564,7 +569,7 @@ class Storage:
                         path = ?,
                         file_name = ?,
                         size_bytes = ?,
-                        analyzed_at = ?,
+                        analyzed_at = COALESCE(NULLIF(?, ''), analyzed_at),
                         text_embedding = COALESCE(?, text_embedding),
                         face_scanned = 1
                     WHERE md5 = ?
@@ -585,14 +590,28 @@ class Storage:
                         path = ?,
                         file_name = ?,
                         size_bytes = ?,
+                        modified_time = COALESCE(NULLIF(?, ''), modified_time),
+                        scene = COALESCE(NULLIF(?, ''), scene),
+                        objects = COALESCE(NULLIF(?, ''), objects),
+                        style = COALESCE(NULLIF(?, ''), style),
+                        location_time = COALESCE(NULLIF(?, ''), location_time),
+                        wallpaper_hint = COALESCE(NULLIF(?, ''), wallpaper_hint),
+                        llm_raw = COALESCE(NULLIF(?, ''), llm_raw),
                         text_embedding = COALESCE(?, text_embedding),
-                        analyzed_at = ?
+                        analyzed_at = COALESCE(NULLIF(?, ''), analyzed_at)
                     WHERE md5 = ?
                     """,
                     (
                         record.get("path", ""),
                         record.get("file_name", ""),
                         record.get("size_bytes"),
+                        record.get("modified_time", ""),
+                        record.get("scene", ""),
+                        objects_str,
+                        record.get("style", ""),
+                        record.get("location_time", ""),
+                        record.get("wallpaper_hint", ""),
+                        record.get("llm_raw", ""),
                         record.get("text_embedding"),
                         record.get("analyzed_at", ""),
                         record["md5"],

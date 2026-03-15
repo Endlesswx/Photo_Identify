@@ -1155,7 +1155,6 @@ def _build_face_scan_record(path: str, md5: str, size_bytes: int) -> dict:
         "file_name": Path(path).name,
         "size_bytes": size_bytes,
         "md5": md5,
-        "analyzed_at": datetime.now().isoformat(),
         "face_scanned": True,
     }
 

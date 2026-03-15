@@ -54,12 +54,19 @@ def get_default_data_dir() -> Path:
 
 def get_default_db_path() -> Path:
     """返回默认数据库路径。"""
-    return get_default_data_dir() / "photo_identify.db"
+    db_dir = get_default_data_dir() / "database"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    return db_dir / "photo_identify.db"
 
 
 def get_default_cache_dir() -> Path:
     """返回默认缓存目录。"""
-    return get_default_data_dir() / "cache"
+    return get_default_data_dir() / "cache" / "Photo_Identify_Caches"
+
+
+def get_default_transcoded_video_dir() -> Path:
+    """返回默认转码后视频目录。"""
+    return get_default_data_dir() / "cache" / "转码后视频"
 
 
 def inject_bin_to_path() -> None:
