@@ -205,7 +205,8 @@ Photo_Identify/
 ├── assets/                     # README 截图等静态资源
 ├── test/                       # 测试脚本
 ├── database/                   # 本地数据库（包含提取信息+模型信息，不入库）
-├── dist/                   # 便携源码分发包（不入库）
+├── dist/                       # 便携源码分发包（不入库）
+├── backup.bat/                 # 本地数据库及备份脚本
 ├── install.bat                 # 一键安装依赖
 ├── start_gui.bat               # 一键启动 GUI
 ├── pyproject.toml              # 项目元数据与依赖声明

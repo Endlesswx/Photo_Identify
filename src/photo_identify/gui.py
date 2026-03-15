@@ -560,7 +560,7 @@ class PhotoIdentifyGUI(tk.Tk):
                 self._favorite_tab_loaded = True
             else:
                 self._refresh_favorites()
-        elif tab_name == "缓存管理":
+        elif tab_name in {"系统设置", "缓存管理"}:
             self._refresh_cache_usage_async()
         try:
             self._saved_tab_index = self.notebook.index(selected_tab)
