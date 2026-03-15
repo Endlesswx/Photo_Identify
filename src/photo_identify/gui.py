@@ -1038,9 +1038,6 @@ class PhotoIdentifyGUI(tk.Tk):
         embedding_model_ref = self.scan_embedding_id_var.get()
         if not model_ref and not embedding_model_ref:
             self.scan_workers_var.set("并发: -")
-            if hasattr(self, "transcoded_entry"):
-                self.transcoded_entry.config(state=tk.DISABLED)
-                self.transcoded_btn.config(state=tk.DISABLED)
             return
 
         parts: list[str] = []
@@ -1052,17 +1049,6 @@ class PhotoIdentifyGUI(tk.Tk):
             if "video" in caps:
                 video_workers = model.get("video_workers", 3)
                 parts.append(f"视频: {video_workers} 线程")
-                if hasattr(self, "transcoded_entry"):
-                    self.transcoded_entry.config(state=tk.NORMAL)
-                    self.transcoded_btn.config(state=tk.NORMAL)
-            else:
-                if hasattr(self, "transcoded_entry"):
-                    self.transcoded_entry.config(state=tk.DISABLED)
-                    self.transcoded_btn.config(state=tk.DISABLED)
-        else:
-            if hasattr(self, "transcoded_entry"):
-                self.transcoded_entry.config(state=tk.DISABLED)
-                self.transcoded_btn.config(state=tk.DISABLED)
 
         embedding_model = self._resolve_model_from_selection(embedding_model_ref) if embedding_model_ref else None
         if embedding_model:

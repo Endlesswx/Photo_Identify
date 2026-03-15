@@ -1,4 +1,8 @@
-# Photo Identify 打包说明
+# Photo Identify 打包EXE说明
+
+2026-3-15注
+
+**打包后的EXE有7.1G之巨，不利于分发，已改用代码分发方案**
 
 ## 目标
 

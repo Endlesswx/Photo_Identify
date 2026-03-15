@@ -5,7 +5,8 @@ import subprocess
 from pathlib import Path
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parents[1]
 DIST_DIR = PROJECT_ROOT / "dist"
 TOOLS_DIR = DIST_DIR / "photo_identify" / "tools"
 BIN_DIR = PROJECT_ROOT / "bin"
@@ -13,9 +14,9 @@ MAIN_EXE = DIST_DIR / "photo_identify" / "photo_identify.exe"
 ROOT_MAIN_EXE = DIST_DIR / "photo_identify.exe"
 
 SPECS = [
-    "photo_identify.spec",
-    "video_compression.spec",
-    "lvip_decompression.spec",
+    str(SCRIPT_DIR / "photo_identify.spec"),
+    str(SCRIPT_DIR / "video_compression.spec"),
+    str(SCRIPT_DIR / "lvip_decompression.spec"),
 ]
 
 

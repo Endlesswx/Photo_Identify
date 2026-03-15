@@ -56,18 +56,36 @@
 
 ## 环境与安装
 
-1. 本项目使用现代 Python 包管理工具 `uv` 构建与执行，请确保您已经安装了 [uv](https://github.com/astral-sh/uv)。
-2. 图片信息提取需要用到支持图片的多模态模型（API或者本地部署），视频提取可以采用支持视频的大模型，或者基于抽帧使用图片大模型（可能更慢）
-3. 人物提取、刷新图片向量、向量查询在有CUDA显卡支持时加速效果好，使用纯CPU等待时间可能较长。
+**非开发者（推荐）：** 双击 `install.bat` 即可自动安装所有依赖，无需手动配置环境。分发包内置了 `uv` 包管理工具，无需额外安装。
+
+**源码开发者：** 请先安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后在项目目录执行 `uv sync` 安装依赖。
+
+**大模型API要求：**
+
+图片信息提取需要用到支持图片的多模态模型（API或者本地部署），视频提取可以采用支持视频的大模型，或者基于抽帧使用图片大模型（可能更慢）
+
+**GPU 加速（可选，推荐）：**
+
+人物提取、刷新图片向量、向量查询在有CUDA显卡支持时加速效果好，使用纯CPU等待时间可能较长。
+
+若有 NVIDIA 独立显卡，安装以下组件后人脸识别和向量计算可获得显著加速。不安装也可正常使用，程序会自动回退到 CPU 模式。
+
+1. **NVIDIA 显卡驱动** — 确保已安装最新版 [NVIDIA 驱动](https://www.nvidia.cn/drivers/)
+2. **CUDA Toolkit 12.x** — 下载安装 [CUDA 12.8](https://developer.nvidia.com/cuda-downloads)（安装时可仅选"Runtime"组件）
+3. **cuDNN 9.x** — 下载 [cuDNN 9](https://developer.nvidia.com/cudnn-downloads)，将 `bin/`、`include/`、`lib/` 中的文件复制到 CUDA 安装目录（如 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\`）
+
+安装完成后，确认 CUDA 的 `bin` 目录已加入系统 `PATH` 环境变量（安装程序通常会自动添加）。启动程序后，扫描页下方会显示 **"GPU 加速 (CUDA)"** 表示已生效；若显示 CPU 模式，请查看启动终端中的红字报错，常见原因是缺少 `cublasLt64_12.dll` 等 DLL 文件。
 
 ## 快速开始
 
 ### 1. 启动图形交互界面 (GUI)
 
-在项目目录运行
+**非开发者（推荐）：** 双击 `start_gui.bat` 启动程序。
+
+源码开发者： 在项目目录运行
 
 ```bash
-uv run python -m photo_identify gui
+uv run python -m photo_identify
 ```
 
 ### 2.模型管理-->添加模型
@@ -133,3 +151,54 @@ uv run python -m photo_identify gui
 ## 数据存储
 
 数据存储在用户指定的本地SQLite数据库中，请妥善保管。
+
+## 项目结构
+
+```
+Photo_Identify/
+├── src/                        # 源码目录
+│   ├── photo_identify/         # 主程序包
+│   │   ├── __main__.py         # 程序入口
+│   │   ├── gui.py              # 图形界面
+│   │   ├── cli.py              # 命令行接口
+│   │   ├── scanner.py          # 媒体扫描与信息提取
+│   │   ├── search.py           # 图片/视频检索
+│   │   ├── storage.py          # 数据库操作
+│   │   ├── llm.py              # 大模型调用
+│   │   ├── face_manager.py     # 人脸识别与管理
+│   │   ├── person_merge.py     # 人物合并
+│   │   ├── model_manager.py    # 模型配置管理
+│   │   ├── embedding_runtime.py# 向量嵌入
+│   │   ├── image_utils.py      # 图片处理工具
+│   │   ├── cache_manager.py    # 缓存管理
+│   │   ├── config.py           # 配置
+│   │   └── runtime_compat.py   # 运行时兼容层
+│   ├── video_edit/             # 视频处理
+│   │   ├── video_compression.py# 视频转码压缩
+│   │   └── video_reading.py    # 视频读取与抽帧
+│   └── data_migration/         # 数据迁移工具
+│       ├── lvip_decompression.py               # LVIP 格式解压
+│       ├── backfill_text_embeddings.py         # 文本向量回填
+│       └── clean_orphaned_foreign_key_records.py # 孤立外键清理
+├── scripts/                    # 构建脚本
+│   ├── build_portable.py       # 构建便携源码分发包
+│   └── pyinstaller/            # PyInstaller 打包（归档）
+│       ├── build_exe.py        # EXE 构建脚本
+│       └── *.spec              # PyInstaller 规格文件
+├── assets/                     # README 截图等静态资源
+├── test/                       # 测试脚本
+├── database/                   # 本地数据库（不入库）
+├── database/                   # 便携源码分发包（不入库）
+├── install.bat                 # 一键安装依赖
+├── start_gui.bat               # 一键启动 GUI
+├── pyproject.toml              # 项目元数据与依赖声明
+└── uv.lock                    # 依赖锁定文件
+```
+
+## 打包方式
+
+```
+uv run python scripts/build_portable.py
+```
+
+  产物在 dist/photo_identify_portable/，将整个文件夹分发给用户即可。
